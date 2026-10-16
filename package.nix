@@ -29,6 +29,10 @@ rustPlatform.buildRustPackage {
     description = "Task worktree lifecycle for parallel coding agents";
     license = lib.licenses.mit;
     mainProgram = "wtctl";
-    platforms = lib.platforms.darwin ++ lib.platforms.linux;
+    platforms = [
+      "aarch64-darwin"
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
   };
 }
