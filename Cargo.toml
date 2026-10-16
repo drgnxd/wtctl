@@ -1,0 +1,31 @@
+[package]
+name = "wtctl"
+version = "0.1.0"
+edition = "2021"
+description = "Task worktree lifecycle for parallel coding agents"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "wtctl"
+path = "src/main.rs"
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["test-agent-names"]
+
+[features]
+# Lets tests name the agent process; never enabled in release builds.
+test-agent-names = []
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
