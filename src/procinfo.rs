@@ -275,7 +275,9 @@ fn literal_len(path: &[u8]) -> usize {
 }
 
 /// Parses `lsof -Fpn` output strictly. The caller's own record is a sentinel:
-/// lsof always sees wtctl itself, so its absence means the listing is incomplete.
+/// lsof always sees wtctl itself, so its absence proves the listing incomplete.
+/// Its presence does not prove completeness; processes lsof may not inspect are
+/// silently missing.
 pub fn interpret_lsof(stdout: &[u8], signaled: bool, self_pid: u32) -> CwdScan {
     if signaled {
         return CwdScan::Unavailable("lsof was killed by a signal".into());
@@ -310,26 +312,102 @@ fn with_sentinel(hits: Vec<Cwd>, self_pid: u32, source: &str) -> CwdScan {
     CwdScan::Paths(hits)
 }
 
+const LSOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn lsof_cwds() -> CwdScan {
-    use std::os::unix::process::ExitStatusExt;
     let Some(lsof) = find_lsof() else {
         return CwdScan::Unavailable("lsof not found".into());
     };
-    match std::process::Command::new(&lsof)
+    lsof_cwds_at(&lsof, LSOF_TIMEOUT)
+}
+
+/// Runs `lsof` with a deadline; a hung or interrupted scan counts as unavailable.
+pub fn lsof_cwds_at(lsof: &Path, timeout: std::time::Duration) -> CwdScan {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = match std::process::Command::new(lsof)
         .args(["-w", "-d", "cwd", "-Fpn"])
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
     {
-        // lsof exits 1 when some processes are unreadable, so the exit code alone
-        // proves nothing; the sentinel and format checks decide.
-        Ok(out) => interpret_lsof(
-            &out.stdout,
-            out.status.signal().is_some(),
-            std::process::id(),
-        ),
-        Err(e) => CwdScan::Unavailable(format!("cannot run lsof: {e}")),
+        Ok(child) => child,
+        Err(e) => return CwdScan::Unavailable(format!("cannot run lsof: {e}")),
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return CwdScan::Unavailable("lsof stdout unavailable".into());
+    };
+    // Drain stdout concurrently so a large listing cannot block lsof on a full pipe.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).map(|_| buf)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => return CwdScan::Unavailable(format!("cannot wait for lsof: {e}")),
+        }
+        let why = if std::time::Instant::now() >= deadline {
+            Some("lsof timed out")
+        } else if crate::lock::interrupt_pending() {
+            Some("interrupted while waiting for lsof")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            let _ = child.kill();
+            let _ = child.wait();
+            return CwdScan::Unavailable(why.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let Ok(Ok(stdout)) = reader.join() else {
+        return CwdScan::Unavailable("cannot read lsof output".into());
+    };
+    // lsof exits 1 when some processes are unreadable, so the exit code alone
+    // proves nothing; the sentinel and format checks decide.
+    interpret_lsof(&stdout, status.signal().is_some(), std::process::id())
+}
+
+/// The cwd of `pid` as raw bytes from the kernel, without lsof's escaping.
+pub fn cwd_of(pid: &str) -> Option<Vec<u8>> {
+    let pid: i32 = pid.parse().ok().filter(|p| *p > 0)?;
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: the buffer is a properly sized, writable proc_vnodepathinfo.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        // SAFETY: vip_path is a contiguous, NUL-terminated MAXPATHLEN buffer.
+        let raw: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                info.pvi_cdir.vip_path.as_ptr() as *const u8,
+                std::mem::size_of_val(&info.pvi_cdir.vip_path),
+            )
+        };
+        let end = raw.iter().position(|b| *b == 0)?;
+        (end > 0).then(|| raw[..end].to_vec())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+        Some(link.as_os_str().as_bytes().to_vec())
     }
 }
 
@@ -380,17 +458,22 @@ fn within(path: &[u8], dir: &[u8]) -> bool {
     path.starts_with(dir) && (path.len() == dir.len() || path.get(dir.len()) == Some(&b'/'))
 }
 
-/// Pids whose cwd is `dir` or below it; `dir` must be canonical. An escaped
-/// entry that could name `dir` makes the answer unknowable, so it fails closed.
+/// Pids whose cwd is `dir` or below it; `dir` must be canonical. Escaped lsof
+/// entries are re-read from the kernel; one that cannot be re-read and could
+/// name `dir` makes the answer unknowable, so it fails closed.
 pub fn users_inside(scan: &CwdScan, dir: &Path) -> Result<Vec<String>, String> {
-    // macOS volumes are usually case-insensitive; folding only over-matches.
-    users_inside_folded(scan, dir, cfg!(target_os = "macos"))
+    // macOS volumes usually ignore case and Unicode normalization; both
+    // allowances only over-match.
+    let macos = cfg!(target_os = "macos");
+    users_inside_with(scan, dir, macos, macos, &cwd_of)
 }
 
-pub fn users_inside_folded(
+pub fn users_inside_with(
     scan: &CwdScan,
     dir: &Path,
     case_insensitive: bool,
+    unicode_insensitive: bool,
+    resolve: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Result<Vec<String>, String> {
     use std::os::unix::ffi::OsStrExt;
     let cwds = match scan {
@@ -400,17 +483,35 @@ pub fn users_inside_folded(
     let raw_dir = dir.as_os_str().as_bytes();
     let trimmed = raw_dir.strip_suffix(b"/").unwrap_or(raw_dir);
     let dir_bytes = fold(trimmed, case_insensitive);
+    // Under normalization-insensitive lookup the bytes after the first
+    // non-ASCII byte of either path may differ, and so may the ASCII base
+    // character a combining mark attaches to.
+    let dir_ascii = &dir_bytes[..dir_bytes
+        .iter()
+        .position(|b| !b.is_ascii())
+        .unwrap_or(dir_bytes.len())];
     let mut pids = Vec::new();
     for cwd in cwds {
-        let path = fold(&cwd.path, case_insensitive);
-        if cwd.exact {
-            if within(&path, &dir_bytes) {
+        let raw = if cwd.exact {
+            Some(cwd.path.clone())
+        } else {
+            resolve(&cwd.pid)
+        };
+        if let Some(raw) = raw {
+            if within(&fold(&raw, case_insensitive), &dir_bytes) {
                 pids.push(cwd.pid.clone());
             }
             continue;
         }
-        let literal = &path[..literal_len(&cwd.path)];
-        if dir_bytes.starts_with(literal) || literal.starts_with(&dir_bytes) {
+        let path = fold(&cwd.path, case_insensitive);
+        let mut literal = &path[..literal_len(&cwd.path)];
+        let related = if unicode_insensitive {
+            literal = &literal[..literal.len().saturating_sub(1)];
+            dir_ascii.starts_with(literal) || literal.starts_with(dir_ascii)
+        } else {
+            dir_bytes.starts_with(literal) || literal.starts_with(&dir_bytes)
+        };
+        if related {
             return Err(format!(
                 "pid {} has an escaped cwd that may lie inside {}",
                 cwd.pid,
@@ -542,7 +643,7 @@ mod tests {
     }
 
     fn paths(scan: &CwdScan, dir: &str, fold: bool) -> Result<Vec<String>, String> {
-        users_inside_folded(scan, Path::new(dir), fold)
+        users_inside_with(scan, Path::new(dir), fold, false, &|_| None)
     }
 
     #[test]
@@ -574,6 +675,64 @@ mod tests {
         assert!(paths(&interpret_lsof(b"", false, 7), "/w", false).is_err());
         assert!(paths(&interpret_lsof(b"n/x\np7\nn/y\n", false, 7), "/w", false).is_err());
         assert!(paths(&CwdScan::Unavailable("x".into()), "/w", false).is_err());
+    }
+
+    #[test]
+    fn escaped_entries_are_re_read_from_the_kernel() {
+        let raw =
+            b"p7\nn/var/empty\np20\nn/srv/\\xe6\\x97\\xa5\np21\nn/work/tree/\\xe6\\x97\\xa5\n";
+        let scan = interpret_lsof(raw, false, 7);
+        let resolve = |pid: &str| match pid {
+            "20" => Some("/srv/日".as_bytes().to_vec()),
+            "21" => Some("/work/tree/日".as_bytes().to_vec()),
+            _ => None,
+        };
+        let dir = Path::new("/work/tree");
+        assert_eq!(
+            users_inside_with(&scan, dir, false, false, &resolve).unwrap(),
+            vec!["21".to_string()]
+        );
+        let elsewhere = Path::new("/srv/data");
+        assert!(users_inside_with(&scan, elsewhere, false, false, &resolve)
+            .unwrap()
+            .is_empty());
+        // Unresolvable and possibly related: fail closed.
+        assert!(users_inside_with(&scan, dir, false, false, &|_| None).is_err());
+        // A worktree with a non-ASCII name only matches through the kernel path.
+        let jp = Path::new("/srv/日");
+        assert_eq!(
+            users_inside_with(&scan, jp, true, true, &resolve).unwrap(),
+            vec!["20".to_string()]
+        );
+        assert!(users_inside_with(&scan, jp, true, true, &|_| None).is_err());
+        // Decomposed `e` + U+0301 versus a precomposed name: the base letter is
+        // dropped before comparing, so the entry is treated as related.
+        let decomposed = interpret_lsof(b"p7\nn/var/empty\np30\nn/w/e\\xcc\\x81\n", false, 7);
+        assert!(users_inside_with(&decomposed, Path::new("/w/é"), false, true, &|_| None).is_err());
+    }
+
+    #[test]
+    fn own_cwd_is_readable_from_the_kernel() {
+        use std::os::unix::ffi::OsStrExt;
+        let me = std::process::id().to_string();
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(cwd_of(&me).unwrap(), cwd.as_os_str().as_bytes());
+        assert_eq!(cwd_of("0"), None);
+    }
+
+    #[test]
+    fn hung_lsof_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wtctl-lsof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("lsof");
+        std::fs::write(&shim, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let scan = lsof_cwds_at(&shim, std::time::Duration::from_millis(200));
+        assert!(matches!(scan, CwdScan::Unavailable(ref why) if why == "lsof timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
