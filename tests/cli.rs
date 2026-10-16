@@ -1118,3 +1118,38 @@ fn interrupted_failed_removal_still_reports_the_unlocked_worktree() {
     assert!(path.exists());
     assert!(!env.repo.join(".git/main-integration.lock").exists());
 }
+
+#[test]
+fn non_ascii_cwds_are_judged_by_their_real_path() {
+    let env = Env::new();
+    let (id, path) = env.create("wide-cwd");
+    let outside = env.tmp.join("外部");
+    let inside = path.join("日本語");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(&inside).unwrap();
+    let mut away = Command::new("sleep")
+        .arg("30")
+        .current_dir(&outside)
+        .spawn()
+        .unwrap();
+    let mut within = Command::new("sleep")
+        .arg("30")
+        .current_dir(&inside)
+        .spawn()
+        .unwrap();
+    let refused = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    within.kill().unwrap();
+    within.wait().unwrap();
+    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    away.kill().unwrap();
+    away.wait().unwrap();
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(4), "{err}");
+    assert!(err.contains(&within.id().to_string()), "{err}");
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+}
