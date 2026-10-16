@@ -69,7 +69,10 @@ Nothing is adopted automatically.
   released by renaming to `main-integration.lock.released.<token>`) so older
   tooling using that protocol is excluded too. SIGINT, SIGTERM, and SIGHUP are
   held back from taking the lock until the result or error is written.
-  Mutations are appended to `<git-common-dir>/agent-audit.jsonl`.
+  Mutations are appended to `<git-common-dir>/agent-audit.jsonl`. A process
+  that dies from a signal may still have completed its change (for example,
+  `main` already fast-forwarded); check with `wtctl list` or
+  `git rev-parse refs/heads/main` before retrying.
 - **Ref updates.** With `main` checked out, `wtctl` re-checks the recorded OID
   and runs `git merge --ff-only --no-overwrite-ignore`; otherwise it uses
   `git update-ref` with the old OID as compare-and-swap.
@@ -87,8 +90,10 @@ A worktree is removable only when all of these hold:
   (`refs/worktree`, `refs/bisect`, `refs/rewritten`) is in `main`; a missing
   reflog fails closed;
 - no process has its cwd inside the worktree (`lsof -d cwd`, or `/proc/*/cwd`
-  on Linux). The scan is trusted only if it reports `wtctl`'s own cwd and is
-  well formed; escaped paths that could name the worktree fail closed;
+  on Linux). The scan is trusted only if it reports `wtctl`'s own cwd, is
+  well formed, and finishes within 30 seconds. Entries that `lsof` escapes
+  (non-ASCII or control bytes) are re-read from the kernel; if that fails and
+  the entry could name the worktree, removal fails closed;
 - the worktree is unlocked or locked with exactly `agent-task <id>`.
 
 `reap` also waits a grace period after creation or adoption (default 600 s),
@@ -110,8 +115,12 @@ Hooks: an executable `reference-transaction` hook always blocks; a
 - Agent detection relies on executable names.
 - Only the files ref backend is supported; with reftable, `integrate` and
   `remove` are expected to fail closed (not tested).
-- The process check sees only processes `lsof` or `/proc` may inspect, and not
-  other mount namespaces.
+- The process check sees only processes `lsof` or `/proc` may inspect: other
+  users' processes (on macOS as well), non-dumpable processes, and processes
+  in other mount namespaces can be missed. The own-process sentinel detects a
+  truncated listing, not these gaps.
+- `reap` scans processes once before its removals, so a process that enters a
+  worktree after the scan is not seen.
 - Signals that are not held back (SIGKILL, SIGQUIT, ...), crashes, and aborts
   can leave `main-integration.lock` behind; check its owner pid before
   removing it by hand.
