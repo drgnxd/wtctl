@@ -21,5 +21,6 @@ small, standard-library first, and fail closed.
 
 ## Conventions
 
-- Commits follow Conventional Commits in English.
+- Commits follow the Conventional Commits subject format in English; see
+  `CONTRIBUTING.md`. CI checks subject syntax.
 - Comments explain why, never what.

@@ -197,6 +197,11 @@ refuses arbitrary filters. Verified Git-annex filters need the explicit
   are never offered for automatic removal. New Copilot tasks use process
   ownership when wtctl can identify the agent process.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for commit message conventions and
+development checks. GitHub Actions runs the checks on all supported systems.
+
 ## License
 
 MIT
