@@ -23,4 +23,3 @@ small, standard-library first, and fail closed.
 
 - Commits follow Conventional Commits in English.
 - Comments explain why, never what.
-
