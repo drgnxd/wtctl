@@ -579,6 +579,9 @@ fn preserved_quarantine_purge_resumes_from_its_signed_cursor() {
     manifest["generated_caches"][0]["purge_pending"] = "nested/state".into();
     manifest["phase"] = "purging_preserved".into();
     fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let migration_journal = operation.join("purge-generated-cache-000.jsonl");
+    fs::write(&migration_journal, b"{\"partial\"").unwrap();
+    fs::set_permissions(&migration_journal, fs::Permissions::from_mode(0o600)).unwrap();
 
     let purged = env.run(&[
         "remove",
