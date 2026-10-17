@@ -213,3 +213,28 @@ pub fn acquire(common: &Path, token: String) -> Result<RepoLock, Fail> {
         flock: Some(flock),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn release_preserves_a_lock_whose_token_changed() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let common =
+            std::env::temp_dir().join(format!("wtctl-lock-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&common).unwrap();
+        let lock = LegacyLock::acquire(&common, "our-token".into()).unwrap();
+        fs::write(lock.dir.join("owner"), "other-token\n1\nhost\n").unwrap();
+        drop(lock);
+        assert_eq!(
+            fs::read_to_string(common.join(LEGACY_LOCK).join("owner")).unwrap(),
+            "other-token\n1\nhost\n"
+        );
+        fs::remove_dir_all(common).unwrap();
+    }
+}

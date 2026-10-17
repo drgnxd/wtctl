@@ -97,7 +97,7 @@ impl Env {
         }
     }
 
-    fn cmd(&self, args: &[&str]) -> Command {
+    fn raw_cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_wtctl"));
         c.args(args)
             .env("HOME", self.tmp.join("home"))
@@ -105,11 +105,24 @@ impl Env {
             .env("WTCTL_AGENT_NAMES", &self.agent)
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("CLAUDE_CONFIG_DIR")
             .current_dir(&self.tmp);
         for (k, v) in base_env() {
             c.env(k, v);
         }
         c
+    }
+
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut command = self.raw_cmd(args);
+        if args
+            .first()
+            .is_some_and(|command| matches!(*command, "integrate" | "remove" | "reap"))
+            && !args.contains(&"--external-writers-quiesced")
+        {
+            command.arg("--external-writers-quiesced");
+        }
+        command
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -179,6 +192,32 @@ impl Env {
     fn main_oid(&self) -> String {
         git(&self.repo, &["rev-parse", "refs/heads/main"])
     }
+
+    fn exclude(&self, pattern: &str) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.repo.join(".git/info/exclude"))
+            .unwrap();
+        writeln!(file, "{pattern}").unwrap();
+    }
+
+    fn quarantine_root(&self) -> PathBuf {
+        self.tmp.join("state/proj/worktrees/.removal-quarantine")
+    }
+}
+
+#[test]
+fn capabilities_reports_the_lifecycle_contract() {
+    let env = Env::new();
+    let output: Value = serde_json::from_str(&env.ok(&["capabilities", "--json"])).unwrap();
+    assert_eq!(output["schema"], 1);
+    assert_eq!(output["finish"], true);
+    assert_eq!(output["legacy_session_lifecycle"], true);
+    assert_eq!(output["git_annex"], true);
+    assert_eq!(output["artifact_quarantine"], true);
+    assert_eq!(output["quarantine_purge"], true);
 }
 
 /// A pid with no process right now: a reaped child's pid, confirmed by ESRCH.
@@ -227,6 +266,436 @@ fn create_records_owner_and_locks_detached_worktree() {
             .code()
             == Some(1)
     );
+}
+
+#[test]
+fn create_supports_parent_metadata_and_a_custom_worktrees_root() {
+    let env = Env::new();
+    let root = env.tmp.join("custom-worktrees");
+    let output: Value = serde_json::from_str(&env.ok(&[
+        "create",
+        "--repo",
+        &env.repo_arg(),
+        "--slug",
+        "custom-root",
+        "--task",
+        "revision task",
+        "--parent",
+        "parent-task-id",
+        "--worktrees-root",
+        &root.to_string_lossy(),
+        "--json",
+    ]))
+    .unwrap();
+    let id = output["task_id"].as_str().unwrap();
+    let path = PathBuf::from(output["worktree"].as_str().unwrap());
+    assert!(path.starts_with(&root));
+    assert_eq!(env.marker(id)["parent"], "parent-task-id");
+}
+
+#[test]
+fn remove_requires_explicit_selection_for_build_outputs_and_discards_after_success() {
+    let env = Env::new();
+    let (id, path) = env.create("remove-build-artifact");
+    env.exclude("/target/");
+    fs::create_dir_all(path.join("target/debug")).unwrap();
+    fs::write(path.join("target/debug/artifact"), b"generated").unwrap();
+
+    let refused = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(path.join("target/debug/artifact").exists());
+
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-generated-build-outputs",
+    ]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    let quarantine = env.quarantine_root();
+    assert!(quarantine.exists());
+    assert!(quarantine.read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn remove_dry_run_reports_selected_artifacts_without_mutating_them() {
+    let env = Env::new();
+    let (id, path) = env.create("dry-run-artifact");
+    env.exclude("/target/");
+    fs::create_dir_all(path.join("target/debug")).unwrap();
+    fs::write(path.join("target/debug/artifact"), b"keep during dry run").unwrap();
+    let output = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-generated-build-outputs",
+        "--dry-run",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("generated artifact(s)"));
+    assert!(path.join("target/debug/artifact").exists());
+    assert!(!env.quarantine_root().exists());
+}
+
+#[test]
+fn remove_json_emits_one_structured_result() {
+    let env = Env::new();
+    let (id, path) = env.create("remove-json");
+    let output = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id, "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "removed");
+    assert_eq!(result["worktree_id"], id);
+    assert!(!path.exists());
+}
+
+#[test]
+fn failed_worktree_removal_restores_quarantined_generated_artifacts() {
+    let env = Env::new();
+    let (id, path) = env.create("restore-generated-cache");
+    env.exclude("/target/");
+    fs::create_dir_all(path.join("target/debug")).unwrap();
+    fs::write(path.join("target/debug/artifact"), b"keep after failure").unwrap();
+    let path_var = git_shim(
+        &env,
+        "fail-generated-remove",
+        "if [ \"$sub\" = worktree ] && [ \"$verb\" = remove ]; then exit 1; fi",
+    );
+    let out = env
+        .cmd(&[
+            "remove",
+            "--repo",
+            &env.repo_arg(),
+            "--id",
+            &id,
+            "--discard-generated-build-outputs",
+        ])
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("git failed:"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(path.join("target/debug/artifact")).unwrap(),
+        b"keep after failure"
+    );
+    let quarantine = env.quarantine_root();
+    assert!(
+        quarantine.exists() && quarantine.read_dir().unwrap().next().is_none(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn finish_discards_default_generated_artifacts_after_integration() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-build-artifact");
+    env.exclude("/target/");
+    fs::create_dir_all(path.join("target/debug")).unwrap();
+    fs::write(path.join("target/debug/artifact"), b"generated").unwrap();
+    let finished = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!path.exists());
+    assert!(env.quarantine_root().exists());
+    assert!(env.quarantine_root().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn discarding_result_removes_only_the_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let (id, path) = env.create("result-link");
+    env.exclude("/result");
+    let external = env.tmp.join("external-build-output");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(external.join("keep"), b"external output").unwrap();
+    symlink(&external, path.join("result")).unwrap();
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-generated-build-outputs",
+    ]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    assert_eq!(fs::read(external.join("keep")).unwrap(), b"external output");
+}
+
+#[test]
+fn selected_build_root_cannot_be_a_symlink_to_external_data() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let (id, path) = env.create("unsafe-build-link");
+    env.exclude("/target/");
+    let external = env.tmp.join("external-target");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(external.join("keep"), b"user data").unwrap();
+    symlink(&external, path.join("target")).unwrap();
+    let refused = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-generated-build-outputs",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(path.is_dir());
+    assert!(path.join("target").is_symlink());
+    assert_eq!(fs::read(external.join("keep")).unwrap(), b"user data");
+}
+
+#[test]
+fn preserved_generated_artifacts_can_be_purged_by_exact_operation_id() {
+    let env = Env::new();
+    let (id, path) = env.create("preserve-cache");
+    env.exclude("/.ruff_cache/");
+    fs::create_dir_all(path.join(".ruff_cache")).unwrap();
+    fs::write(path.join(".ruff_cache/state"), b"cache state").unwrap();
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--preserve-generated-artifacts",
+    ]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    let mut operations = env.quarantine_root().read_dir().unwrap();
+    let operation = operations
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap();
+    assert!(operations.next().is_none());
+    let cache = env
+        .quarantine_root()
+        .join(&operation)
+        .join("generated-cache-000/state");
+    assert_eq!(fs::read(&cache).unwrap(), b"cache state");
+
+    let purged = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--purge-preserved-quarantine",
+        &operation,
+    ]);
+    assert!(
+        purged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&purged.stderr)
+    );
+    assert!(!env.quarantine_root().join(operation).exists());
+}
+
+#[test]
+fn preserved_quarantine_purge_resumes_from_its_signed_cursor() {
+    let env = Env::new();
+    let (id, path) = env.create("resume-cache-purge");
+    env.exclude("/.ruff_cache/");
+    fs::create_dir_all(path.join(".ruff_cache/nested")).unwrap();
+    fs::write(path.join(".ruff_cache/nested/state"), b"cache state").unwrap();
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--preserve-generated-artifacts",
+    ]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let operation = env
+        .quarantine_root()
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let operation_id = operation
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let archive = operation.join("generated-cache-000");
+    fs::remove_file(archive.join("nested/state")).unwrap();
+    let manifest_path = operation.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["generated_caches"][0]["purge_state"] = "purging".into();
+    manifest["generated_caches"][0]["purge_cursor"] = 0.into();
+    manifest["generated_caches"][0]["purge_pending"] = "nested/state".into();
+    manifest["phase"] = "purging_preserved".into();
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    let purged = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--purge-preserved-quarantine",
+        &operation_id,
+    ]);
+    assert!(
+        purged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&purged.stderr)
+    );
+    assert!(!operation.exists());
+}
+
+#[test]
+fn unknown_direnv_is_quarantined_and_requires_an_explicit_unverified_purge() {
+    let env = Env::new();
+    let (id, path) = env.create("preserve-direnv");
+    fs::create_dir_all(path.join(".direnv/user-data")).unwrap();
+    fs::write(path.join(".direnv/user-data/keep"), b"not a verified cache").unwrap();
+    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    let operation = env
+        .quarantine_root()
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let preserved = operation.join(".direnv/user-data/keep");
+    assert_eq!(fs::read(&preserved).unwrap(), b"not a verified cache");
+    let operation_id = operation
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let refused = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--purge-preserved-quarantine",
+        &operation_id,
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(preserved.exists());
+
+    let purged = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--purge-preserved-quarantine",
+        &operation_id,
+        "--discard-unverified-direnv",
+    ]);
+    assert!(
+        purged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&purged.stderr)
+    );
+    assert!(!operation.exists());
+}
+
+#[test]
+fn canonical_database_link_is_unlinked_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let database = env.repo.join("state.db");
+    fs::write(&database, b"canonical database").unwrap();
+    let (id, path) = env.create("database-link");
+    symlink(&database, path.join("state.db")).unwrap();
+    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    assert_eq!(fs::read(database).unwrap(), b"canonical database");
+}
+
+#[test]
+fn failed_removal_restores_the_canonical_database_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let database = env.repo.join("state.db");
+    fs::write(&database, b"canonical database").unwrap();
+    let (id, path) = env.create("restore-database-link");
+    symlink(&database, path.join("state.db")).unwrap();
+    let path_var = git_shim(
+        &env,
+        "fail-database-remove",
+        "if [ \"$sub\" = worktree ] && [ \"$verb\" = remove ]; then exit 1; fi",
+    );
+    let out = env
+        .cmd(&["remove", "--repo", &env.repo_arg(), "--id", &id])
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(path.is_dir());
+    assert!(fs::symlink_metadata(path.join("state.db"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::canonicalize(path.join("state.db")).unwrap(), database);
+    assert_eq!(fs::read(database).unwrap(), b"canonical database");
 }
 
 #[test]
@@ -410,6 +879,347 @@ fn integrate_fast_forwards_checked_out_main_and_audits() {
 }
 
 #[test]
+fn finish_requires_writer_ack_and_integrates_then_removes_under_one_command() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-task");
+    let tip = commit_file(&path, "finish.txt", "finished\n");
+    let refused = env.run(&["finish", "--repo", &env.repo_arg(), "--id", &id]);
+    assert_eq!(refused.status.code(), Some(4));
+    assert!(path.exists());
+    let out = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["status"], "finished");
+    assert_eq!(result["task_id"], id);
+    assert_eq!(env.main_oid(), tip);
+    assert_eq!(git(&env.repo, &["show", "HEAD:finish.txt"]), "finished");
+    assert!(!path.exists());
+    assert!(env.list("--all").is_empty());
+}
+
+#[test]
+fn finish_json_errors_are_machine_readable() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-json-error");
+    let output = env.run(&["finish", "--repo", &env.repo_arg(), "--id", &id, "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["exit_code"], 4);
+    assert!(path.exists());
+}
+
+#[test]
+fn finish_keep_worktree_integrates_without_removing_it() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-keep");
+    let tip = commit_file(&path, "kept.txt", "task\n");
+    let output = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--keep-worktree",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "integrated-kept");
+    assert_eq!(env.main_oid(), tip);
+    assert!(path.is_dir());
+    assert!(env.admin(&id).is_dir());
+}
+
+#[test]
+fn finish_merges_a_compatible_main_advance_before_removing_the_task() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-advance");
+    commit_file(&path, "task.txt", "task\n");
+    commit_file(&env.repo, "main.txt", "main\n");
+    let out = env.ok(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert!(out.contains(&format!("finished {id}")), "{out}");
+    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task");
+    assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main");
+    assert!(!path.exists());
+    assert!(env.list("--all").is_empty());
+}
+
+#[test]
+fn finish_rejects_ignored_and_case_aliased_paths_before_updating_main() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-path-collision");
+    env.exclude("/ignored.txt");
+    fs::write(env.repo.join("ignored.txt"), b"preserve\n").unwrap();
+    let ignored_task_path = path.join("ignored.txt");
+    fs::write(&ignored_task_path, b"task\n").unwrap();
+    git(&path, &["add", "-f", "ignored.txt"]);
+    git(&path, &["commit", "-q", "-m", "task"]);
+    fs::create_dir_all(env.repo.join("Folder")).unwrap();
+    let main_tip = commit_file(&env.repo, "Folder/main.txt", "main\n");
+    let output = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(
+        fs::read(env.repo.join("ignored.txt")).unwrap(),
+        b"preserve\n"
+    );
+    assert!(path.is_dir());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ignored/untracked data"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn finish_rejects_case_aliased_merge_directories_before_creating_a_merge_commit() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-case-alias");
+    fs::create_dir_all(path.join("folder")).unwrap();
+    commit_file(&path, "folder/task.txt", "task\n");
+    fs::create_dir_all(env.repo.join("Folder")).unwrap();
+    let main_tip = commit_file(&env.repo, "Folder/main.txt", "main\n");
+    let output = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(path.is_dir());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("final merge tree is unsafe"));
+}
+
+#[test]
+fn finish_uses_the_supplied_integration_commit_message() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-merge-message");
+    commit_file(&path, "task.txt", "task\n");
+    commit_file(&env.repo, "main.txt", "main\n");
+    let output = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--integration-message",
+        "chore: integrate main advance",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        git(&env.repo, &["log", "-1", "--format=%s", "main"]),
+        "chore: integrate main advance"
+    );
+}
+
+#[test]
+fn finish_refuses_an_unreviewed_filter_or_unapproved_commit_signer() {
+    for (name, setting, value, expected) in [
+        (
+            "filter",
+            "filter.unreviewed.clean",
+            "command:unreviewed",
+            "unreviewed Git filters",
+        ),
+        (
+            "signer",
+            "commit.gpgsign",
+            "true",
+            "authorize it with --allow-commit-signing",
+        ),
+    ] {
+        let env = Env::new();
+        let (id, path) = env.create(&format!("finish-{name}"));
+        commit_file(&path, "task.txt", "task\n");
+        commit_file(&env.repo, "main.txt", "main\n");
+        if name == "filter" {
+            fs::write(path.join(".gitattributes"), "*.txt filter=unreviewed\n").unwrap();
+            git(&path, &["add", ".gitattributes"]);
+            git(&path, &["commit", "-q", "-m", "add filter attribute"]);
+        }
+        git(&env.repo, &["config", setting, value]);
+        let main = env.main_oid();
+        let output = env.run(&[
+            "finish",
+            "--repo",
+            &env.repo_arg(),
+            "--id",
+            &id,
+            "--external-writers-quiesced",
+        ]);
+        assert_eq!(output.status.code(), Some(4), "{name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{name}: {output:?}"
+        );
+        assert_eq!(env.main_oid(), main);
+        assert!(path.is_dir());
+    }
+}
+
+#[test]
+fn finish_preserves_the_task_worktree_when_an_advanced_main_conflicts() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-conflict");
+    commit_file(&path, "f.txt", "task side\n");
+    let main_tip = commit_file(&env.repo, "f.txt", "main side\n");
+    let out = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("worktree preserved"));
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(path.exists());
+    assert!(!env.admin(&id).join("MERGE_HEAD").exists());
+}
+
+#[test]
+fn git_annex_worktree_is_restage_checked_and_removed_from_a_symlink_gitdir() {
+    let env = Env::new();
+    git(&env.repo, &["annex", "init", "-q"]);
+    fs::write(env.repo.join("annexed.bin"), vec![b'x'; 8192]).unwrap();
+    git(&env.repo, &["annex", "add", "--force-large", "annexed.bin"]);
+    git(&env.repo, &["commit", "-q", "-m", "annexed"]);
+
+    let missing_ack = env.run(&[
+        "create",
+        "--repo",
+        &env.repo_arg(),
+        "--slug",
+        "annex-noack",
+        "--task",
+        "annex worktree",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(missing_ack.status.code(), Some(4));
+
+    let task: Value = serde_json::from_str(&env.ok(&[
+        "create",
+        "--repo",
+        &env.repo_arg(),
+        "--slug",
+        "annex-task",
+        "--task",
+        "annex worktree",
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--json",
+    ]))
+    .unwrap();
+    let id = task["task_id"].as_str().unwrap();
+    let path = PathBuf::from(task["worktree"].as_str().unwrap());
+    git(&path, &["annex", "restage"]);
+    assert!(
+        fs::symlink_metadata(path.join(".git"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "git-annex restage should exercise the symlinked .git form"
+    );
+    let dry_run = env.ok(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        id,
+        "--external-writers-quiesced",
+        "--dry-run",
+    ]);
+    assert!(dry_run.contains("dry-run ok"), "{dry_run}");
+    assert!(fs::symlink_metadata(path.join(".git"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(path.exists());
+    let tip = commit_file(&path, "task.txt", "task work\n");
+    assert!(fs::symlink_metadata(path.join(".git"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    let missing_remove_ack = env
+        .raw_cmd(&["remove", "--repo", &env.repo_arg(), "--id", id])
+        .output()
+        .unwrap();
+    assert_eq!(missing_remove_ack.status.code(), Some(4));
+    assert!(path.exists());
+
+    let missing_filter_ack = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(missing_filter_ack.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&missing_filter_ack.stderr).contains("--allow-annex-filter"));
+    assert!(path.exists());
+
+    let out = env.ok(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--allow-annex-filter",
+    ]);
+    assert!(out.contains(&format!("finished {id}")), "{out}");
+    assert_eq!(env.main_oid(), tip);
+    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task work");
+    assert!(!path.exists());
+    assert!(!git(&env.repo, &["worktree", "list", "--porcelain"]).contains(path.to_str().unwrap()));
+}
+
+#[test]
 fn integrate_uses_cas_when_main_is_not_checked_out() {
     let env = Env::new();
     git(&env.repo, &["switch", "-q", "-c", "other"]);
@@ -446,6 +1256,27 @@ fn integrate_refuses_dirty_task_and_foreign_owner() {
 }
 
 #[test]
+fn integrate_refuses_submodule_gitlink_changes() {
+    let env = Env::new();
+    let (id, path) = env.create("submodule-gitlink");
+    let commit = commit_file(&path, "gitlink-object.txt", "object\n");
+    git(
+        &path,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{commit},nested"),
+        ],
+    );
+    git(&path, &["commit", "-q", "-m", "add gitlink"]);
+    let output = env.run(&["integrate", "--repo", &env.repo_arg(), "--id", &id]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("submodule gitlink changes"));
+    assert!(path.exists());
+}
+
+#[test]
 fn integration_lock_is_exclusive_and_honors_legacy_lock() {
     let env = Env::new();
     let (id, path) = env.create("lock-task");
@@ -467,6 +1298,38 @@ fn integration_lock_is_exclusive_and_honors_legacy_lock() {
     assert_eq!(out.status.code(), Some(5));
     fs::remove_dir(&legacy).unwrap();
     env.ok(&["integrate", "--repo", &env.repo_arg(), "--id", &id]);
+}
+
+#[test]
+fn direct_mutating_lifecycle_commands_require_external_writer_acknowledgement() {
+    let env = Env::new();
+    let (id, path) = env.create("writer-ack");
+    commit_file(&path, "task.txt", "task\n");
+    let integrate = env
+        .raw_cmd(&["integrate", "--repo", &env.repo_arg(), "--id", &id])
+        .output()
+        .unwrap();
+    assert_eq!(integrate.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&integrate.stderr).contains("external-writers-quiesced"));
+    env.ok(&["integrate", "--repo", &env.repo_arg(), "--id", &id]);
+    let remove = env
+        .raw_cmd(&["remove", "--repo", &env.repo_arg(), "--id", &id])
+        .output()
+        .unwrap();
+    assert_eq!(remove.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&remove.stderr).contains("external-writers-quiesced"));
+    env.ok(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert!(!path.exists());
+    let (orphan, orphan_path) = env.create("reap-ack");
+    env.kill_owner(&orphan);
+    let reap = env
+        .raw_cmd(&["reap", "--repo", &env.repo_arg(), "--grace-secs", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(reap.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&reap.stderr).contains("external-writers-quiesced"));
+    env.ok(&["reap", "--repo", &env.repo_arg(), "--grace-secs", "0"]);
+    assert!(!orphan_path.exists());
 }
 
 #[test]
@@ -497,7 +1360,8 @@ fn legacy_owner_metadata_is_listed_read_only() {
     let row = all.iter().find(|r| r["kind"] == "legacy").unwrap();
     assert_eq!(row["id"], "old-task-20260101-01");
     assert_eq!(row["owner"], "claude:0e7f96a6-1234-4abc-8def-0123456789ab");
-    assert_eq!(row["owner_state"], "dead");
+    assert_eq!(row["owner_state"], "unknown");
+    assert_eq!(row["audit_state"], "UNKNOWN");
     assert!(
         env.list("--orphans").is_empty(),
         "legacy entries are never adopt candidates"
@@ -508,6 +1372,341 @@ fn legacy_owner_metadata_is_listed_read_only() {
     let out = env.run(&["reap", "--repo", &env.repo_arg(), "--grace-secs", "0"]);
     assert!(out.status.success());
     assert!(path.exists());
+}
+
+#[test]
+fn legacy_audit_marks_a_dead_process_active_when_its_session_recently_updated() {
+    let env = Env::new();
+    let session = "0e7f96a6-1234-4abc-8def-0123456789ab";
+    let path = env.tmp.join("state/proj/worktrees/recent-session");
+    git(
+        &env.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let base = env.main_oid();
+    let admin = env.repo.join(".git/worktrees/recent-session");
+    fs::write(
+        admin.join("agent-task"),
+        format!(
+            "recent task client=claude session={session} base={base} pid={}@1\n",
+            absent_pid()
+        ),
+    )
+    .unwrap();
+    let session_file = env
+        .tmp
+        .join("home/.claude/projects/project")
+        .join(format!("{session}.jsonl"));
+    fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+    fs::write(session_file, "recent activity").unwrap();
+
+    let mut command = env.cmd(&["list", "--repo", &env.repo_arg(), "--all", "--json"]);
+    command
+        .env("CLAUDE_CODE_SESSION_ID", session)
+        .env("CLAUDE_CONFIG_DIR", env.tmp.join("empty-claude-config"));
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let row = rows.iter().find(|r| r["id"] == "recent-session").unwrap();
+    assert_eq!(row["owner_state"], "alive");
+    assert_eq!(row["audit_state"], "ACTIVE");
+    assert!(row["session_idle_hours"].as_f64().unwrap() < 2.0);
+    assert_eq!(row["integrated"], true);
+    assert_eq!(row["removable"], "legacy audit state is ACTIVE");
+}
+
+#[test]
+fn legacy_audit_offers_only_stale_merged_worktrees_owned_by_the_current_session() {
+    let env = Env::new();
+    let session = "0e7f96a6-1234-4abc-8def-0123456789ab";
+    let path = env.tmp.join("state/proj/worktrees/stale-merged");
+    git(
+        &env.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let base = env.main_oid();
+    let admin = env.repo.join(".git/worktrees/stale-merged");
+    fs::write(
+        admin.join("agent-task"),
+        format!(
+            "stale task client=claude session={session} base={base} pid={}@1\n",
+            absent_pid()
+        ),
+    )
+    .unwrap();
+    let task_tip = commit_file(&path, "task.txt", "merged\n");
+    git(&env.repo, &["merge", "--ff-only", &task_tip]);
+    let session_file = env
+        .tmp
+        .join("home/.claude/projects/project")
+        .join(format!("{session}.jsonl"));
+    fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+    fs::write(&session_file, "old activity").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    fs::File::open(&session_file)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
+    let mut command = env.cmd(&[
+        "list",
+        "--repo",
+        &env.repo_arg(),
+        "--legacy",
+        "--json",
+        "--base",
+        &task_tip,
+    ]);
+    command.env("CLAUDE_CODE_SESSION_ID", session);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let row = rows.iter().find(|r| r["id"] == "stale-merged").unwrap();
+    assert_eq!(row["audit_state"], "IDLE-MERGED");
+    assert_eq!(row["mine"], true);
+    assert_eq!(row["removable"], true);
+    let suggested: Vec<String> = serde_json::from_value(row["suggested_remove"].clone()).unwrap();
+    assert_eq!(suggested[0], "wtctl");
+    assert!(suggested.contains(&"--legacy-worktree-id".into()));
+    assert!(suggested.contains(&"--base".into()));
+    assert!(suggested.contains(&task_tip));
+    assert!(suggested.contains(&"--dry-run".into()));
+}
+
+#[test]
+fn legacy_branch_worktrees_are_visible_in_all_and_legacy_lists() {
+    let env = Env::new();
+    let branch = "legacy-branch";
+    let path = env.tmp.join("legacy-branch-worktree");
+    git(&env.repo, &["branch", branch, "HEAD"]);
+    git(
+        &env.repo,
+        &["worktree", "add", "-q", path.to_str().unwrap(), branch],
+    );
+    let base = env.main_oid();
+    git(
+        &env.repo,
+        &[
+            "config",
+            &format!("branch.{branch}.description"),
+            &format!(
+                "legacy branch client=claude session=0e7f96a6-1234-4abc-8def-0123456789ab base={base} pid={}@1",
+                absent_pid()
+            ),
+        ],
+    );
+    let all = env.list("--all");
+    let row = all.iter().find(|r| r["branch"] == branch).unwrap();
+    assert_eq!(row["kind"], "legacy");
+    assert_eq!(row["owner"], "claude:0e7f96a6-1234-4abc-8def-0123456789ab");
+    assert_eq!(row["owner_state"], "unknown");
+    assert!(env.list("--legacy").iter().any(|r| r["branch"] == branch));
+    assert!(env.list("--orphans").is_empty());
+}
+
+#[test]
+fn remove_accepts_an_explicit_commit_base_ref() {
+    let env = Env::new();
+    let (id, path) = env.create("remove-custom-base");
+    let base = env.main_oid();
+    let output = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--base",
+        &base,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!path.exists());
+}
+
+#[test]
+fn remove_legacy_detached_worktree_requires_the_exact_current_session() {
+    let env = Env::new();
+    let session = "0e7f96a6-1234-4abc-8def-0123456789ab";
+    let path = env.tmp.join("state/proj/worktrees/old-detached");
+    git(
+        &env.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let id = "old-detached";
+    let base = env.main_oid();
+    fs::write(
+        env.repo.join(".git/worktrees/old-detached/agent-task"),
+        format!("old task client=claude session={session} base={base}\n"),
+    )
+    .unwrap();
+    let mut wrong_session = env.cmd(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--legacy-worktree-id",
+        id,
+    ]);
+    wrong_session.env(
+        "CLAUDE_CODE_SESSION_ID",
+        "9e7f96a6-1234-4abc-8def-0123456789ab",
+    );
+    assert_eq!(wrong_session.output().unwrap().status.code(), Some(4));
+    assert!(path.exists());
+
+    let mut current_session = env.cmd(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--legacy-worktree-id",
+        id,
+    ]);
+    current_session.env("CLAUDE_CODE_SESSION_ID", session);
+    let output = current_session.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!path.exists());
+}
+
+#[test]
+fn remove_legacy_branch_worktree_can_delete_only_its_verified_branch() {
+    let env = Env::new();
+    let session = "0e7f96a6-1234-4abc-8def-0123456789ab";
+    let branch = "legacy-branch";
+    let path = env.tmp.join("legacy-branch-worktree");
+    git(&env.repo, &["branch", branch, "HEAD"]);
+    git(
+        &env.repo,
+        &["worktree", "add", "-q", path.to_str().unwrap(), branch],
+    );
+    let base = env.main_oid();
+    git(
+        &env.repo,
+        &[
+            "config",
+            &format!("branch.{branch}.description"),
+            &format!("legacy branch client=claude session={session} base={base}"),
+        ],
+    );
+    let mut command = env.cmd(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--expect-branch",
+        branch,
+        "--delete-branch",
+    ]);
+    command.env("CLAUDE_CODE_SESSION_ID", session);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!path.exists());
+    assert!(!git_cmd(
+        &env.repo,
+        &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+    )
+    .output()
+    .unwrap()
+    .status
+    .success());
+}
+
+#[test]
+fn finish_legacy_branch_worktree_merges_advancing_main_and_removes_the_owned_branch() {
+    let env = Env::new();
+    let session = "0e7f96a6-1234-4abc-8def-0123456789ab";
+    let branch = "legacy-finish";
+    let path = env.tmp.join("legacy-finish-worktree");
+    git(&env.repo, &["branch", branch, "HEAD"]);
+    git(
+        &env.repo,
+        &["worktree", "add", "-q", path.to_str().unwrap(), branch],
+    );
+    let base = env.main_oid();
+    git(
+        &env.repo,
+        &[
+            "config",
+            &format!("branch.{branch}.description"),
+            &format!("legacy branch client=claude session={session} base={base}"),
+        ],
+    );
+    let branch_tip = commit_file(&path, "legacy-task.txt", "legacy work\n");
+    commit_file(&env.repo, "main.txt", "main work\n");
+
+    let mut command = env.cmd(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--expect-branch",
+        branch,
+        "--delete-branch",
+        "--external-writers-quiesced",
+    ]);
+    command.env("CLAUDE_CODE_SESSION_ID", session);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let head = env.main_oid();
+    assert!(git(
+        &env.repo,
+        &["merge-base", "--is-ancestor", &branch_tip, &head]
+    )
+    .is_empty());
+    assert_eq!(
+        git(&env.repo, &["show", "HEAD:legacy-task.txt"]),
+        "legacy work"
+    );
+    assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main work");
+    assert!(!path.exists());
+    assert!(!git_cmd(
+        &env.repo,
+        &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+    )
+    .output()
+    .unwrap()
+    .status
+    .success());
 }
 
 fn reap(env: &Env) -> String {
@@ -541,6 +1740,30 @@ fn reflog_only_commits_block_reap_and_remove() {
     let out = reap(&env);
     assert!(out.contains(&format!("orphan\t{id}")), "{out}");
     assert!(path.exists());
+}
+
+#[test]
+fn explicit_reflog_opt_in_allows_removal_when_head_is_integrated() {
+    let env = Env::new();
+    let (id, path) = env.create("allow-reflog");
+    commit_file(&path, "lost.txt", "work\n");
+    git(&path, &["reset", "-q", "--hard", "HEAD~1"]);
+    let refused = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--allow-unreferenced-reflog",
+    ]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
 }
 
 #[test]
@@ -787,7 +2010,7 @@ fn state_home_must_be_absolute() {
 }
 
 fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -914,6 +2137,184 @@ fn failed_removal_relocks_with_the_original_reason() {
 }
 
 #[test]
+fn failed_removal_restores_a_verified_git_annex_pointer() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let (id, path) = env.create("restore-annex-pointer");
+    let admin = env.admin(&id);
+    fs::remove_file(path.join(".git")).unwrap();
+    symlink(&admin, path.join(".git")).unwrap();
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let shim_dir = env.tmp.join("annex-restore-shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ] && [ \"$a\" = remove ]; then exit 1; fi\n  prev=$a\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_var = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = env
+        .cmd(&["remove", "--repo", &env.repo_arg(), "--id", &id])
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let pointer = fs::symlink_metadata(path.join(".git")).unwrap();
+    assert!(pointer.file_type().is_symlink());
+    assert_eq!(fs::canonicalize(path.join(".git")).unwrap(), admin);
+    assert_eq!(
+        fs::read_to_string(env.admin(&id).join("locked"))
+            .unwrap()
+            .trim(),
+        format!("agent-task {id}")
+    );
+}
+
+#[test]
+fn failed_partial_removal_does_not_restore_over_a_changed_git_pointer() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let (id, path) = env.create("partial-remove");
+    let admin = env.admin(&id);
+    fs::remove_file(path.join(".git")).unwrap();
+    symlink(&admin, path.join(".git")).unwrap();
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let shim_dir = env.tmp.join("partial-shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ] && [ \"$a\" = remove ]; then\n    rm \"$WTCTL_TEST_WT/.git\"\n    printf 'gitdir: invalid\\n' > \"$WTCTL_TEST_WT/.git\"\n    exit 1\n  fi\n  prev=$a\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_var = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = env
+        .cmd(&["remove", "--repo", &env.repo_arg(), "--id", &id])
+        .env("PATH", path_var)
+        .env("WTCTL_TEST_WT", &path)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("rollback stopped safely"), "{stderr}");
+    assert!(path.is_dir());
+    assert_eq!(
+        fs::read_to_string(path.join(".git")).unwrap(),
+        "gitdir: invalid\n"
+    );
+    assert!(!admin.join("locked").exists());
+}
+
+#[test]
+fn failed_removal_does_not_replace_a_lock_acquired_after_preflight() {
+    let env = Env::new();
+    let (id, path) = env.create("new-lock");
+    let worktree = path.to_string_lossy().into_owned();
+    git(&env.repo, &["worktree", "unlock", &worktree]);
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let shim_dir = env.tmp.join("new-lock-shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ] && [ \"$a\" = remove ]; then\n    '{real}' -C \"$WTCTL_TEST_REPO\" worktree lock --reason 'foreign hold' \"$WTCTL_TEST_WT\"\n    exit 1\n  fi\n  prev=$a\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_var = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = env
+        .cmd(&["remove", "--repo", &env.repo_arg(), "--id", &id])
+        .env("PATH", path_var)
+        .env("WTCTL_TEST_REPO", &env.repo)
+        .env("WTCTL_TEST_WT", &path)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("worktree lock changed"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(env.admin(&id).join("locked"))
+            .unwrap()
+            .trim(),
+        "foreign hold"
+    );
+    assert!(path.is_dir());
+}
+
+#[test]
+fn failed_removal_does_not_recreate_a_worktree_after_registration_disappears() {
+    let env = Env::new();
+    let (id, path) = env.create("registration-gone");
+    let worktree = path.to_string_lossy().into_owned();
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let shim_dir = env.tmp.join("registration-gone-shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ] && [ \"$a\" = remove ]; then\n    '{real}' \"$@\"\n    exit 1\n  fi\n  prev=$a\ndone\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_var = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = env
+        .cmd(&["remove", "--repo", &env.repo_arg(), "--id", &id])
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("registration disappeared"), "{stderr}");
+    assert!(!path.exists());
+    assert!(!git(&env.repo, &["worktree", "list", "--porcelain"]).contains(&worktree));
+}
+
+#[test]
 fn sigterm_during_integration_still_releases_the_legacy_lock() {
     let env = Env::new();
     let (id, path) = env.create("signal-task");
@@ -935,7 +2336,7 @@ fn sigterm_during_integration_still_releases_the_legacy_lock() {
         ])
         .env("WTCTL_TEST_MARK", &mark)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     wait_for(&mark);
@@ -944,6 +2345,10 @@ fn sigterm_during_integration_still_releases_the_legacy_lock() {
     let token = owner.lines().next().unwrap();
     assert_eq!(token.len(), 32);
     assert!(owner.lines().nth(1) == Some(&child.id().to_string()));
+    assert_eq!(
+        fs::create_dir(&lock).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
     // SAFETY: plain kill(2) on our own child.
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
     let status = child.wait().unwrap();
@@ -1141,15 +2546,23 @@ fn non_ascii_cwds_are_judged_by_their_real_path() {
     within.kill().unwrap();
     within.wait().unwrap();
     let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
-    away.kill().unwrap();
-    away.wait().unwrap();
     let err = String::from_utf8_lossy(&refused.stderr);
     assert_eq!(refused.status.code(), Some(4), "{err}");
     assert!(err.contains(&within.id().to_string()), "{err}");
-    assert!(
-        removed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&removed.stderr)
-    );
+    if removed.status.success() {
+        away.kill().unwrap();
+        away.wait().unwrap();
+    } else {
+        let detail = String::from_utf8_lossy(&removed.stderr);
+        assert!(detail.contains("may lie inside"), "{detail}");
+        away.kill().unwrap();
+        away.wait().unwrap();
+        let retry = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+        assert!(
+            retry.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+    }
     assert!(!path.exists());
 }

@@ -290,6 +290,21 @@ impl Entry {
         git::is_oid(&self.head).then_some(self.head.as_str())
     }
 
+    pub fn branch_ref(&self) -> Option<&str> {
+        self.head
+            .strip_prefix("ref: ")
+            .filter(|r| r.starts_with("refs/heads/"))
+    }
+
+    pub fn current_oid(&self) -> Option<String> {
+        if let Some(oid) = self.detached_oid() {
+            return Some(oid.to_string());
+        }
+        let oid = git::run(&self.path, ["rev-parse", "--verify", "HEAD"]).ok()?;
+        let oid = oid.trim().to_string();
+        git::is_oid(&oid).then_some(oid)
+    }
+
     pub fn marker(&self) -> Option<&Marker> {
         match &self.meta {
             Meta::Wtctl(m) => Some(m),
@@ -339,12 +354,7 @@ pub struct Facts {
 
 impl Facts {
     pub fn removable(&self) -> Result<(), String> {
-        if let Some(op) = self.in_progress {
-            return Err(format!("{op} in progress"));
-        }
-        if let Some(why) = &self.blocker {
-            return Err(why.clone());
-        }
+        self.removable_except_status()?;
         let Some(c) = self.clean else {
             return Err("status unavailable".into());
         };
@@ -354,15 +364,58 @@ impl Facts {
                 c.tracked, c.untracked, c.ignored
             ));
         }
+        Ok(())
+    }
+
+    pub fn removable_except_status(&self) -> Result<(), String> {
+        self.removable_except_integration()?;
+        match self.unintegrated {
+            None => Err("integration state unknown".into()),
+            Some(n) if n > 0 => Err(format!(
+                "{n} commit(s) not in main (HEAD, reflog, or per-worktree refs)"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn removable_except_integration(&self) -> Result<(), String> {
+        if let Some(op) = self.in_progress {
+            return Err(format!("{op} in progress"));
+        }
+        if let Some(why) = &self.blocker {
+            return Err(why.clone());
+        }
         match self.hidden {
             None => return Err("index flags unavailable".into()),
             Some(n) if n > 0 => return Err(format!("{n} assume-unchanged/skip-worktree entries")),
             _ => {}
         }
+        Ok(())
+    }
+
+    pub fn removable_with_reflog_opt_in(&self, allow: bool) -> Result<(), String> {
+        self.removable_except_status_with_reflog_opt_in(allow)?;
+        let Some(clean) = self.clean else {
+            return Err("status unavailable".into());
+        };
+        if !clean.is_clean() {
+            return Err(format!(
+                "not clean ({} tracked, {} untracked, {} ignored)",
+                clean.tracked, clean.untracked, clean.ignored
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn removable_except_status_with_reflog_opt_in(&self, allow: bool) -> Result<(), String> {
+        self.removable_except_integration()?;
+        if allow {
+            return Ok(());
+        }
         match self.unintegrated {
             None => Err("integration state unknown".into()),
-            Some(n) if n > 0 => Err(format!(
-                "{n} commit(s) not in main (HEAD, reflog, or per-worktree refs)"
+            Some(count) if count > 0 => Err(format!(
+                "{count} commit(s) not in main (HEAD, reflog, or per-worktree refs)"
             )),
             _ => Ok(()),
         }
@@ -427,7 +480,7 @@ fn probe(e: &Entry) -> Result<Option<Probe>, Fail> {
 /// Everything except the integration count, plus the revisions that count needs.
 fn settle(e: &Entry, probe: Option<Probe>) -> (Facts, Option<Vec<String>>) {
     let mut facts = Facts {
-        head: e.head.clone(),
+        head: e.current_oid().unwrap_or_default(),
         in_progress: e.in_progress(),
         blocker: e.per_worktree_state(),
         ..Facts::default()
@@ -443,12 +496,9 @@ fn settle(e: &Entry, probe: Option<Probe>) -> (Facts, Option<Vec<String>>) {
     if !exists && facts.blocker.is_none() {
         facts.blocker = Some("HEAD reflog unavailable; cannot prove the work is in main".into());
     }
-    let revs = match (e.detached_oid(), refs, reflog) {
+    let revs = match (e.current_oid(), refs, reflog) {
         (Some(head), Some(refs), Some(reflog)) if exists => {
-            let mut revs: Vec<String> = std::iter::once(head.to_string())
-                .chain(refs)
-                .chain(reflog)
-                .collect();
+            let mut revs: Vec<String> = std::iter::once(head).chain(refs).chain(reflog).collect();
             revs.sort();
             revs.dedup();
             Some(revs)

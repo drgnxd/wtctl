@@ -92,7 +92,6 @@ pub const STATUS_ARGS: &[&str] = &[
     "--ignored=matching",
 ];
 
-// Directories the legacy remover also treats as disposable caches.
 const DISPOSABLE: &[&str] = &["__pycache__", ".pytest_cache", ".ruff_cache"];
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -100,6 +99,12 @@ pub struct Cleanliness {
     pub tracked: usize,
     pub untracked: usize,
     pub ignored: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusEntry {
+    pub code: [u8; 2],
+    pub path: Vec<u8>,
 }
 
 impl Cleanliness {
@@ -134,6 +139,31 @@ pub fn parse_status(raw: &[u8]) -> Cleanliness {
     c
 }
 
+pub fn parse_status_entries(raw: &[u8]) -> Result<Vec<StatusEntry>, String> {
+    let fields: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < fields.len().saturating_sub(1) {
+        let record = fields[index];
+        index += 1;
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            return Err("git status returned an invalid porcelain record".into());
+        }
+        let code = [record[0], record[1]];
+        entries.push(StatusEntry {
+            code,
+            path: record[3..].to_vec(),
+        });
+        if code.contains(&b'R') || code.contains(&b'C') {
+            index += 1;
+        }
+    }
+    Ok(entries)
+}
+
 /// Counts index entries hidden from `git status` by assume-unchanged or skip-worktree.
 pub fn count_hidden(ls_files_v: &[u8]) -> usize {
     ls_files_v
@@ -161,4 +191,26 @@ pub fn executable_hooks(hooks_dir: &Path, names: &[&str]) -> Vec<String> {
         })
         .map(|s| s.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn status_entries_preserve_arbitrary_paths_and_consume_rename_sources() {
+        let parsed =
+            parse_status_entries(b"?? path with spaces\0!! target/debug\0R  renamed\0old-name\0")
+                .unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].path, b"path with spaces");
+        assert_eq!(parsed[1].code, *b"!!");
+        assert_eq!(parsed[2].path, b"renamed");
+    }
+
+    #[test]
+    fn malformed_status_entry_fails_closed() {
+        assert!(parse_status_entries(b"??\0").is_err());
+        assert!(parse_status_entries(b"bad entry\0").is_err());
+    }
 }

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-const DEFAULT_AGENTS: &[&str] = &["claude", "opencode"];
+const DEFAULT_AGENTS: &[&str] = &["claude", "opencode", "copilot"];
 const MAX_DEPTH: usize = 64;
 // JavaScript launchers whose script argument identifies the agent.
 const SCRIPT_HOSTS: &[&str] = &["node", "bun"];
@@ -548,6 +548,10 @@ fn classify(names: &[String], agents: &[String]) -> Option<String> {
             .and_then(|p| p.parent())
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str());
+        let components: Vec<&str> = path
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect();
         for agent in agents {
             // Nix wraps binaries as `.<name>-wrapped`, and the kernel truncates comm.
             let wrapped = format!(".{agent}-wrap");
@@ -561,7 +565,11 @@ fn classify(names: &[String], agents: &[String]) -> Option<String> {
             // npm installs run `node <prefix>/<agent>-code/cli.js` or `node .../<agent>/...`.
             if host
                 && (parent == Some(agent.as_str())
-                    || parent.is_some_and(|p| p.strip_suffix("-code") == Some(agent)))
+                    || parent.is_some_and(|p| p.strip_suffix("-code") == Some(agent))
+                    || (agent == "copilot"
+                        && components
+                            .windows(2)
+                            .any(|parts| parts[0] == "@github" && parts[1] == "copilot")))
             {
                 return Some(agent.clone());
             }
@@ -607,12 +615,20 @@ mod tests {
             (&["/opt/agent/bin/claude"], Some("claude")),
             (&["/x/share/claude/versions/2.1.0", "2.1.0"], Some("claude")),
             (&[".opencode-wrappe"], Some("opencode")),
+            (&["/opt/copilot/bin/copilot"], Some("copilot")),
             (
                 &[
                     "node",
                     "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
                 ],
                 Some("claude"),
+            ),
+            (
+                &[
+                    "node",
+                    "/usr/lib/node_modules/@github/copilot/dist/index.js",
+                ],
+                Some("copilot"),
             ),
             (&["/bin/bash", "bash"], None),
             (&["/usr/bin/python3", "/srv/claude-code/cli.py"], None),
