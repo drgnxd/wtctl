@@ -33,6 +33,7 @@
             pkgs.clippy
             pkgs.rustfmt
             pkgs.git
+            pkgs.git-annex
             pkgs.lsof
           ];
         };

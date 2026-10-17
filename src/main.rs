@@ -1,21 +1,24 @@
 //! wtctl: create, inspect, integrate, and clean up detached task worktrees.
 //!
-//! Ownership is the creating agent process (pid + start time) found among the
-//! caller's ancestors, never a session-id environment variable. Mutating
-//! commands serialize on an flock and the legacy mkdir lock.
+//! New tasks are process-owned; legacy worktrees retain session-based ownership.
+//! Mutating commands serialize on a flock and the legacy mkdir lock.
 
+mod artifact;
 mod git;
+mod legacy;
 mod lock;
+mod preflight;
 mod procinfo;
 mod task;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use procinfo::{Liveness, Owner};
@@ -26,13 +29,19 @@ const DEFAULT_GRACE_SECS: i64 = 600;
 
 const USAGE: &str = "usage: wtctl <command> [options]
 
-  create  --repo <path> --slug <slug> [--task <text>] [--from <commit>] [--allow-repository-hooks] [--json]
+  capabilities [--json]       Report lifecycle capabilities for caller gating
+  create  --repo <path> --slug <slug> [--task <text>] [--from <commit>] [--parent <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
   whoami  [--path <path>] [--json]
-  list    [--repo <path>] [--mine | --orphans | --all] [--main <branch>] [--json]
-  integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks]
-  reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch>]
+  list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
+  integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
+  reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id>
-  remove  --repo <path> --id <task-id> [--main <branch>]
+  remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
+
+  artifact cleanup options: --discard-direnv-cache, --discard-generated-caches,
+    --discard-generated-build-outputs, --discard-generated-artifacts,
+    --preserve-generated-artifacts, --purge-preserved-quarantine <operation-id>
 
 exit codes: 0 ok, 1 error, 2 usage, 3 main diverged (rebase needed),
 4 refused by a safety check, 5 lock busy";
@@ -65,6 +74,27 @@ fn refuse<T>(msg: impl Into<String>) -> R<T> {
     Err(Fail::new(4, msg))
 }
 
+fn cmd_capabilities(a: &Args) -> R<()> {
+    if a.values.keys().any(|key| key != "--json") || a.flags.iter().any(|flag| flag != "--json") {
+        return Err(Fail::new(2, "capabilities accepts only --json"));
+    }
+    let capabilities = json!({
+        "schema": 1,
+        "create": true,
+        "finish": true,
+        "legacy_session_lifecycle": true,
+        "git_annex": true,
+        "artifact_quarantine": true,
+        "quarantine_purge": true,
+    });
+    if a.flag("--json") {
+        out!("{capabilities}");
+    } else {
+        out!("wtctl lifecycle capabilities: schema 1, legacy, git-annex, artifact-quarantine");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- arguments
 
 struct Args {
@@ -81,14 +111,37 @@ const VALUE_OPTS: &[&str] = &[
     "--path",
     "--main",
     "--grace-secs",
+    "--active-hours",
+    "--legacy-worktree-id",
+    "--expect-branch",
+    "--purge-preserved-quarantine",
+    "--integration-message",
+    "--parent",
+    "--worktrees-root",
+    "--base",
+    "--lock-name",
 ];
 const FLAG_OPTS: &[&str] = &[
     "--mine",
     "--orphans",
     "--all",
+    "--wtctl",
+    "--legacy",
     "--dry-run",
     "--json",
     "--allow-repository-hooks",
+    "--external-writers-quiesced",
+    "--delete-branch",
+    "--discard-direnv-cache",
+    "--discard-generated-caches",
+    "--discard-generated-build-outputs",
+    "--discard-generated-artifacts",
+    "--preserve-generated-artifacts",
+    "--discard-unverified-direnv",
+    "--allow-unreferenced-reflog",
+    "--keep-worktree",
+    "--allow-annex-filter",
+    "--allow-commit-signing",
 ];
 
 impl Args {
@@ -162,6 +215,32 @@ impl Args {
     }
 }
 
+fn artifact_options(a: &Args, finish_default: bool) -> R<artifact::Options> {
+    let preserve = a.flag("--preserve-generated-artifacts");
+    let discard_all = a.flag("--discard-generated-artifacts") || (finish_default && !preserve);
+    let discard_caches = a.flag("--discard-generated-caches");
+    if discard_all && preserve {
+        return Err(Fail::new(
+            2,
+            "--discard-generated-artifacts cannot be combined with --preserve-generated-artifacts",
+        ));
+    }
+    if discard_caches && preserve {
+        return Err(Fail::new(
+            2,
+            "--discard-generated-caches cannot be combined with --preserve-generated-artifacts",
+        ));
+    }
+    Ok(artifact::Options {
+        discard_direnv: a.flag("--discard-direnv-cache"),
+        discard_caches,
+        discard_build_outputs: a.flag("--discard-generated-build-outputs"),
+        discard_all,
+        preserve_generated: preserve,
+        allow_unreferenced_reflog: a.flag("--allow-unreferenced-reflog"),
+    })
+}
+
 /// `refs/heads/<branch>` for `--main`, validated by Git's own branch-name rules.
 fn main_ref(a: &Args, cwd: &Path) -> R<(String, String)> {
     let Some(branch) = a.get("--main")? else {
@@ -184,6 +263,31 @@ fn main_ref(a: &Args, cwd: &Path) -> R<(String, String)> {
     }
     let refname = format!("refs/heads/{name}");
     Ok((name, refname))
+}
+
+fn base_ref(a: &Args, cwd: &Path) -> R<(String, String)> {
+    let Some(base) = a.get("--base")? else {
+        return main_ref(a, cwd);
+    };
+    if a.get("--main")?.is_some() {
+        return Err(Fail::new(2, "choose one of --main and --base"));
+    }
+    if base.starts_with('-') {
+        return Err(Fail::new(2, "--base must be a commit ref or OID"));
+    }
+    let expression = format!("{base}^{{commit}}");
+    let resolved = git::output(
+        cwd,
+        ["rev-parse", "--verify", "--end-of-options", &expression],
+    )?;
+    let oid = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+    if !resolved.status.success() || !git::is_oid(&oid) {
+        return Err(Fail::new(
+            2,
+            format!("--base {base:?} does not resolve to a commit"),
+        ));
+    }
+    Ok((base.to_string(), oid))
 }
 
 // -------------------------------------------------------------- environment
@@ -236,7 +340,7 @@ fn me() -> R<Owner> {
     procinfo::find_agent().ok_or_else(|| {
         Fail::new(
             4,
-            "no coding-agent ancestor process (claude/opencode) found; \
+            "no coding-agent ancestor process (claude/opencode/copilot) found; \
              run wtctl from the agent's own shell",
         )
     })
@@ -287,6 +391,31 @@ impl Repo {
 
     fn lock(&self) -> R<lock::RepoLock> {
         lock::acquire(&self.common, random_hex(16)?)
+    }
+
+    fn uses_annex(&self) -> R<bool> {
+        let filter = git::output(&self.root, ["config", "--get", "filter.annex.process"])?;
+        Ok(
+            (filter.status.success() && !filter.stdout.trim_ascii().is_empty())
+                || self.common.join("annex").exists(),
+        )
+    }
+
+    fn require_annex_ready(&self, external_writers_quiesced: bool) -> R<bool> {
+        if !self.uses_annex()? {
+            return Ok(false);
+        }
+        if !external_writers_quiesced {
+            return refuse("this repository uses git-annex; coordinate external writers and pass --external-writers-quiesced");
+        }
+        let version = git::output(&self.root, ["annex", "version"])?;
+        if !version.status.success() {
+            return refuse(format!(
+                "this repository uses git-annex but `git annex version` failed: {}",
+                git::stderr_of(&version)
+            ));
+        }
+        Ok(true)
     }
 
     fn audit(&self, record: Value) {
@@ -461,6 +590,7 @@ fn cmd_create(a: &Args) -> R<()> {
         root,
         common: canon(Path::new(OsStr::from_bytes(common))),
     };
+    repo.require_annex_ready(a.flag("--external-writers-quiesced"))?;
     let hooks = active_hooks(
         &repo.root,
         &["post-checkout", "reference-transaction"],
@@ -469,7 +599,23 @@ fn cmd_create(a: &Args) -> R<()> {
     )?;
     check_hooks(&hooks, a.flag("--allow-repository-hooks"))?;
 
-    let root_dir = state_home()?.join(repo.name()).join("worktrees");
+    let root_dir = if let Some(custom) = a.os("--worktrees-root") {
+        let custom = PathBuf::from(custom);
+        let absolute = if custom.is_absolute() {
+            custom
+        } else {
+            std::env::current_dir()
+                .map_err(|error| Fail::new(1, format!("cannot resolve worktrees root: {error}")))?
+                .join(custom)
+        };
+        canon(&absolute)
+    } else {
+        state_home()?.join(repo.name()).join("worktrees")
+    };
+    let parent = a.get("--parent")?;
+    if parent.is_some_and(|value| value.is_empty() || value.contains(['\n', '\r'])) {
+        return Err(Fail::new(2, "--parent must be a non-empty single line"));
+    }
     let id = format!("{slug}-{}-{}", local_date(), random_hex(4)?);
     let path = root_dir.join(&id);
     let Some(path_text) = path.to_str().map(str::to_string) else {
@@ -507,6 +653,7 @@ fn cmd_create(a: &Args) -> R<()> {
         "owner": owner_json(&owner),
         "session_hint": session_hint,
         "task": text,
+        "parent": parent,
         "created_unix": now(),
         "history": [],
     });
@@ -626,44 +773,230 @@ fn cmd_whoami(a: &Args) -> R<()> {
     Ok(())
 }
 
-fn owner_state(meta: &Meta) -> Liveness {
+fn legacy_metadata(repo: &Repo, entry: &Entry) -> Option<HashMap<String, String>> {
+    match &entry.meta {
+        Meta::Legacy(trailer) => Some(trailer.clone()),
+        Meta::Wtctl(_) | Meta::Invalid(_) => None,
+        Meta::None => {
+            let branch = entry.branch_ref()?.strip_prefix("refs/heads/")?;
+            let key = format!("branch.{branch}.description");
+            let description = git::output(&repo.root, ["config", "--get", &key]).ok()?;
+            description
+                .status
+                .success()
+                .then(|| task::legacy_trailer(&String::from_utf8_lossy(&description.stdout)))
+        }
+    }
+}
+
+fn valid_legacy_session(client: &str, session: &str) -> bool {
+    match client {
+        "claude" => {
+            session.len() == 36
+                && session.bytes().enumerate().all(|(i, b)| match i {
+                    8 | 13 | 18 | 23 => b == b'-',
+                    _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+                })
+        }
+        "opencode" => session
+            .strip_prefix("ses_")
+            .is_some_and(|v| v.len() == 26 && v.bytes().all(|b| b.is_ascii_alphanumeric())),
+        _ => false,
+    }
+}
+
+fn current_session_identity() -> Option<(String, String)> {
+    let present: Vec<(String, String)> = [
+        ("claude", "CLAUDE_CODE_SESSION_ID"),
+        ("opencode", "OPENCODE_SESSION_ID"),
+    ]
+    .into_iter()
+    .filter_map(|(client, variable)| {
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| (client.to_string(), value))
+    })
+    .collect();
+    match present.as_slice() {
+        [(client, session)] if valid_legacy_session(client, session) => {
+            Some((client.clone(), session.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn legacy_is_mine(trailer: &HashMap<String, String>) -> bool {
+    let (Some(client), Some(session)) = (trailer.get("client"), trailer.get("session")) else {
+        return false;
+    };
+    let Some((current_client, current_session)) = current_session_identity() else {
+        return false;
+    };
+    if !valid_legacy_session(client, session) {
+        return false;
+    }
+    current_client == *client && current_session == *session
+}
+
+fn owner_state(
+    meta: &Meta,
+    legacy: Option<&HashMap<String, String>>,
+    active_hours: f64,
+    home: &Path,
+    xdg_data: &Path,
+    claude_config: Option<&Path>,
+) -> (Liveness, Option<f64>) {
     match meta {
-        Meta::Wtctl(m) => procinfo::liveness(&m.owner),
-        Meta::Legacy(t) => task::legacy_liveness(t),
-        _ => Liveness::Unknown,
+        Meta::Wtctl(m) => (procinfo::liveness(&m.owner), None),
+        Meta::Legacy(t) => legacy_owner_state(t, active_hours, home, xdg_data, claude_config),
+        _ => legacy.map_or((Liveness::Unknown, None), |t| {
+            legacy_owner_state(t, active_hours, home, xdg_data, claude_config)
+        }),
+    }
+}
+
+fn legacy_owner_state(
+    trailer: &HashMap<String, String>,
+    active_hours: f64,
+    home: &Path,
+    xdg_data: &Path,
+    claude_config: Option<&Path>,
+) -> (Liveness, Option<f64>) {
+    if task::legacy_liveness(trailer) == Liveness::Alive {
+        return (Liveness::Alive, None);
+    }
+    let (Some(client), Some(session)) = (trailer.get("client"), trailer.get("session")) else {
+        return (Liveness::Unknown, None);
+    };
+    let Some(idle_hours) =
+        legacy::session_idle_hours(client, session, home, xdg_data, claude_config, now() as f64)
+    else {
+        return (Liveness::Unknown, None);
+    };
+    (
+        if idle_hours < active_hours {
+            Liveness::Alive
+        } else {
+            Liveness::Dead
+        },
+        Some(idle_hours),
+    )
+}
+
+fn legacy_audit_state(
+    repo: &Repo,
+    entry: &Entry,
+    trailer: Option<&HashMap<String, String>>,
+    owner: Liveness,
+    facts: &task::Facts,
+    main_ref: &str,
+) -> String {
+    match owner {
+        Liveness::Alive => return "ACTIVE".into(),
+        Liveness::Unknown => return "UNKNOWN".into(),
+        Liveness::Dead => {}
+    }
+    let Some(trailer) = trailer else {
+        return "UNKNOWN".into();
+    };
+    let (Some(client), Some(session)) = (trailer.get("client"), trailer.get("session")) else {
+        return "UNKNOWN".into();
+    };
+    let Some(current) = current_session_identity() else {
+        return "IDLE-OWNER-UNKNOWN".into();
+    };
+    if current.0 != *client || current.1 != *session {
+        return "IDLE-OTHER-SESSION".into();
+    }
+    let Some(base) = trailer.get("base").filter(|oid| git::is_oid(oid)) else {
+        return "IDLE-UNMERGED".into();
+    };
+    let Some(head) = entry.current_oid() else {
+        return "IDLE-UNMERGED".into();
+    };
+    let ahead = head != *base && is_ancestor(&repo.root, base, &head).unwrap_or(false);
+    let contained =
+        facts.unintegrated == Some(0) && is_ancestor(&repo.root, &head, main_ref).unwrap_or(false);
+    let clean = facts
+        .clean
+        .is_some_and(|state| state.tracked == 0 && state.untracked == 0);
+    if ahead && contained && clean {
+        "IDLE-MERGED".into()
+    } else {
+        "IDLE-UNMERGED".into()
     }
 }
 
 fn cmd_list(a: &Args) -> R<()> {
     let repo = a.repo(false)?;
-    let (_, main_ref) = main_ref(a, &repo.root)?;
-    let modes: Vec<&str> = ["--mine", "--orphans", "--all"]
+    let (_, main_ref) = base_ref(a, &repo.root)?;
+    let modes: Vec<&str> = ["--mine", "--orphans", "--all", "--wtctl", "--legacy"]
         .into_iter()
         .filter(|f| a.flag(f))
         .collect();
     if modes.len() > 1 {
-        return Err(Fail::new(2, "choose one of --mine, --orphans, --all"));
+        return Err(Fail::new(
+            2,
+            "choose one of --mine, --orphans, --all, --wtctl, --legacy",
+        ));
     }
     let mode = modes.first().copied().unwrap_or("--wtctl");
+    let active_hours = match a.get("--active-hours")? {
+        Some(value) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|hours| hours.is_finite() && *hours >= 0.0)
+            .ok_or_else(|| Fail::new(2, "--active-hours must be a non-negative number"))?,
+        None => 2.0,
+    };
     let current = if mode == "--mine" {
         Some(me()?)
     } else {
         procinfo::find_agent()
     };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let xdg_data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"));
+    let claude_config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
     let all = task::entries(&repo.common);
+    let legacy: HashMap<PathBuf, HashMap<String, String>> = all
+        .iter()
+        .filter_map(|entry| legacy_metadata(&repo, entry).map(|meta| (entry.admin.clone(), meta)))
+        .collect();
     let selected: Vec<&Entry> = all
         .iter()
-        .filter(|e| match (e.marker(), mode) {
-            (_, "--all") => true,
-            (Some(m), "--mine") => is_mine(m, current.as_ref()),
-            (Some(m), "--orphans") => procinfo::liveness(&m.owner) == Liveness::Dead,
-            (Some(_), "--wtctl") => true,
+        .filter(|e| match mode {
+            "--all" => true,
+            "--wtctl" => e.marker().is_some(),
+            "--legacy" => e.marker().is_none() && legacy.contains_key(&e.admin),
+            "--mine" => e.marker().map_or_else(
+                || legacy.get(&e.admin).is_some_and(legacy_is_mine),
+                |m| is_mine(m, current.as_ref()),
+            ),
+            "--orphans" => e
+                .marker()
+                .is_some_and(|m| procinfo::liveness(&m.owner) == Liveness::Dead),
             _ => false,
         })
         .collect();
     let facts = task::facts(&selected, &main_ref)?;
+    let main_worktree = canonical_main_checkout(&repo)?;
     let mut rows = Vec::new();
     for (e, f) in selected.iter().zip(&facts) {
+        let legacy_row = legacy.get(&e.admin);
+        let (state, idle_hours) = owner_state(
+            &e.meta,
+            legacy_row,
+            active_hours,
+            &home,
+            &xdg_data,
+            claude_config.as_deref(),
+        );
         let (kind, owner, mine) = match &e.meta {
             Meta::Wtctl(m) => (
                 "wtctl",
@@ -677,20 +1010,98 @@ fn cmd_list(a: &Args) -> R<()> {
                     t.get("client").map_or("?", String::as_str),
                     t.get("session").map_or("?", String::as_str)
                 ),
-                false,
+                legacy_is_mine(t),
             ),
             Meta::Invalid(_) => ("invalid", String::new(), false),
-            Meta::None => ("none", String::new(), false),
+            Meta::None => match legacy_row {
+                Some(t) => (
+                    "legacy",
+                    format!(
+                        "{}:{}",
+                        t.get("client").map_or("?", String::as_str),
+                        t.get("session").map_or("?", String::as_str)
+                    ),
+                    legacy_is_mine(t),
+                ),
+                None => ("none", String::new(), false),
+            },
+        };
+        let audit_state = if kind == "legacy" {
+            legacy_audit_state(&repo, e, legacy_row, state, f, &main_ref)
+        } else if kind == "wtctl" {
+            match state {
+                Liveness::Alive => "ACTIVE".into(),
+                Liveness::Unknown => "UNKNOWN".into(),
+                Liveness::Dead => "ORPHAN".into(),
+            }
+        } else {
+            "UNKNOWN".into()
+        };
+        let facts_removable = f.removable();
+        let artifact_blocker = if facts_removable.is_ok() && e.path.is_dir() {
+            artifact::check_pending_transaction(&repo.name(), &e.path)
+                .and_then(|()| {
+                    artifact::inspect_plan(
+                        &e.path,
+                        main_worktree.as_deref(),
+                        artifact::Options::default(),
+                    )
+                    .map(|_| ())
+                })
+                .err()
+        } else {
+            None
+        };
+        let removable = if kind == "legacy" && audit_state != "IDLE-MERGED" {
+            Value::String(format!("legacy audit state is {audit_state}"))
+        } else if let Err(why) = facts_removable {
+            Value::String(why)
+        } else if let Some(why) = artifact_blocker.clone() {
+            Value::String(why)
+        } else {
+            Value::Bool(true)
+        };
+        let suggested_remove = if kind == "legacy"
+            && audit_state == "IDLE-MERGED"
+            && mine
+            && artifact_blocker.is_none()
+            && f.removable().is_ok()
+        {
+            let selector =
+                if let Some(branch) = e.branch_ref().and_then(|r| r.strip_prefix("refs/heads/")) {
+                    vec!["--expect-branch".to_string(), branch.to_string()]
+                } else {
+                    vec!["--legacy-worktree-id".to_string(), e.id()]
+                };
+            let mut command = vec![
+                "wtctl".to_string(),
+                "remove".to_string(),
+                "--repo".to_string(),
+                repo.root.to_string_lossy().into_owned(),
+            ];
+            command.extend(selector);
+            if let Some(base) = a.get("--base")? {
+                command.extend(["--base".into(), base.to_string()]);
+            } else if let Some(main) = a.get("--main")? {
+                command.extend(["--main".into(), main.to_string()]);
+            }
+            command.push("--external-writers-quiesced".into());
+            command.push("--dry-run".into());
+            Some(command)
+        } else {
+            None
         };
         rows.push(json!({
             "id": e.id(), "kind": kind, "path": e.path.to_string_lossy(), "head": e.head,
-            "locked": e.lock_reason.is_some(), "lock_reason": e.lock_reason, "owner": owner, "owner_state": owner_state(&e.meta).as_str(),
+            "branch": e.branch_ref().and_then(|r| r.strip_prefix("refs/heads/")),
+            "locked": e.lock_reason.is_some(), "lock_reason": e.lock_reason, "owner": owner, "owner_state": state.as_str(), "session_idle_hours": idle_hours, "audit_state": audit_state,
             "mine": mine, "exists": e.path.is_dir(),
             "clean": f.clean.map(|c| c.is_clean()),
             "changes": f.clean.map(|c| json!({"tracked": c.tracked, "untracked": c.untracked, "ignored": c.ignored})),
             "hidden": f.hidden, "in_progress": f.in_progress, "blocker": f.blocker,
             "unintegrated": f.unintegrated, "integrated": f.unintegrated.map(|n| n == 0),
-            "removable": f.removable().err().map_or(Value::Bool(true), Value::String),
+            "removable": removable,
+            "suggested_remove": suggested_remove,
         }));
     }
     if a.flag("--json") {
@@ -703,8 +1114,11 @@ fn cmd_list(a: &Args) -> R<()> {
         None => "?",
     };
     for r in &rows {
+        let idle = r["session_idle_hours"]
+            .as_f64()
+            .map_or_else(|| "?".into(), |hours| format!("{hours:.1}h"));
         out!(
-            "{}\t{}\towner={} {}{}\tintegrated={} unintegrated={}\tclean={}\tlocked={}\t{}",
+            "{}\t{}\towner={} {}{} session_idle={} audit={}\tintegrated={} unintegrated={}\tclean={}\tlocked={}\t{}",
             r["id"].as_str().unwrap_or(""),
             r["kind"].as_str().unwrap_or(""),
             r["owner"].as_str().unwrap_or(""),
@@ -714,6 +1128,8 @@ fn cmd_list(a: &Args) -> R<()> {
             } else {
                 ""
             },
+            idle,
+            r["audit_state"].as_str().unwrap_or("UNKNOWN"),
             yn(&r["integrated"]),
             r["unintegrated"]
                 .as_u64()
@@ -748,6 +1164,33 @@ fn ensure_ref(repo: &Path, refname: &str, expected: &str) -> R<()> {
         return refuse(format!(
             "{refname} moved from {expected} to {}; retry",
             actual.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_task_head(entry: &Entry, expected: &str) -> R<()> {
+    if entry.current_oid().as_deref() != Some(expected) {
+        return refuse(format!("{} HEAD changed during integration", entry.id()));
+    }
+    Ok(())
+}
+
+fn ensure_no_cwd_users(entry: &Entry, stage: &str) -> R<()> {
+    let users = procinfo::users_inside(&procinfo::scan_cwds(), &entry.path).map_err(|error| {
+        Fail::new(
+            4,
+            format!(
+                "cannot inspect processes inside {}: {error}",
+                entry.path.display()
+            ),
+        )
+    })?;
+    if !users.is_empty() {
+        return refuse(format!(
+            "processes are using {} {stage} (pids: {})",
+            entry.path.display(),
+            users.join(", ")
         ));
     }
     Ok(())
@@ -789,43 +1232,128 @@ fn main_checkout(repo: &Repo, refname: &str) -> R<Option<PathBuf>> {
     Ok(None)
 }
 
-fn cmd_integrate(a: &Args) -> R<()> {
-    let repo = a.repo(true)?;
-    let id = a.need("--id")?;
-    let (main, refname) = main_ref(a, &repo.root)?;
-    let _lock = repo.lock()?;
-    let (entry, marker) = repo.find_task(id)?;
-    let caller = require_owner(&marker)?;
-    let Some(tip) = entry.detached_oid().map(str::to_string) else {
-        return refuse(format!("{id} is not on a detached HEAD"));
-    };
-    let facts = task::facts(&[&entry], &refname)?;
+fn canonical_main_checkout(repo: &Repo) -> R<Option<PathBuf>> {
+    main_checkout(repo, "refs/heads/main")
+}
+
+fn gitlinks(repo: &Path, treeish: &str) -> R<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let output = git::output(repo, ["ls-tree", "-rz", "--full-tree", treeish])?;
+    if !output.status.success() {
+        return refuse(format!("cannot inspect submodule entries in {treeish}"));
+    }
+    let mut links = BTreeMap::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return refuse(format!(
+                "git ls-tree returned malformed output for {treeish}"
+            ));
+        };
+        let metadata: Vec<&[u8]> = record[..tab].split(|byte| *byte == b' ').collect();
+        if metadata.len() == 3 && metadata[0] == b"160000" {
+            links.insert(record[tab + 1..].to_vec(), metadata[2].to_vec());
+        }
+    }
+    Ok(links)
+}
+
+fn require_no_gitlink_changes(repo: &Path, base: &str, tip: &str) -> R<()> {
+    let before = gitlinks(repo, base)?;
+    let after = gitlinks(repo, tip)?;
+    let changed: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    if !changed.is_empty() {
+        return refuse(format!(
+            "submodule gitlink changes require a separate task: {}",
+            changed.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+struct IntegrationContext<'a> {
+    id: &'a str,
+    main: &'a str,
+    refname: &'a str,
+    task_base: &'a str,
+}
+
+struct IntegrationOptions {
+    allow_hooks: bool,
+    allow_annex_filter: bool,
+    cleanup: Option<artifact::Options>,
+    json_output: bool,
+}
+
+fn integrate_task(
+    repo: &Repo,
+    context: IntegrationContext<'_>,
+    entry: &Entry,
+    caller: &Owner,
+    options: IntegrationOptions,
+) -> R<(String, String, bool)> {
+    let IntegrationContext {
+        id,
+        main,
+        refname,
+        task_base,
+    } = context;
+    let IntegrationOptions {
+        allow_hooks,
+        allow_annex_filter,
+        cleanup,
+        json_output,
+    } = options;
+    let tip = entry
+        .current_oid()
+        .ok_or_else(|| Fail::new(4, format!("cannot resolve {id} HEAD")))?;
+    require_no_gitlink_changes(&repo.root, task_base, &tip)?;
+    let facts = task::facts(&[entry], refname)?;
     let f = facts.first().cloned().unwrap_or_default();
     if let Some(op) = f.in_progress {
         return refuse(format!("{id} has a {op} in progress"));
     }
-    match f.clean {
-        Some(c) if c.tracked + c.untracked == 0 => {}
-        Some(c) => {
-            return refuse(format!(
-                "{id} has uncommitted changes ({} tracked, {} untracked); commit them first",
-                c.tracked, c.untracked
-            ))
+    if let Some(cleanup) = cleanup {
+        f.removable_except_integration()
+            .map_err(|why| Fail::new(4, format!("{id} has unsafe state: {why}")))?;
+        let main_worktree = canonical_main_checkout(repo)?;
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+            .map_err(|why| Fail::new(4, format!("{id} has changes: {why}")))?;
+    } else {
+        match f.clean {
+            Some(c) if c.is_clean() => {}
+            Some(c) => {
+                return refuse(format!(
+                    "{id} has changes ({} tracked, {} untracked, {} ignored); clean or explicitly preserve them first",
+                    c.tracked, c.untracked, c.ignored
+                ))
+            }
+            None => return refuse(format!("cannot read the status of {id}")),
         }
-        None => return refuse(format!("cannot read the status of {id}")),
     }
     if f.hidden != Some(0) {
         return refuse(format!("{id} has assume-unchanged/skip-worktree entries"));
     }
-    let old = git::run(&repo.root, ["rev-parse", "--verify", "--quiet", &refname])
+    let old = git::run(&repo.root, ["rev-parse", "--verify", "--quiet", refname])
         .map_err(|_| Fail::new(1, format!("{refname} does not exist")))?
         .trim()
         .to_string();
 
     if is_ancestor(&repo.root, &tip, &old)? {
-        out!("{id} is already integrated into {main} ({old})");
-        return Ok(());
+        return Ok((old.clone(), old, true));
     }
+    ensure_task_head(entry, &tip)?;
+    ensure_no_cwd_users(entry, "integration")?;
+    check_active_filters(repo, &old, &tip, allow_annex_filter)?;
     if !is_ancestor(&repo.root, &old, &tip)? {
         let mt = git::output(
             &repo.root,
@@ -845,8 +1373,10 @@ fn cmd_integrate(a: &Args) -> R<()> {
             Some(1) => format!("conflicts: {}", conflicts.join(", ")),
             _ => format!("merge-tree failed: {}", git::stderr_of(&mt)),
         };
-        for path in &conflicts {
-            out!("conflict\t{path}");
+        if !json_output {
+            for path in &conflicts {
+                out!("conflict\t{path}");
+            }
         }
         return Err(Fail::new(
             3,
@@ -855,8 +1385,10 @@ fn cmd_integrate(a: &Args) -> R<()> {
     }
 
     let msg = format!("wtctl integrate {id}");
-    let allow = a.flag("--allow-repository-hooks");
-    match main_checkout(&repo, &refname)? {
+    ensure_ref(&repo.root, refname, &old)?;
+    ensure_task_head(entry, &tip)?;
+    ensure_no_cwd_users(entry, "integration")?;
+    match main_checkout(repo, refname)? {
         Some(checkout) => {
             check_hooks(
                 &active_hooks(
@@ -865,7 +1397,7 @@ fn cmd_integrate(a: &Args) -> R<()> {
                     None,
                     None,
                 )?,
-                allow,
+                allow_hooks,
             )?;
             let st = git::output(
                 &checkout,
@@ -874,7 +1406,10 @@ fn cmd_integrate(a: &Args) -> R<()> {
             if !st.status.success() || !st.stdout.is_empty() {
                 return refuse(format!("{} is not clean", checkout.display()));
             }
-            ensure_ref(&repo.root, &refname, &old)?;
+            preflight::check_merge_paths(&checkout, &old, &tip).map_err(|why| {
+                Fail::new(4, format!("main fast-forward path preflight failed: {why}"))
+            })?;
+            ensure_ref(&repo.root, refname, &old)?;
             let out = git::output(
                 &checkout,
                 [
@@ -892,24 +1427,1059 @@ fn cmd_integrate(a: &Args) -> R<()> {
         None => {
             check_hooks(
                 &active_hooks(&repo.root, &["reference-transaction"], None, None)?,
-                allow,
+                allow_hooks,
             )?;
-            cas_update(&repo.root, &refname, &tip, &old, &msg)?;
+            cas_update(&repo.root, refname, &tip, &old, &msg)?;
         }
     }
-    ensure_ref(&repo.root, &refname, &tip)?;
+    ensure_ref(&repo.root, refname, &tip)?;
     repo.audit(
         json!({"at": now(), "event": "integrate", "task_id": id, "ref": refname,
                       "old": old, "new": tip, "pid": caller.pid}),
     );
-    out!("integrated {id}: {main} {old}..{tip}");
+    Ok((old, tip, false))
+}
+
+fn cmd_integrate(a: &Args) -> R<()> {
+    let repo = a.repo(true)?;
+    let id = a.need("--id")?;
+    if !a.flag("--external-writers-quiesced") {
+        return refuse(
+            "inspect repository-specific writers, then pass --external-writers-quiesced",
+        );
+    }
+    let (main, refname) = main_ref(a, &repo.root)?;
+    repo.require_annex_ready(a.flag("--external-writers-quiesced"))?;
+    let _lock = repo.lock()?;
+    let (entry, marker) = repo.find_task(id)?;
+    let caller = require_owner(&marker)?;
+    let (old, tip, already) = integrate_task(
+        &repo,
+        IntegrationContext {
+            id,
+            main: &main,
+            refname: &refname,
+            task_base: &marker.base,
+        },
+        &entry,
+        &caller,
+        IntegrationOptions {
+            allow_hooks: a.flag("--allow-repository-hooks"),
+            allow_annex_filter: a.flag("--allow-annex-filter"),
+            cleanup: None,
+            json_output: a.flag("--json"),
+        },
+    )?;
+    if a.flag("--json") {
+        out!(
+            "{}",
+            json!({
+                "status": if already { "already-integrated" } else { "integrated" },
+                "task_id": id,
+                "main": main,
+                "old": old,
+                "new": tip,
+            })
+        );
+    } else if already {
+        out!("{id} is already integrated into {main} ({old})");
+    } else {
+        out!("integrated {id}: {main} {old}..{tip}");
+    }
     Ok(())
 }
 
-fn remove_worktree(repo: &Repo, entry: &Entry, id: &str, cwds: &procinfo::CwdScan) -> R<()> {
+struct FinishMerge<'a> {
+    main_ref: &'a str,
+    main_tip: &'a str,
+    task_tip: &'a str,
+    allow_hooks: bool,
+    annex: bool,
+    cleanup: artifact::Options,
+    integration_message: &'a str,
+    allow_annex_filter: bool,
+    allow_commit_signing: bool,
+}
+
+fn merge_main_into_task(
+    repo: &Repo,
+    id: &str,
+    entry: &Entry,
+    task_base: &str,
+    context: FinishMerge<'_>,
+) -> R<String> {
+    ensure_task_head(entry, context.task_tip)?;
+    ensure_no_cwd_users(entry, "merge preparation")?;
+    if !is_ancestor(&repo.root, task_base, context.main_tip)?
+        || !is_ancestor(&repo.root, task_base, context.task_tip)?
+    {
+        return refuse(format!("{id} and main do not share the recorded task base"));
+    }
+    let initial = task::facts(&[entry], context.main_ref)?;
+    let initial = initial.first().cloned().unwrap_or_default();
+    initial
+        .removable_except_integration()
+        .map_err(|why| Fail::new(4, format!("{id} is not safe to merge: {why}")))?;
+    let main_worktree = canonical_main_checkout(repo)?;
+    artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup).map_err(
+        |why| {
+            Fail::new(
+                4,
+                format!("{id} must be clean before merging advanced main: {why}"),
+            )
+        },
+    )?;
+    if let Some(operation) = initial.in_progress {
+        return refuse(format!("{id} has a {operation} in progress"));
+    }
+    if context.annex {
+        annex_restage(entry)?;
+    }
+    ensure_task_head(entry, context.task_tip)?;
+    ensure_no_cwd_users(entry, "merge preparation")?;
+    let refreshed_plan =
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
+            .map_err(|why| Fail::new(4, format!("{id} changed during merge preparation: {why}")))?;
+    drop(refreshed_plan);
+    let preview = git::output(
+        &repo.root,
+        [
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            context.task_tip,
+            context.main_tip,
+        ],
+    )?;
+    let expected_tree = match preview.status.code() {
+        Some(0) => {
+            let merged_tree = String::from_utf8_lossy(&preview.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !git::is_oid(&merged_tree) {
+                return refuse("merge-tree returned no valid result tree");
+            }
+            preflight::check_merge_paths(&entry.path, context.task_tip, &merged_tree)
+                .map_err(|why| Fail::new(4, format!("final merge tree is unsafe: {why}")))?;
+            check_commit_signing(repo, context.allow_commit_signing)?;
+            check_active_filters(
+                repo,
+                context.task_tip,
+                &merged_tree,
+                context.allow_annex_filter,
+            )?;
+            merged_tree
+        }
+        Some(1) => {
+            return Err(Fail::new(
+                3,
+                format!(
+                    "merge of advanced main into {id} conflicts; task worktree preserved for resolution: {}",
+                    String::from_utf8_lossy(&preview.stdout).trim().replace('\n', ", ")
+                ),
+            ));
+        }
+        _ => {
+            return refuse(format!(
+                "merge-tree preflight failed: {}",
+                git::stderr_of(&preview)
+            ));
+        }
+    };
+    let hooks = active_hooks(
+        &entry.path,
+        &[
+            "pre-merge-commit",
+            "commit-msg",
+            "post-merge",
+            "reference-transaction",
+        ],
+        None,
+        None,
+    )?;
+    check_hooks(&hooks, context.allow_hooks)?;
+    ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
+    ensure_task_head(entry, context.task_tip)?;
+    ensure_no_cwd_users(entry, "merge")?;
+    let merge = git::output(
+        &entry.path,
+        [
+            "merge",
+            "--no-edit",
+            "--no-ff",
+            "--no-overwrite-ignore",
+            "-m",
+            context.integration_message,
+            context.main_tip,
+        ],
+    )?;
+    if !merge.status.success() {
+        let status = git::output(
+            &entry.path,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        let conflicts = String::from_utf8_lossy(&status.stdout)
+            .trim()
+            .replace('\n', ", ");
+        return Err(Fail::new(
+            3,
+            format!(
+                "merge of advanced main into {id} failed; worktree preserved for resolution ({}): {}",
+                entry.path.display(),
+                if conflicts.is_empty() { git::stderr_of(&merge) } else { conflicts }
+            ),
+        ));
+    }
+    if context.annex {
+        annex_restage(entry)?;
+    }
+    ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
+    let merged_tip = git::run(&entry.path, ["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let actual_tree = git::run(
+        &entry.path,
+        ["rev-parse", &format!("{merged_tip}^{{tree}}")],
+    )?
+    .trim()
+    .to_string();
+    if actual_tree != expected_tree {
+        return refuse(format!(
+            "{id} merge result tree differs from the preflight tree"
+        ));
+    }
+    if !is_ancestor(&repo.root, context.task_tip, &merged_tip)?
+        || !is_ancestor(&repo.root, context.main_tip, &merged_tip)?
+    {
+        return refuse(format!(
+            "{id} merge commit does not preserve both histories"
+        ));
+    }
+    let parents = git::run(&entry.path, ["show", "-s", "--format=%P", &merged_tip])?;
+    let parents: Vec<_> = parents.split_whitespace().collect();
+    if parents != [context.task_tip, context.main_tip] {
+        return refuse(format!("{id} HEAD changed unexpectedly during merge"));
+    }
+    ensure_no_cwd_users(entry, "post-merge check")?;
+    preflight::check_merge_paths(&entry.path, context.task_tip, &merged_tip)
+        .map_err(|why| Fail::new(4, format!("merged tree changed after preflight: {why}")))?;
+    let refreshed = task::facts(&[entry], context.main_ref)?;
+    let refreshed = refreshed.first().cloned().unwrap_or_default();
+    if refreshed.removable_except_integration().is_err()
+        || artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup).is_err()
+    {
+        return refuse(format!(
+            "{id} changed after merging main; leave it for inspection"
+        ));
+    }
+    Ok(merged_tip)
+}
+
+fn check_active_filters(repo: &Repo, old: &str, tree: &str, allow_annex_filter: bool) -> R<()> {
+    let changed = git::output(
+        &repo.root,
+        ["diff", "--name-only", "-z", "--no-renames", old, tree],
+    )?;
+    if !changed.status.success() {
+        return refuse(format!(
+            "cannot inspect changed paths for filters: {}",
+            git::stderr_of(&changed)
+        ));
+    }
+    let paths: Vec<&[u8]> = changed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let source = format!("--source={tree}");
+    let mut command = git::command(
+        &repo.root,
+        ["check-attr", source.as_str(), "-z", "filter", "--stdin"],
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| Fail::new(1, format!("cannot run git check-attr: {error}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        for path in &paths {
+            stdin
+                .write_all(path)
+                .map_err(|error| Fail::new(1, format!("cannot write filter paths: {error}")))?;
+            stdin
+                .write_all(b"\0")
+                .map_err(|error| Fail::new(1, format!("cannot write filter paths: {error}")))?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| Fail::new(1, format!("cannot read git check-attr: {error}")))?;
+    if !output.status.success() {
+        return refuse(format!(
+            "git check-attr failed: {}",
+            git::stderr_of(&output)
+        ));
+    }
+    let fields: Vec<&[u8]> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect();
+    let mut active = Vec::new();
+    let mut annex = Vec::new();
+    for triple in fields.chunks(3) {
+        if triple.len() != 3 {
+            return refuse("git check-attr returned malformed output");
+        }
+        if triple[1] != b"filter" || matches!(triple[2], b"unspecified" | b"unset") {
+            continue;
+        }
+        let description = format!(
+            "{}:filter={}",
+            String::from_utf8_lossy(triple[0]),
+            String::from_utf8_lossy(triple[2])
+        );
+        if triple[2] == b"annex" {
+            annex.push(description);
+        } else {
+            active.push(description);
+        }
+    }
+    if !active.is_empty() {
+        return refuse(format!(
+            "changed paths use unreviewed Git filters: {}",
+            active.join(", ")
+        ));
+    }
+    if !annex.is_empty() {
+        if !allow_annex_filter {
+            return refuse(format!(
+                "changed paths use Git-annex filters; inspect and pass --allow-annex-filter: {}",
+                annex.join(", ")
+            ));
+        }
+        let expected = [
+            ("filter.annex.clean", "git-annex smudge --clean -- %f"),
+            ("filter.annex.smudge", "git-annex smudge -- %f"),
+            ("filter.annex.process", "git-annex filter-process"),
+        ];
+        let mut mismatches = Vec::new();
+        for (key, expected) in expected {
+            let config = git::output(&repo.root, ["config", "--get", key])?;
+            if !config.status.success()
+                || String::from_utf8_lossy(&config.stdout).trim() != expected
+            {
+                mismatches.push(key);
+            }
+        }
+        if !mismatches.is_empty() || !repo.require_annex_ready(true)? {
+            return refuse(format!(
+                "git-annex filter configuration is not verified: {}",
+                mismatches.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_commit_signing(repo: &Repo, allow_commit_signing: bool) -> R<()> {
+    let signing = git::output(&repo.root, ["config", "--bool", "--get", "commit.gpgsign"])?;
+    if !signing.status.success() && signing.status.code() != Some(1) {
+        return refuse(format!(
+            "cannot inspect commit signing configuration: {}",
+            git::stderr_of(&signing)
+        ));
+    }
+    if signing.status.success()
+        && String::from_utf8_lossy(&signing.stdout).trim() == "true"
+        && !allow_commit_signing
+    {
+        return refuse(
+            "integration merge is configured to sign; authorize it with --allow-commit-signing",
+        );
+    }
+    Ok(())
+}
+
+fn cmd_finish(a: &Args) -> R<()> {
+    let repo = a.repo(true)?;
+    let id = a.get("--id")?;
+    let legacy_id = a.get("--legacy-worktree-id")?;
+    let branch = a.get("--expect-branch")?;
+    if [id, legacy_id, branch]
+        .into_iter()
+        .filter(Option::is_some)
+        .count()
+        != 1
+    {
+        return Err(Fail::new(
+            2,
+            "provide exactly one of --id, --legacy-worktree-id, or --expect-branch",
+        ));
+    }
+    if a.flag("--delete-branch") && branch.is_none() {
+        return Err(Fail::new(2, "--delete-branch requires --expect-branch"));
+    }
+    let keep_worktree = a.flag("--keep-worktree");
+    let integration_message = a
+        .get("--integration-message")?
+        .unwrap_or("chore: integrate task worktree");
+    if integration_message.trim().is_empty()
+        || integration_message.contains('\n')
+        || integration_message.contains('\r')
+    {
+        return Err(Fail::new(
+            2,
+            "--integration-message must be a non-empty single line",
+        ));
+    }
+    if keep_worktree
+        && (a.flag("--delete-branch")
+            || a.flag("--discard-direnv-cache")
+            || a.flag("--discard-generated-caches")
+            || a.flag("--discard-generated-build-outputs")
+            || a.flag("--discard-generated-artifacts")
+            || a.flag("--preserve-generated-artifacts"))
+    {
+        return Err(Fail::new(
+            2,
+            "--keep-worktree cannot be combined with branch or artifact cleanup options",
+        ));
+    }
+    if !a.flag("--external-writers-quiesced") {
+        return refuse(
+            "inspect scheduled and non-cooperating writers, then pass --external-writers-quiesced",
+        );
+    }
+    let cleanup = if keep_worktree {
+        artifact::Options::default()
+    } else {
+        artifact_options(a, true)?
+    };
+    let (main, refname) = main_ref(a, &repo.root)?;
+    let annex = repo.require_annex_ready(true)?;
+    let _lock = repo.lock()?;
+    let (mut entry, task_base, marker, removal, display_id, caller) = if let Some(id) = id {
+        let (entry, marker) = repo.find_task(id)?;
+        let caller = require_owner(&marker)?;
+        let removal = RemovalAuthority {
+            worktree_id: entry.id(),
+            wtctl_task_id: Some(marker.task_id.clone()),
+            expected_marker: Some(marker.raw.clone()),
+            expected_lock_reason: Some(format!("agent-task {id}")),
+            legacy_owner: None,
+            expected_branch: None,
+        };
+        (
+            entry,
+            marker.base.clone(),
+            Some(marker),
+            removal,
+            id.to_string(),
+            caller,
+        )
+    } else {
+        let (entry, trailer) = find_legacy_target(&repo, legacy_id, branch)?;
+        if !legacy_is_mine(&trailer) {
+            return refuse("legacy worktree belongs to another or unknown client session");
+        }
+        let task_base = trailer
+            .get("base")
+            .filter(|base| git::is_oid(base))
+            .cloned()
+            .ok_or_else(|| Fail::new(4, "legacy owner metadata has no valid base OID"))?;
+        let client = trailer["client"].clone();
+        let session = trailer["session"].clone();
+        let display_id = branch
+            .map(str::to_string)
+            .or_else(|| legacy_id.map(str::to_string))
+            .unwrap_or_else(|| entry.id());
+        let removal = RemovalAuthority {
+            worktree_id: entry.id(),
+            wtctl_task_id: None,
+            expected_marker: None,
+            expected_lock_reason: None,
+            legacy_owner: Some((client, session)),
+            expected_branch: branch.map(str::to_string),
+        };
+        (entry, task_base, None, removal, display_id, me()?)
+    };
+    let main_tip = git::run(&repo.root, ["rev-parse", "--verify", &refname])?
+        .trim()
+        .to_string();
+    let task_tip = entry
+        .current_oid()
+        .ok_or_else(|| Fail::new(4, format!("cannot resolve {display_id} HEAD")))?;
+    if !is_ancestor(&repo.root, &main_tip, &task_tip)?
+        && !is_ancestor(&repo.root, &task_tip, &main_tip)?
+    {
+        let merged_tip = merge_main_into_task(
+            &repo,
+            &display_id,
+            &entry,
+            &task_base,
+            FinishMerge {
+                main_ref: &refname,
+                main_tip: &main_tip,
+                task_tip: &task_tip,
+                allow_hooks: a.flag("--allow-repository-hooks"),
+                annex,
+                cleanup,
+                integration_message,
+                allow_annex_filter: a.flag("--allow-annex-filter"),
+                allow_commit_signing: a.flag("--allow-commit-signing"),
+            },
+        )?;
+        entry = Entry::load(entry.admin.clone()).ok_or_else(|| {
+            Fail::new(
+                4,
+                format!("{display_id} registration disappeared after merge"),
+            )
+        })?;
+        if entry.current_oid().as_deref() != Some(merged_tip.as_str()) {
+            return refuse(format!(
+                "{display_id} HEAD changed after merge; cleanup stopped"
+            ));
+        }
+        verify_removal_authority(&repo, &entry, &removal)?;
+        if let Some(marker) = &marker {
+            require_owner(marker)?;
+        }
+    }
+    let finish_head = entry
+        .current_oid()
+        .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before integration"))?;
+    let (old, tip, already) = integrate_task(
+        &repo,
+        IntegrationContext {
+            id: &display_id,
+            main: &main,
+            refname: &refname,
+            task_base: &task_base,
+        },
+        &entry,
+        &caller,
+        IntegrationOptions {
+            allow_hooks: a.flag("--allow-repository-hooks"),
+            allow_annex_filter: a.flag("--allow-annex-filter"),
+            cleanup: Some(cleanup),
+            json_output: a.flag("--json"),
+        },
+    )?;
+    let fresh = Entry::load(entry.admin.clone()).ok_or_else(|| {
+        Fail::new(
+            4,
+            format!("{display_id} registration disappeared after integration"),
+        )
+    })?;
+    if fresh.path != entry.path || fresh.current_oid().as_deref() != Some(finish_head.as_str()) {
+        return refuse(format!(
+            "{display_id} changed after integration; cleanup stopped"
+        ));
+    }
+    verify_removal_authority(&repo, &fresh, &removal)?;
+    if let Some(marker) = &marker {
+        require_owner(marker)?;
+    }
+    let post_integration_facts = task::facts(&[&fresh], &refname)?;
+    post_integration_facts
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .removable_except_integration()
+        .map_err(|why| Fail::new(4, format!("{display_id} changed after integration: {why}")))?;
+    let main_worktree = canonical_main_checkout(&repo)?;
+    artifact::inspect_plan(&fresh.path, main_worktree.as_deref(), cleanup)
+        .map_err(|why| Fail::new(4, format!("{display_id} changed after integration: {why}")))?;
+    if keep_worktree {
+        repo.audit(json!({
+            "at": now(),
+            "event": "finish-kept",
+            "worktree_id": removal.worktree_id,
+            "ref": refname,
+            "old": old,
+            "new": tip,
+            "already_integrated": already,
+            "pid": caller.pid,
+        }));
+        if a.flag("--json") {
+            out!(
+                "{}",
+                json!({
+                    "status": "integrated-kept",
+                    "repo": repo.root,
+                    "main_tip": tip,
+                    "task_id": display_id,
+                    "worktree_id": removal.worktree_id,
+                    "task_tip": finish_head,
+                })
+            );
+        } else {
+            out!("integrated {display_id}: {main} (worktree kept)");
+        }
+        return Ok(());
+    }
+    let finished_head = fresh
+        .current_oid()
+        .ok_or_else(|| Fail::new(4, "cannot resolve finished worktree HEAD"))?;
+    if let Err(fail) = remove_worktree(
+        &repo,
+        &fresh,
+        &removal,
+        RemovalContext {
+            main_ref: &refname,
+            cwds: &procinfo::scan_cwds(),
+            annex,
+            cleanup,
+            json_output: a.flag("--json"),
+        },
+    ) {
+        return Err(Fail::new(
+            fail.code,
+            format!(
+                "{display_id} integrated but cleanup is pending: {}",
+                fail.msg
+            ),
+        ));
+    }
+    if let Some(branch) = branch {
+        if a.flag("--delete-branch") {
+            delete_legacy_branch(&repo, branch, &finished_head, &refname)?;
+        }
+    }
+    repo.audit(json!({
+        "at": now(),
+        "event": "finish",
+        "worktree_id": removal.worktree_id,
+        "ref": refname,
+        "old": old,
+        "new": tip,
+        "already_integrated": already,
+        "pid": caller.pid,
+    }));
+    if a.flag("--json") {
+        out!(
+            "{}",
+            json!({
+                "status": "finished",
+                "repo": repo.root,
+                "main_tip": tip,
+                "task_id": display_id,
+                "worktree_id": removal.worktree_id,
+                "task_tip": finished_head,
+                "already_integrated": already,
+            })
+        );
+    } else {
+        out!("finished {display_id}: {main}");
+    }
+    Ok(())
+}
+
+fn gitfile_pointer(entry: &Entry) -> R<Option<OsString>> {
+    let dotgit = entry.path.join(".git");
+    let admin = canon(&entry.admin);
+    let metadata = fs::symlink_metadata(&dotgit)
+        .map_err(|e| Fail::new(4, format!("cannot inspect {}: {e}", dotgit.display())))?;
+    let symlink_target = if metadata.file_type().is_symlink() {
+        let target = fs::read_link(&dotgit)
+            .map_err(|e| Fail::new(4, format!("cannot read {} symlink: {e}", dotgit.display())))?;
+        if canon(&dotgit) != admin {
+            return refuse(format!(
+                "{} does not resolve to {}",
+                dotgit.display(),
+                admin.display()
+            ));
+        }
+        Some(target.into_os_string())
+    } else if metadata.is_file() {
+        let text = fs::read_to_string(&dotgit)
+            .map_err(|e| Fail::new(4, format!("cannot read {} gitfile: {e}", dotgit.display())))?;
+        let pointer = text
+            .trim()
+            .strip_prefix("gitdir: ")
+            .ok_or_else(|| Fail::new(4, format!("{} is not a gitfile", dotgit.display())))?;
+        let pointer = PathBuf::from(pointer);
+        let pointer = if pointer.is_absolute() {
+            pointer
+        } else {
+            entry.path.join(pointer)
+        };
+        if canon(&pointer) != admin {
+            return refuse(format!(
+                "{} does not name {}",
+                dotgit.display(),
+                admin.display()
+            ));
+        }
+        None
+    } else {
+        return refuse(format!(
+            "{} is neither a gitfile nor a symlink",
+            dotgit.display()
+        ));
+    };
+
+    let back = fs::read_to_string(entry.admin.join("gitdir")).map_err(|e| {
+        Fail::new(
+            4,
+            format!("cannot read {}: {e}", entry.admin.join("gitdir").display()),
+        )
+    })?;
+    let back = PathBuf::from(back.trim());
+    let back = if back.is_absolute() {
+        back
+    } else {
+        entry.admin.join(back)
+    };
+    if back.file_name() != Some(OsStr::new(".git"))
+        || back.parent().is_none_or(|p| canon(p) != canon(&entry.path))
+    {
+        return refuse(format!(
+            "{} does not point back to {}",
+            entry.admin.join("gitdir").display(),
+            dotgit.display()
+        ));
+    }
+    Ok(symlink_target)
+}
+
+fn replace_dotgit_with_gitfile(entry: &Entry, expected_link: &OsStr) -> R<()> {
+    if gitfile_pointer(entry)?.as_deref() != Some(expected_link) {
+        return refuse(format!(
+            "{} changed before annex normalization",
+            entry.path.join(".git").display()
+        ));
+    }
+    let dotgit = entry.path.join(".git");
+    let temporary = entry
+        .path
+        .join(format!(".git.wtctl-normalize-{}.tmp", random_hex(8)?));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&temporary)
+        .map_err(|e| Fail::new(4, format!("cannot create {}: {e}", temporary.display())))?;
+    let result = (|| -> std::io::Result<()> {
+        writeln!(file, "gitdir: {}", entry.admin.display())?;
+        file.sync_all()?;
+        if gitfile_pointer(entry).ok().flatten().as_deref() != Some(expected_link) {
+            return Err(std::io::Error::other(
+                ".git symlink changed during normalization",
+            ));
+        }
+        fs::rename(&temporary, &dotgit)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return refuse(format!("cannot normalize {}: {error}", dotgit.display()));
+    }
+    if gitfile_pointer(entry)?.is_some() {
+        return refuse(format!(
+            "{} remained a symlink after normalization",
+            dotgit.display()
+        ));
+    }
+    Ok(())
+}
+
+fn restore_dotgit_symlink(entry: &Entry, original: &OsStr) -> R<()> {
+    let dotgit = entry.path.join(".git");
+    match gitfile_pointer(entry)? {
+        Some(current) if current == original => return Ok(()),
+        Some(_) => {
+            return refuse(format!(
+                "{} has a different symlink target",
+                dotgit.display()
+            ))
+        }
+        None => {}
+    }
+    let temporary = entry
+        .path
+        .join(format!(".git.wtctl-restore-{}.tmp", random_hex(8)?));
+    std::os::unix::fs::symlink(original, &temporary).map_err(|e| {
+        Fail::new(
+            4,
+            format!("cannot stage {} symlink restoration: {e}", dotgit.display()),
+        )
+    })?;
+    if gitfile_pointer(entry)?.is_some() {
+        let _ = fs::remove_file(&temporary);
+        return refuse(format!(
+            "{} changed before symlink restoration",
+            dotgit.display()
+        ));
+    }
+    fs::rename(&temporary, &dotgit).map_err(|e| {
+        Fail::new(
+            4,
+            format!("cannot restore {} symlink: {e}", dotgit.display()),
+        )
+    })?;
+    if gitfile_pointer(entry)?.as_deref() != Some(original) {
+        return refuse(format!(
+            "{} symlink restoration did not verify",
+            dotgit.display()
+        ));
+    }
+    Ok(())
+}
+
+fn annex_restage(entry: &Entry) -> R<()> {
+    let result = git::output(&entry.path, ["annex", "restage"])?;
+    if !result.status.success() {
+        return refuse(format!(
+            "git annex restage failed: {}",
+            git::stderr_of(&result)
+        ));
+    }
+    let refreshed = Entry::load(entry.admin.clone()).ok_or_else(|| {
+        Fail::new(
+            4,
+            "worktree registration disappeared after git annex restage",
+        )
+    })?;
+    if refreshed.path != entry.path || refreshed.head != entry.head || refreshed.id() != entry.id()
+    {
+        return refuse("worktree identity or HEAD changed during git annex restage");
+    }
+    let status = git::output(&refreshed.path, git::STATUS_ARGS)?;
+    if !status.status.success() || !git::parse_status(&status.stdout).is_clean() {
+        return refuse(format!(
+            "{} changed during git annex restage",
+            refreshed.path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_failed_removal(
+    repo: &Repo,
+    expected: &Entry,
+    authority: &RemovalAuthority,
+    expected_head: &str,
+    original_symlink: Option<&OsStr>,
+    was_locked: bool,
+) -> R<()> {
+    let fresh = Entry::load(expected.admin.clone()).ok_or_else(|| {
+        Fail::new(
+            4,
+            "Git removal failed after the worktree registration disappeared; inspect the path and admin directory before recovery",
+        )
+    })?;
+    if fresh.path != expected.path
+        || fresh.id() != authority.worktree_id
+        || fresh.current_oid().as_deref() != Some(expected_head)
+        || !fresh.path.is_dir()
+    {
+        return refuse(
+            "Git removal failed after the worktree identity or HEAD changed; preserved remaining state for inspection",
+        );
+    }
+    verify_removal_authority(repo, &fresh, authority)?;
+    let pointer = gitfile_pointer(&fresh)?;
+    if let Some(original) = original_symlink {
+        if pointer
+            .as_deref()
+            .is_some_and(|current| current != original)
+        {
+            return refuse(
+                "Git removal failed and the .git symlink target changed; left it untouched",
+            );
+        }
+    } else if pointer.is_some() {
+        return refuse("Git removal failed and .git changed to a symlink; left it untouched");
+    }
+
+    let expected_lock = authority.expected_lock_reason.as_deref();
+    match (&fresh.lock_reason, was_locked, expected_lock) {
+        (Some(current), true, Some(expected)) if current == expected => {}
+        (Some(_), _, _) => {
+            return refuse("Git removal failed and the worktree lock changed; left it untouched")
+        }
+        (None, true, Some(_)) => relock(repo, fresh.path.as_os_str(), &authority.worktree_id)
+            .map_err(|e| Fail::new(4, format!("worktree left UNLOCKED ({})", e.msg)))?,
+        (None, _, _) => {}
+    }
+    let refreshed = Entry::load(fresh.admin.clone())
+        .ok_or_else(|| Fail::new(4, "worktree registration disappeared during rollback"))?;
+    if refreshed.path != expected.path
+        || refreshed.id() != authority.worktree_id
+        || refreshed.current_oid().as_deref() != Some(expected_head)
+        || !refreshed.path.is_dir()
+    {
+        return refuse(
+            "worktree changed while restoring its original state; inspect before recovery",
+        );
+    }
+    verify_removal_authority(repo, &refreshed, authority)?;
+    if was_locked && refreshed.lock_reason.as_deref() != expected_lock {
+        return refuse("failed to restore the worktree's original lock state");
+    }
+    if let Some(original) = original_symlink {
+        if gitfile_pointer(&refreshed)?.is_none() {
+            restore_dotgit_symlink(&refreshed, original)?;
+        }
+    }
+    Ok(())
+}
+
+struct RemovalAuthority {
+    worktree_id: String,
+    wtctl_task_id: Option<String>,
+    expected_marker: Option<Value>,
+    expected_lock_reason: Option<String>,
+    legacy_owner: Option<(String, String)>,
+    expected_branch: Option<String>,
+}
+
+fn removal_lock_state(entry: &Entry, authority: &RemovalAuthority) -> R<bool> {
+    match (
+        &entry.lock_reason,
+        authority.expected_lock_reason.as_deref(),
+    ) {
+        (Some(reason), Some(expected)) if reason == expected => Ok(true),
+        (Some(reason), _) => refuse(format!(
+            "{} is locked by someone else ({reason:?}); leave it alone",
+            entry.path.display()
+        )),
+        (None, _) => Ok(false),
+    }
+}
+
+fn verify_removal_authority(repo: &Repo, entry: &Entry, authority: &RemovalAuthority) -> R<()> {
+    if entry.id() != authority.worktree_id {
+        return refuse(format!(
+            "expected worktree ID {} but Git registered {}",
+            authority.worktree_id,
+            entry.id()
+        ));
+    }
+    if let Some(task_id) = &authority.wtctl_task_id {
+        if entry.marker().is_none_or(|m| {
+            m.task_id != *task_id || authority.expected_marker.as_ref() != Some(&m.raw)
+        }) {
+            return refuse(format!("wtctl marker mismatch for {task_id}"));
+        }
+        return Ok(());
+    }
+    if let Some(branch) = &authority.expected_branch {
+        if entry
+            .branch_ref()
+            .and_then(|r| r.strip_prefix("refs/heads/"))
+            != Some(branch.as_str())
+        {
+            return refuse(format!(
+                "expected branch {branch} does not match the registered worktree"
+            ));
+        }
+    } else if entry.branch_ref().is_some() {
+        return refuse("legacy branch worktrees require --expect-branch");
+    }
+    let Some((client, session)) = &authority.legacy_owner else {
+        return refuse("legacy worktree removal requires an exact session owner");
+    };
+    let Some(meta) = legacy_metadata(repo, entry) else {
+        return refuse("legacy owner metadata disappeared during removal");
+    };
+    if meta.get("client") != Some(client) || meta.get("session") != Some(session) {
+        return refuse("legacy owner metadata changed during removal");
+    }
+    if !legacy_is_mine(&meta) {
+        return refuse("legacy worktree belongs to another or unknown client session");
+    }
+    Ok(())
+}
+
+struct RemovalContext<'a> {
+    main_ref: &'a str,
+    cwds: &'a procinfo::CwdScan,
+    annex: bool,
+    cleanup: artifact::Options,
+    json_output: bool,
+}
+
+fn remove_worktree(
+    repo: &Repo,
+    entry: &Entry,
+    authority: &RemovalAuthority,
+    context: RemovalContext<'_>,
+) -> R<()> {
+    let RemovalContext {
+        main_ref,
+        cwds,
+        annex,
+        cleanup,
+        json_output,
+    } = context;
+    let id = &authority.worktree_id;
+    let expected_head = entry
+        .current_oid()
+        .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before removal"))?;
+    artifact::check_pending_transaction(&repo.name(), &entry.path)
+        .map_err(|why| Fail::new(4, format!("{id}: {why}")))?;
+    if entry.admin.join("modules").exists() {
+        return refuse(format!(
+            "{id} contains submodule state; remove it separately"
+        ));
+    }
+    let index = git::output(&entry.path, ["ls-files", "--stage", "-z"])?;
+    if !index.status.success()
+        || index.stdout.split(|byte| *byte == 0).any(|record| {
+            record
+                .split(|byte| *byte == b'\t')
+                .next()
+                .is_some_and(|metadata| metadata.starts_with(b"160000 "))
+        })
+    {
+        return refuse(format!(
+            "{id} contains submodules or its index cannot be inspected"
+        ));
+    }
+    if entry.admin.join("modules").exists() {
+        return refuse(format!(
+            "{id} contains submodule state; remove it separately"
+        ));
+    }
+    let index = git::output(&entry.path, ["ls-files", "--stage", "-z"])?;
+    if !index.status.success() {
+        return refuse(format!("cannot inspect the index of {id} for submodules"));
+    }
+    if index.stdout.split(|byte| *byte == 0).any(|record| {
+        record
+            .split(|byte| *byte == b'\t')
+            .next()
+            .is_some_and(|metadata| metadata.starts_with(b"160000 "))
+    }) {
+        return refuse(format!("{id} contains submodules; remove them separately"));
+    }
     if let Ok(cwd) = std::env::current_dir() {
         if canon(&cwd).starts_with(&entry.path) {
             return refuse(format!("run this outside {}", entry.path.display()));
+        }
+    }
+    let facts = task::facts(&[entry], main_ref)?;
+    facts
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
+        .map_err(|why| Fail::new(4, format!("{id}: {why}")))?;
+    if cleanup.allow_unreferenced_reflog {
+        let main_tip = git::run(&repo.root, ["rev-parse", "--verify", main_ref])?;
+        if !is_ancestor(&repo.root, &expected_head, main_tip.trim())? {
+            return refuse(format!("{id} HEAD is not contained in {main_ref}; reflog opt-in cannot permit an unintegrated task"));
         }
     }
     let users = procinfo::users_inside(cwds, &entry.path).map_err(|e| {
@@ -928,44 +2498,214 @@ fn remove_worktree(repo: &Repo, entry: &Entry, id: &str, cwds: &procinfo::CwdSca
             users.join(", ")
         ));
     }
-    let ours = format!("agent-task {id}");
-    let locked = match &entry.lock_reason {
-        Some(reason) if *reason == ours => true,
-        Some(reason) => {
-            return refuse(format!(
-                "{} is locked by someone else ({reason:?}); leave it alone",
-                entry.path.display()
-            ))
+    verify_removal_authority(repo, entry, authority)?;
+    let locked = removal_lock_state(entry, authority)?;
+    gitfile_pointer(entry)?;
+    if annex {
+        annex_restage(entry)?;
+        let refreshed = Entry::load(entry.admin.clone()).ok_or_else(|| {
+            Fail::new(
+                4,
+                "worktree registration disappeared after git annex restage",
+            )
+        })?;
+        if refreshed.path != entry.path
+            || refreshed.head != entry.head
+            || refreshed.lock_reason != entry.lock_reason
+        {
+            return refuse(format!("{id} changed during git annex restage"));
         }
-        None => false,
-    };
-    let path = entry.path.as_os_str();
-    if locked {
+        verify_removal_authority(repo, &refreshed, authority)?;
+        let facts = task::facts(&[&refreshed], main_ref)?;
+        facts
+            .first()
+            .cloned()
+            .unwrap_or_default()
+            .removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
+            .map_err(|why| Fail::new(4, format!("{id} changed during git annex restage: {why}")))?;
+        let fresh_cwds = procinfo::scan_cwds();
+        let users = procinfo::users_inside(&fresh_cwds, &entry.path).map_err(|e| {
+            Fail::new(
+                4,
+                format!(
+                    "cannot re-check processes inside {} after git annex restage: {e}",
+                    entry.path.display()
+                ),
+            )
+        })?;
+        if !users.is_empty() {
+            return refuse(format!(
+                "processes entered {} during git annex restage (pids: {})",
+                entry.path.display(),
+                users.join(", ")
+            ));
+        }
+    }
+    let main_worktree = canonical_main_checkout(repo)?;
+    let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+        .map_err(|why| Fail::new(4, format!("{id}: {why}")))?;
+    let dotgit_symlink = gitfile_pointer(entry)?;
+    let mut transaction = artifact::begin_transaction(
+        &plan,
+        &repo.name(),
+        &repo.common,
+        &entry.path,
+        &entry.admin,
+        &expected_head,
+        entry.branch_ref(),
+    )
+    .map_err(|why| Fail::new(4, format!("{id}: {why}")))?;
+    let mut rollback_dotgit = dotgit_symlink.clone();
+
+    let operation = (|| -> R<()> {
+        if let Some(transaction) = &mut transaction {
+            artifact::quarantine(transaction, &plan, &entry.path).map_err(|why| {
+                Fail::new(4, format!("cannot quarantine worktree artifacts: {why}"))
+            })?;
+        }
+        let facts = task::facts(&[entry], main_ref)?;
+        facts
+            .first()
+            .cloned()
+            .unwrap_or_default()
+            .removable_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
+            .map_err(|why| Fail::new(4, format!("{id} changed before removal: {why}")))?;
+        verify_removal_authority(repo, entry, authority)?;
+        let fresh = Entry::load(entry.admin.clone())
+            .ok_or_else(|| Fail::new(4, "worktree registration disappeared before removal"))?;
+        if fresh.path != entry.path
+            || fresh.current_oid().as_deref() != Some(expected_head.as_str())
+        {
+            return refuse(format!("{id} identity or HEAD changed before removal"));
+        }
+        let fresh_cwds = procinfo::scan_cwds();
+        let users = procinfo::users_inside(&fresh_cwds, &entry.path).map_err(|error| {
+            Fail::new(4, format!("cannot re-check worktree processes: {error}"))
+        })?;
+        if !users.is_empty() {
+            return refuse(format!(
+                "processes entered {} before removal (pids: {})",
+                entry.path.display(),
+                users.join(", ")
+            ));
+        }
+        let pointer = gitfile_pointer(entry)?;
+        rollback_dotgit = pointer.clone();
+        if let Some(link) = pointer.as_deref() {
+            replace_dotgit_with_gitfile(entry, link)?;
+        }
+        let path = entry.path.as_os_str();
+        if locked {
+            git::run(
+                &repo.root,
+                [OsStr::new("worktree"), OsStr::new("unlock"), path],
+            )?;
+        }
         git::run(
             &repo.root,
-            [OsStr::new("worktree"), OsStr::new("unlock"), path],
+            [OsStr::new("worktree"), OsStr::new("remove"), path],
         )?;
-    }
-    if let Err(fail) = git::run(
-        &repo.root,
-        [OsStr::new("worktree"), OsStr::new("remove"), path],
-    ) {
-        if locked {
-            if let Err(e) = relock(repo, path, id) {
+        if entry.path.exists() || Entry::load(entry.admin.clone()).is_some() {
+            return refuse(
+                "git worktree remove returned success but the path or registration remains",
+            );
+        }
+        Ok(())
+    })();
+
+    if let Err(fail) = operation {
+        let registered = Entry::load(entry.admin.clone()).is_some();
+        let still_registered = registered && entry.path.is_dir();
+        if !still_registered {
+            if let Some(transaction) = &mut transaction {
+                transaction.manifest["phase"] = json!("recovery_required");
+                let _ = artifact::write_recovery_marker(transaction);
+            }
+            return Err(Fail::new(
+                fail.code,
+                format!(
+                    "{}; {}; recovery data preserved",
+                    fail.msg,
+                    if registered {
+                        "worktree path changed during removal"
+                    } else {
+                        "worktree registration disappeared during removal"
+                    }
+                ),
+            ));
+        }
+        let rollback = rollback_failed_removal(
+            repo,
+            entry,
+            authority,
+            &expected_head,
+            rollback_dotgit.as_deref(),
+            locked,
+        );
+        if let Err(rollback) = rollback {
+            return Err(Fail::new(
+                fail.code,
+                format!("{}; rollback stopped safely: {}", fail.msg, rollback.msg),
+            ));
+        }
+        if let Some(transaction) = &mut transaction {
+            if let Err(restore) =
+                artifact::restore(transaction, &entry.path, &entry.admin, &expected_head)
+            {
                 return Err(Fail::new(
                     fail.code,
-                    format!("{}; worktree left UNLOCKED ({})", fail.msg, e.msg),
+                    format!(
+                        "{}; artifact rollback stopped safely: {}",
+                        fail.msg, restore
+                    ),
                 ));
             }
         }
         return Err(fail);
+    }
+
+    if let Some(transaction) = &mut transaction {
+        let report = artifact::finish_transaction(transaction).map_err(|why| {
+            Fail::new(
+                1,
+                format!("worktree removed; quarantine recovery required: {why}"),
+            )
+        })?;
+        for path in report.discarded {
+            if json_output {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "discarded generated artifact {}",
+                    path.display()
+                );
+            } else {
+                out!("discarded generated artifact {}", path.display());
+            }
+        }
+        for path in report.preserved {
+            if json_output {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "preserved generated artifact quarantine at {}",
+                    path.display()
+                );
+            } else {
+                out!(
+                    "preserved generated artifact quarantine at {}",
+                    path.display()
+                );
+            }
+        }
+        for warning in report.warnings {
+            let _ = writeln!(std::io::stderr(), "warning: {warning}");
+        }
     }
     Ok(())
 }
 
 fn cmd_reap(a: &Args) -> R<()> {
     let repo = a.repo(false)?;
-    let (_, main_ref) = main_ref(a, &repo.root)?;
+    let (_, main_ref) = base_ref(a, &repo.root)?;
     let grace = match a.get("--grace-secs")? {
         Some(v) => v
             .parse::<i64>()
@@ -975,6 +2715,7 @@ fn cmd_reap(a: &Args) -> R<()> {
         None => DEFAULT_GRACE_SECS,
     };
     let _lock = repo.lock()?;
+    let annex_repo = repo.uses_annex()?;
     let all = task::entries(&repo.common);
     let mut candidates = Vec::new();
     for e in &all {
@@ -993,7 +2734,17 @@ fn cmd_reap(a: &Args) -> R<()> {
             _ => {}
         }
     }
+    if !candidates.is_empty() && !a.flag("--dry-run") && !a.flag("--external-writers-quiesced") {
+        return refuse(
+            "inspect repository-specific writers, then pass --external-writers-quiesced",
+        );
+    }
     let facts = task::facts(&candidates, &main_ref)?;
+    let annex = if annex_repo && !candidates.is_empty() && !a.flag("--dry-run") {
+        repo.require_annex_ready(a.flag("--external-writers-quiesced"))?
+    } else {
+        annex_repo
+    };
     let cwds = if candidates.is_empty() {
         procinfo::CwdScan::Unavailable("not scanned".into())
     } else {
@@ -1039,7 +2790,29 @@ fn cmd_reap(a: &Args) -> R<()> {
         };
         match (fresh, refreshed) {
             (Some(fe), Some(rf)) if rf.removable().is_ok() => {
-                match remove_worktree(&repo, &fe, &id, &cwds) {
+                let removal = RemovalAuthority {
+                    worktree_id: id.clone(),
+                    wtctl_task_id: Some(id.clone()),
+                    expected_marker: fe.marker().map(|m| m.raw.clone()),
+                    expected_lock_reason: Some(format!("agent-task {id}")),
+                    legacy_owner: None,
+                    expected_branch: None,
+                };
+                match remove_worktree(
+                    &repo,
+                    &fe,
+                    &removal,
+                    RemovalContext {
+                        main_ref: &main_ref,
+                        cwds: &cwds,
+                        annex,
+                        cleanup: artifact::Options {
+                            discard_caches: true,
+                            ..artifact::Options::default()
+                        },
+                        json_output: false,
+                    },
+                ) {
                     Ok(()) => {
                         repo.audit(json!({"at": now(), "event": "reap", "task_id": id}));
                         out!("reaped\t{id}");
@@ -1083,20 +2856,325 @@ fn cmd_adopt(a: &Args) -> R<()> {
     Ok(())
 }
 
+fn find_legacy_target(
+    repo: &Repo,
+    worktree_id: Option<&str>,
+    branch: Option<&str>,
+) -> R<(Entry, HashMap<String, String>)> {
+    let entries = task::entries(&repo.common);
+    let matches: Vec<(Entry, HashMap<String, String>)> = entries
+        .into_iter()
+        .filter(|entry| {
+            if let Some(branch) = branch {
+                entry
+                    .branch_ref()
+                    .and_then(|r| r.strip_prefix("refs/heads/"))
+                    == Some(branch)
+            } else {
+                worktree_id.is_some_and(|id| entry.id() == id)
+            }
+        })
+        .filter(|entry| entry.marker().is_none())
+        .filter_map(|entry| legacy_metadata(repo, &entry).map(|meta| (entry, meta)))
+        .collect();
+    match matches.len() {
+        0 => refuse("no matching legacy worktree with readable owner metadata"),
+        1 => Ok(matches.into_iter().next().expect("one match")),
+        n => refuse(format!("legacy selector matched {n} worktrees")),
+    }
+}
+
+fn delete_legacy_branch(repo: &Repo, branch: &str, expected_head: &str, base_ref: &str) -> R<()> {
+    if branch.starts_with('-') {
+        return Err(Fail::new(2, "branch must not start with '-'"));
+    }
+    let name = git::output(&repo.root, ["check-ref-format", "--branch", branch])?;
+    if !name.status.success() {
+        return Err(Fail::new(2, format!("invalid branch name {branch:?}")));
+    }
+    let refname = format!("refs/heads/{branch}");
+    if main_checkout(repo, &refname)?.is_some() {
+        return refuse(format!("{refname} is still checked out in a worktree"));
+    }
+    let current = git::run(&repo.root, ["rev-parse", "--verify", &refname])?;
+    if current.trim() != expected_head {
+        return refuse(format!("{refname} moved after verification; branch kept"));
+    }
+    let base = git::run(&repo.root, ["rev-parse", "--verify", base_ref])?;
+    if !is_ancestor(&repo.root, expected_head, base.trim())? {
+        return refuse(format!(
+            "{refname} is not contained in {base_ref}; branch kept"
+        ));
+    }
+    let hooks = active_hooks(&repo.root, &["reference-transaction"], None, None)?;
+    check_hooks(&hooks, false)?;
+    let removed = git::output(&repo.root, ["update-ref", "-d", &refname, expected_head])?;
+    if !removed.status.success() {
+        return refuse(format!(
+            "could not delete {refname}: {}",
+            git::stderr_of(&removed)
+        ));
+    }
+    let section = format!("branch.{branch}");
+    let config = git::output(
+        &repo.root,
+        [
+            "config",
+            "--file",
+            &repo.common.join("config").to_string_lossy(),
+            "--remove-section",
+            &section,
+        ],
+    )?;
+    if !config.status.success() && !git::stderr_of(&config).contains("no such section") {
+        return Err(Fail::new(
+            1,
+            format!(
+                "{refname} was deleted but its config section remains: {}",
+                git::stderr_of(&config)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn cmd_remove(a: &Args) -> R<()> {
     let repo = a.repo(true)?;
-    let id = a.need("--id")?;
-    let (_, main_ref) = main_ref(a, &repo.root)?;
+    if a.get("--lock-name")?
+        .is_some_and(|name| name != lock::LEGACY_LOCK)
+    {
+        return Err(Fail::new(
+            2,
+            format!(
+                "the shared lifecycle lock name is fixed at {}",
+                lock::LEGACY_LOCK
+            ),
+        ));
+    }
+    if let Some(operation_id) = a.get("--purge-preserved-quarantine")? {
+        if !a.flag("--dry-run") && !a.flag("--external-writers-quiesced") {
+            return refuse(
+                "inspect quarantine and repository writers, then pass --external-writers-quiesced",
+            );
+        }
+        if ["--id", "--legacy-worktree-id", "--expect-branch"]
+            .iter()
+            .any(|selector| a.os(selector).is_some())
+            || [
+                "--delete-branch",
+                "--discard-direnv-cache",
+                "--discard-generated-caches",
+                "--discard-generated-build-outputs",
+                "--discard-generated-artifacts",
+                "--preserve-generated-artifacts",
+                "--allow-unreferenced-reflog",
+            ]
+            .iter()
+            .any(|flag| a.flag(flag))
+            || a.os("--base").is_some()
+        {
+            return Err(Fail::new(
+                2,
+                "quarantine purge cannot be combined with worktree removal options",
+            ));
+        }
+        let (_, main_ref) = main_ref(a, &repo.root)?;
+        let _lock = repo.lock()?;
+        let labels = artifact::purge_preserved(
+            &repo.root,
+            &repo.name(),
+            &repo.common,
+            &main_ref,
+            operation_id,
+            a.flag("--discard-unverified-direnv"),
+            a.flag("--dry-run"),
+        )
+        .map_err(|why| Fail::new(4, why))?;
+        if a.flag("--dry-run") {
+            if a.flag("--json") {
+                out!("{}", json!({"status": "dry-run", "artifacts": labels}));
+            } else {
+                out!(
+                    "dry-run ok: would purge preserved artifacts: {}",
+                    labels.join(", ")
+                );
+            }
+        } else {
+            if a.flag("--json") {
+                out!("{}", json!({"status": "purged", "artifacts": labels}));
+            } else {
+                out!("purged preserved artifacts: {}", labels.join(", "));
+            }
+        }
+        return Ok(());
+    }
+    if a.flag("--discard-unverified-direnv") {
+        return Err(Fail::new(
+            2,
+            "--discard-unverified-direnv requires --purge-preserved-quarantine",
+        ));
+    }
+    let cleanup = artifact_options(a, false)?;
+    let id = a.get("--id")?;
+    let legacy_id = a.get("--legacy-worktree-id")?;
+    let branch = a.get("--expect-branch")?;
+    if [id, legacy_id, branch]
+        .into_iter()
+        .filter(Option::is_some)
+        .count()
+        != 1
+    {
+        return Err(Fail::new(
+            2,
+            "provide exactly one of --id, --legacy-worktree-id, or --expect-branch",
+        ));
+    }
+    if a.flag("--delete-branch") && branch.is_none() {
+        return Err(Fail::new(2, "--delete-branch requires --expect-branch"));
+    }
+    let (_, main_ref) = base_ref(a, &repo.root)?;
+    let external_writers_quiesced = a.flag("--external-writers-quiesced") || a.flag("--dry-run");
+    let annex = repo.require_annex_ready(external_writers_quiesced)?;
+    if !a.flag("--dry-run") && !external_writers_quiesced {
+        return refuse(
+            "inspect repository-specific writers, then pass --external-writers-quiesced",
+        );
+    }
     let _lock = repo.lock()?;
-    let (entry, marker) = repo.find_task(id)?;
-    require_owner(&marker)?;
+    let (entry, authority) = if let Some(id) = id {
+        let (entry, marker) = repo.find_task(id)?;
+        require_owner(&marker)?;
+        let authority = RemovalAuthority {
+            worktree_id: entry.id(),
+            wtctl_task_id: Some(marker.task_id.clone()),
+            expected_marker: Some(marker.raw.clone()),
+            expected_lock_reason: Some(format!("agent-task {id}")),
+            legacy_owner: None,
+            expected_branch: None,
+        };
+        (entry, authority)
+    } else {
+        let (entry, trailer) = find_legacy_target(&repo, legacy_id, branch)?;
+        if !legacy_is_mine(&trailer) {
+            return refuse("legacy worktree belongs to another or unknown client session");
+        }
+        if a.flag("--delete-branch") && branch.is_none() {
+            return Err(Fail::new(
+                2,
+                "--delete-branch is only valid for a branch-backed legacy worktree",
+            ));
+        }
+        let authority = RemovalAuthority {
+            worktree_id: entry.id(),
+            wtctl_task_id: None,
+            expected_marker: None,
+            expected_lock_reason: None,
+            legacy_owner: Some((trailer["client"].clone(), trailer["session"].clone())),
+            expected_branch: branch.map(str::to_string),
+        };
+        (entry, authority)
+    };
     let facts = task::facts(&[&entry], &main_ref)?;
     let f = facts.first().cloned().unwrap_or_default();
-    f.removable()
-        .or_else(|why| refuse(format!("{id}: {why}")))?;
-    remove_worktree(&repo, &entry, id, &procinfo::scan_cwds())?;
-    repo.audit(json!({"at": now(), "event": "remove", "task_id": id}));
-    out!("removed {id}");
+    f.removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
+        .or_else(|why| refuse(format!("{}: {why}", authority.worktree_id)))?;
+    if cleanup.allow_unreferenced_reflog {
+        let main_tip = git::run(&repo.root, ["rev-parse", "--verify", &main_ref])?;
+        if !is_ancestor(&repo.root, &f.head, main_tip.trim())? {
+            return refuse("--allow-unreferenced-reflog cannot remove an unintegrated HEAD");
+        }
+    }
+    let head = entry
+        .current_oid()
+        .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD"))?;
+    if a.flag("--dry-run") {
+        let main_worktree = canonical_main_checkout(&repo)?;
+        artifact::check_pending_transaction(&repo.name(), &entry.path)
+            .map_err(|why| Fail::new(4, why))?;
+        let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+            .map_err(|why| Fail::new(4, why))?;
+        verify_removal_authority(&repo, &entry, &authority)?;
+        removal_lock_state(&entry, &authority)?;
+        let users = procinfo::users_inside(&procinfo::scan_cwds(), &entry.path)
+            .map_err(|e| Fail::new(4, format!("cannot check processes inside worktree: {e}")))?;
+        if !users.is_empty() {
+            return refuse(format!(
+                "processes still have their cwd inside {} (pids: {})",
+                entry.path.display(),
+                users.join(", ")
+            ));
+        }
+        let dotgit = gitfile_pointer(&entry)?;
+        if a.flag("--json") {
+            out!(
+                "{}",
+                json!({
+                    "status": "dry-run",
+                    "worktree_id": authority.worktree_id,
+                    "path": entry.path,
+                    "head": head,
+                    "verified_dotgit": if dotgit.is_some() { "symlink" } else { "gitfile" },
+                    "generated_artifacts": plan.generated.len() + usize::from(plan.direnv.is_some()),
+                    "canonical_database_link": plan.database_link.is_some(),
+                    "git_annex_restage": annex,
+                })
+            );
+        } else {
+            out!(
+                "dry-run ok: {} (.git is a {}; HEAD {}) would be removed{}{}",
+                entry.path.display(),
+                if dotgit.is_some() {
+                    "verified symlink"
+                } else {
+                    "verified gitfile"
+                },
+                head,
+                if annex {
+                    "; git annex restage would run first"
+                } else {
+                    ""
+                },
+                if plan.generated.is_empty()
+                    && plan.direnv.is_none()
+                    && plan.database_link.is_none()
+                {
+                    String::new()
+                } else {
+                    format!(
+                        "; {} generated artifact(s) would be quarantined then cleaned or preserved",
+                        plan.generated.len() + usize::from(plan.direnv.is_some())
+                    )
+                },
+            );
+        }
+        return Ok(());
+    }
+    remove_worktree(
+        &repo,
+        &entry,
+        &authority,
+        RemovalContext {
+            main_ref: &main_ref,
+            cwds: &procinfo::scan_cwds(),
+            annex,
+            cleanup,
+            json_output: a.flag("--json"),
+        },
+    )?;
+    if let Some(branch) = branch {
+        if a.flag("--delete-branch") {
+            delete_legacy_branch(&repo, branch, &head, &main_ref)?;
+        }
+    }
+    repo.audit(json!({"at": now(), "event": "remove", "worktree_id": authority.worktree_id}));
+    if a.flag("--json") {
+        out!(
+            "{}",
+            json!({"status": "removed", "worktree_id": authority.worktree_id, "branch_deleted": a.flag("--delete-branch")})
+        );
+    } else {
+        out!("removed {}", authority.worktree_id);
+    }
     Ok(())
 }
 
@@ -1110,11 +3188,71 @@ fn run(argv: &[OsString]) -> R<()> {
         return Ok(());
     }
     let args = Args::parse(rest)?;
+    let cleanup_flags = [
+        "--discard-direnv-cache",
+        "--discard-generated-caches",
+        "--discard-generated-build-outputs",
+        "--discard-generated-artifacts",
+        "--preserve-generated-artifacts",
+        "--discard-unverified-direnv",
+        "--allow-unreferenced-reflog",
+    ];
+    if !matches!(cmd, "finish" | "remove")
+        && (cleanup_flags.iter().any(|flag| args.flag(flag))
+            || args.os("--purge-preserved-quarantine").is_some())
+    {
+        return Err(Fail::new(
+            2,
+            "artifact cleanup options are only valid for finish or remove",
+        ));
+    }
+    if cmd == "finish"
+        && (args.flag("--discard-unverified-direnv")
+            || args.os("--purge-preserved-quarantine").is_some())
+    {
+        return Err(Fail::new(
+            2,
+            "quarantine purge options are only valid for remove",
+        ));
+    }
+    if !matches!(cmd, "finish" | "integrate") && args.flag("--allow-annex-filter") {
+        return Err(Fail::new(
+            2,
+            "--allow-annex-filter is only valid for integrate or finish",
+        ));
+    }
+    if cmd != "finish"
+        && (args.flag("--allow-commit-signing")
+            || args.flag("--keep-worktree")
+            || args.os("--integration-message").is_some())
+    {
+        return Err(Fail::new(
+            2,
+            "merge integration options are only valid for finish",
+        ));
+    }
+    if args.os("--base").is_some() && !matches!(cmd, "list" | "reap" | "remove") {
+        return Err(Fail::new(
+            2,
+            "--base is only valid for list, reap, or remove",
+        ));
+    }
+    if cmd != "create" && (args.os("--parent").is_some() || args.os("--worktrees-root").is_some()) {
+        return Err(Fail::new(
+            2,
+            "--parent and --worktrees-root are only valid for create",
+        ));
+    }
+    if cmd != "remove" && args.os("--lock-name").is_some() {
+        return Err(Fail::new(2, "--lock-name is only valid for remove"));
+    }
     match cmd {
+        "capabilities" => cmd_capabilities(&args),
         "create" => cmd_create(&args),
         "whoami" => cmd_whoami(&args),
         "list" => cmd_list(&args),
         "integrate" => cmd_integrate(&args),
+        "finish" => cmd_finish(&args),
         "reap" => cmd_reap(&args),
         "adopt" => cmd_adopt(&args),
         "remove" => cmd_remove(&args),
@@ -1124,9 +3262,21 @@ fn run(argv: &[OsString]) -> R<()> {
 
 fn main() {
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let json_output = argv.iter().any(|arg| arg.as_bytes() == b"--json");
     let result = run(&argv);
     if let Err(fail) = &result {
-        let _ = writeln!(std::io::stderr(), "error: {}", fail.msg);
+        if json_output {
+            out!(
+                "{}",
+                json!({
+                    "status": "error",
+                    "error": fail.msg,
+                    "exit_code": fail.code,
+                })
+            );
+        } else {
+            let _ = writeln!(std::io::stderr(), "error: {}", fail.msg);
+        }
     }
     // Interrupts held back during a locked mutation take effect only after the
     // error above is written, so a caller never loses it.
@@ -1194,6 +3344,43 @@ mod tests {
         assert_eq!(git::count_hidden(b"H a\0h b\0S c\0s d\0"), 3);
         assert!(git::is_oid(&"a".repeat(40)) && git::is_oid(&"0".repeat(64)));
         assert!(!git::is_oid("ref: refs/heads/main") && !git::is_oid(&"A".repeat(40)));
+    }
+
+    #[test]
+    fn annex_dotgit_symlink_round_trips_to_a_verified_gitfile() {
+        let dir = std::env::temp_dir().join(format!("wtctl-annex-dotgit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let worktree = dir.join("worktree");
+        let admin = dir.join("admin");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&admin, worktree.join(".git")).unwrap();
+        let entry = Entry {
+            admin: admin.clone(),
+            path: worktree.clone(),
+            head: "test-head".into(),
+            lock_reason: None,
+            meta: Meta::None,
+        };
+        let original = fs::read_link(worktree.join(".git"))
+            .unwrap()
+            .into_os_string();
+        assert_eq!(gitfile_pointer(&entry).unwrap(), Some(original.clone()));
+
+        replace_dotgit_with_gitfile(&entry, &original).unwrap();
+        assert!(gitfile_pointer(&entry).unwrap().is_none());
+        assert!(fs::read_to_string(worktree.join(".git"))
+            .unwrap()
+            .starts_with("gitdir: "));
+
+        restore_dotgit_symlink(&entry, &original).unwrap();
+        assert_eq!(gitfile_pointer(&entry).unwrap(), Some(original));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

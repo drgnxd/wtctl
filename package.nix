@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   git,
+  git-annex,
   lsof,
 }:
 
@@ -21,6 +22,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
   nativeCheckInputs = [
     git
+    git-annex
     lsof
   ];
   checkFeatures = [ "test-agent-names" ];
