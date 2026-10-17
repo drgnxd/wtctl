@@ -12,7 +12,8 @@ so a stale inherited variable cannot block or misattribute a task.
 ## Install
 
 ```sh
-nix build github:<owner>/wtctl        # or: nix profile install ...
+nix build github:drgnxd/wtctl
+nix profile install github:drgnxd/wtctl
 cargo install --path .                # from a checkout
 ```
 
