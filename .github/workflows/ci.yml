@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  commit-messages:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check Conventional Commit subjects
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash scripts/check-commit-messages.sh "$BASE_SHA" "$HEAD_SHA"
+
+  test:
+    name: Test (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15
+            system: aarch64-darwin
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v7.0.1
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          github_access_token: ${{ github.token }}
+      - run: nix develop -c cargo fmt --check
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/wtctl-target
+      - run: nix develop -c cargo clippy --all-targets -- -D warnings
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/wtctl-target
+      - run: nix develop -c cargo clippy --all-targets --features test-agent-names -- -D warnings
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/wtctl-target
+      - run: nix develop -c cargo test
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/wtctl-target
+      - run: nix develop -c cargo test --features test-agent-names
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/wtctl-target
+      - run: nix flake check
+      - run: nix build .#wtctl --no-link
