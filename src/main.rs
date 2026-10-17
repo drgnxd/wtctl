@@ -1533,7 +1533,7 @@ fn merge_main_into_task(
         return refuse(format!("{id} has a {operation} in progress"));
     }
     if context.annex {
-        annex_restage(entry)?;
+        annex_restage(entry, &entry.head)?;
     }
     ensure_task_head(entry, context.task_tip)?;
     ensure_no_cwd_users(entry, "merge preparation")?;
@@ -1633,13 +1633,13 @@ fn merge_main_into_task(
             ),
         ));
     }
-    if context.annex {
-        annex_restage(entry)?;
-    }
-    ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
     let merged_tip = git::run(&entry.path, ["rev-parse", "HEAD"])?
         .trim()
         .to_string();
+    if context.annex {
+        annex_restage(entry, &merged_tip)?;
+    }
+    ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
     let actual_tree = git::run(
         &entry.path,
         ["rev-parse", &format!("{merged_tip}^{{tree}}")],
@@ -2236,7 +2236,7 @@ fn restore_dotgit_symlink(entry: &Entry, original: &OsStr) -> R<()> {
     Ok(())
 }
 
-fn annex_restage(entry: &Entry) -> R<()> {
+fn annex_restage(entry: &Entry, expected_head: &str) -> R<()> {
     let result = git::output(&entry.path, ["annex", "restage"])?;
     if !result.status.success() {
         return refuse(format!(
@@ -2250,7 +2250,9 @@ fn annex_restage(entry: &Entry) -> R<()> {
             "worktree registration disappeared after git annex restage",
         )
     })?;
-    if refreshed.path != entry.path || refreshed.head != entry.head || refreshed.id() != entry.id()
+    if refreshed.path != entry.path
+        || refreshed.head != expected_head
+        || refreshed.id() != entry.id()
     {
         return refuse("worktree identity or HEAD changed during git annex restage");
     }
@@ -2502,7 +2504,7 @@ fn remove_worktree(
     let locked = removal_lock_state(entry, authority)?;
     gitfile_pointer(entry)?;
     if annex {
-        annex_restage(entry)?;
+        annex_restage(entry, &entry.head)?;
         let refreshed = Entry::load(entry.admin.clone()).ok_or_else(|| {
             Fail::new(
                 4,

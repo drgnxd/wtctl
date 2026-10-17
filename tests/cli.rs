@@ -1184,6 +1184,7 @@ fn git_annex_worktree_is_restage_checked_and_removed_from_a_symlink_gitdir() {
         .unwrap()
         .file_type()
         .is_symlink());
+    let main_tip = commit_file(&env.repo, "main.txt", "main work\n");
 
     let missing_remove_ack = env
         .raw_cmd(&["remove", "--repo", &env.repo_arg(), "--id", id])
@@ -1216,8 +1217,18 @@ fn git_annex_worktree_is_restage_checked_and_removed_from_a_symlink_gitdir() {
         "--allow-annex-filter",
     ]);
     assert!(out.contains(&format!("finished {id}")), "{out}");
-    assert_eq!(env.main_oid(), tip);
+    let finish_tip = env.main_oid();
+    assert_ne!(finish_tip, tip);
+    git(
+        &env.repo,
+        &["merge-base", "--is-ancestor", &tip, &finish_tip],
+    );
+    git(
+        &env.repo,
+        &["merge-base", "--is-ancestor", &main_tip, &finish_tip],
+    );
     assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task work");
+    assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main work");
     assert!(!path.exists());
     assert!(!git(&env.repo, &["worktree", "list", "--porcelain"]).contains(path.to_str().unwrap()));
 }
