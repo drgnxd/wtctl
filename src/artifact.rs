@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 
 const PRECOMMIT_CONFIG: &str = ".pre-commit-config.yaml";
 const MAX_PRECOMMIT_BYTES: u64 = 16 * 1024 * 1024;
+const PURGE_BATCH_ENTRIES: usize = 256;
+const LSOF_BATCH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeEntry {
@@ -68,6 +70,7 @@ pub struct Plan {
 pub struct MovedArtifact {
     pub original: PathBuf,
     pub quarantine: PathBuf,
+    pub journal: PathBuf,
     pub signature: Vec<TreeEntry>,
     pub preserve: bool,
     pub direnv: bool,
@@ -192,6 +195,7 @@ pub fn begin_transaction(
                 "path": item.path.strip_prefix(worktree).unwrap().to_string_lossy(),
                 "signature": signature_json(&item.signature),
                 "quarantine_path": operation.join(format!("generated-cache-{index:03}")),
+                "purge_journal": format!("purge-generated-cache-{index:03}.jsonl"),
                 "preserve": item.preserve,
                 "purge_state": "planned",
             })
@@ -203,6 +207,7 @@ pub fn begin_transaction(
             "signature": signature_json(&item.signature),
             "identity": [item.signature[0].device, item.signature[0].inode],
             "quarantine_path": operation.join(".direnv"),
+            "purge_journal": "purge-direnv.jsonl",
             "discard_requested": plan.discard_direnv,
             "discardable": plan.direnv_discardable,
             "purge_state": "planned",
@@ -310,9 +315,18 @@ fn move_artifact(
         format!("generated-cache-{index:03}")
     };
     let destination = transaction.operation.join(name);
+    let journal = transaction.operation.join(if direnv {
+        "purge-direnv.jsonl".to_string()
+    } else {
+        format!(
+            "purge-{}.jsonl",
+            destination.file_name().unwrap().to_string_lossy()
+        )
+    });
     transaction.moved.push(MovedArtifact {
         original: artifact.path.clone(),
         quarantine: destination.clone(),
+        journal,
         signature: artifact.signature.clone(),
         preserve: artifact.preserve,
         direnv,
@@ -542,6 +556,16 @@ pub fn purge_preserved(
             ));
         }
         let name = format!("generated-cache-{index:03}");
+        let journal_name = format!("purge-{name}.jsonl");
+        if record["purge_journal"]
+            .as_str()
+            .is_some_and(|value| value != journal_name)
+        {
+            return Err("generated artifact purge journal path is invalid".into());
+        }
+        if fs::symlink_metadata(operation.join(&journal_name)).is_ok() {
+            allowed.insert(journal_name.clone());
+        }
         if record["quarantine_path"] != operation.join(&name).to_string_lossy().as_ref() {
             return Err("generated artifact quarantine path is invalid".into());
         }
@@ -553,12 +577,13 @@ pub fn purge_preserved(
         }
         let archive = operation.join(&name);
         let signature = parse_signature(&record["signature"])?;
-        verify_purge_progress(&archive, &signature, record)?;
+        verify_artifact_progress(&archive, &signature, record, &operation.join(&journal_name))?;
         allowed.insert(name);
         labels.push(relative.to_string());
         transaction.moved.push(MovedArtifact {
             original: worktree.join(relative),
             quarantine: archive,
+            journal: operation.join(journal_name),
             signature,
             preserve: false,
             direnv: false,
@@ -567,6 +592,15 @@ pub fn purge_preserved(
     if transaction.manifest["direnv"].is_object() {
         let record = transaction.manifest["direnv"].clone();
         let archive = operation.join(".direnv");
+        if record["purge_journal"]
+            .as_str()
+            .is_some_and(|value| value != "purge-direnv.jsonl")
+        {
+            return Err(".direnv purge journal path is invalid".into());
+        }
+        if fs::symlink_metadata(operation.join("purge-direnv.jsonl")).is_ok() {
+            allowed.insert("purge-direnv.jsonl".into());
+        }
         if record["quarantine_path"] != archive.to_string_lossy().as_ref() {
             return Err(".direnv quarantine path is invalid".into());
         }
@@ -597,7 +631,12 @@ pub fn purge_preserved(
                     "purging an unverified .direnv requires --discard-unverified-direnv".into(),
                 );
             };
-            verify_purge_progress(&archive, &signature, &transaction.manifest["direnv"])?;
+            verify_artifact_progress(
+                &archive,
+                &signature,
+                &transaction.manifest["direnv"],
+                &operation.join("purge-direnv.jsonl"),
+            )?;
             if fs::symlink_metadata(&archive).is_ok() {
                 allowed.insert(".direnv".into());
             }
@@ -605,6 +644,7 @@ pub fn purge_preserved(
             transaction.moved.push(MovedArtifact {
                 original: worktree.join(".direnv"),
                 quarantine: archive,
+                journal: operation.join("purge-direnv.jsonl"),
                 signature,
                 preserve: false,
                 direnv: true,
@@ -717,14 +757,7 @@ fn verify_purge_progress(
     signature: &[TreeEntry],
     record: &Value,
 ) -> Result<(), String> {
-    let mut ordered = signature.to_vec();
-    ordered.sort_by(|a, b| {
-        b.relative
-            .matches('/')
-            .count()
-            .cmp(&a.relative.matches('/').count())
-            .then_with(|| b.relative.cmp(&a.relative))
-    });
+    let ordered = legacy_purge_order(signature);
     let cursor = record["purge_cursor"].as_u64().unwrap_or(0) as usize;
     let pending = record["purge_pending"].as_str();
     if cursor > ordered.len()
@@ -777,6 +810,61 @@ fn verify_purge_progress(
         ));
     }
     Ok(())
+}
+
+fn verify_artifact_progress(
+    root: &Path,
+    signature: &[TreeEntry],
+    record: &Value,
+    journal: &Path,
+) -> Result<(), String> {
+    if record["purge_order"]
+        .as_str()
+        .is_some_and(|order| order != "legacy")
+    {
+        return Err("artifact purge order is invalid".into());
+    }
+    if record.get("purge_cursor").is_some() || record.get("purge_pending").is_some() {
+        verify_purge_progress(root, signature, record)
+    } else if fs::symlink_metadata(journal).is_ok() {
+        let ordered = if record["purge_order"] == "legacy" {
+            legacy_purge_order(signature)
+        } else {
+            purge_order(signature)
+        };
+        let states = read_purge_journal(journal, &ordered)?;
+        verify_journal_progress(root, &ordered, &states)
+    } else {
+        verify_purge_progress(root, signature, record)
+    }
+}
+
+fn purge_order(signature: &[TreeEntry]) -> Vec<TreeEntry> {
+    let mut ordered = signature.to_vec();
+    ordered.sort_by(|a, b| match (a.relative == ".", b.relative == ".") {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => b
+            .relative
+            .matches('/')
+            .count()
+            .cmp(&a.relative.matches('/').count())
+            .then_with(|| b.relative.cmp(&a.relative)),
+    });
+    ordered
+}
+
+fn legacy_purge_order(signature: &[TreeEntry]) -> Vec<TreeEntry> {
+    let mut ordered = signature.to_vec();
+    ordered.sort_by(|a, b| {
+        b.relative
+            .matches('/')
+            .count()
+            .cmp(&a.relative.matches('/').count())
+            .then_with(|| b.relative.cmp(&a.relative))
+    });
+    ordered
 }
 
 fn known_generated_path(path: &str) -> bool {
@@ -837,21 +925,105 @@ fn transaction_record_mut<'a>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PurgeJournalState {
+    Pending,
+    Deleted,
+}
+
 fn purge_tree(transaction: &mut Transaction, moved: &MovedArtifact) -> Result<(), String> {
     let record = transaction_record_mut(transaction, moved)?.clone();
-    verify_purge_progress(&moved.quarantine, &moved.signature, &record)?;
-    let open_paths: Vec<PathBuf> = moved
-        .signature
-        .iter()
-        .filter(|entry| entry.kind != "symlink" && entry.kind != "special")
-        .map(|entry| {
-            if entry.relative == "." {
-                moved.quarantine.clone()
-            } else {
-                moved.quarantine.join(&entry.relative)
+    if record["purge_order"]
+        .as_str()
+        .is_some_and(|order| order != "legacy")
+    {
+        return Err("artifact purge order is invalid".into());
+    }
+    let legacy_order = record.get("purge_cursor").is_some()
+        || record.get("purge_pending").is_some()
+        || record["purge_order"] == "legacy";
+    let ordered = if legacy_order {
+        legacy_purge_order(&moved.signature)
+    } else {
+        purge_order(&moved.signature)
+    };
+    let journal_name = moved
+        .journal
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "artifact purge journal name is invalid".to_string())?;
+    if moved.journal.parent() != Some(transaction.operation.as_path())
+        || record["purge_journal"]
+            .as_str()
+            .is_some_and(|value| value != journal_name)
+    {
+        return Err("artifact purge journal path is invalid".into());
+    }
+
+    let journal_meta = fs::symlink_metadata(&moved.journal);
+    let legacy_progress =
+        record.get("purge_cursor").is_some() || record.get("purge_pending").is_some();
+    let mut states = if journal_meta.is_ok() && !legacy_progress {
+        read_purge_journal(&moved.journal, &ordered)?
+    } else {
+        let mut states = Vec::new();
+        if legacy_progress {
+            verify_purge_progress(&moved.quarantine, &moved.signature, &record)?;
+            let cursor = record["purge_cursor"].as_u64().unwrap_or(0) as usize;
+            states.resize(cursor, Some(PurgeJournalState::Deleted));
+            if let Some(pending) = record["purge_pending"].as_str() {
+                if cursor >= ordered.len() || pending != ordered[cursor].relative {
+                    return Err("quarantine purge cursor is malformed".into());
+                }
+                states.push(Some(PurgeJournalState::Pending));
             }
-        })
-        .collect();
+        }
+        if journal_meta.is_ok() {
+            let metadata = fs::symlink_metadata(&moved.journal)
+                .map_err(|error| format!("cannot inspect artifact purge journal: {error}"))?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::getuid() }
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err("artifact purge journal is not a private regular file".into());
+            }
+            fs::remove_file(&moved.journal).map_err(|error| {
+                format!("cannot restart artifact purge journal migration: {error}")
+            })?;
+        }
+        let mut journal = create_purge_journal(&moved.journal)?;
+        if !states.is_empty() {
+            for (index, state) in states.iter().enumerate() {
+                if *state == Some(PurgeJournalState::Deleted) {
+                    append_purge_journal(&mut journal, index, &ordered[index], "deleted")?;
+                } else {
+                    append_purge_journal(&mut journal, index, &ordered[index], "pending")?;
+                }
+            }
+            journal
+                .sync_all()
+                .map_err(|error| format!("cannot sync artifact purge journal: {error}"))?;
+            sync_dir(&transaction.operation)?;
+        } else {
+            journal
+                .sync_all()
+                .map_err(|error| format!("cannot sync artifact purge journal: {error}"))?;
+            sync_dir(&transaction.operation)?;
+        }
+        let record = transaction_record_mut(transaction, moved)?;
+        record["purge_journal"] = Value::String(journal_name.into());
+        if legacy_order {
+            record["purge_order"] = Value::String("legacy".into());
+        }
+        record.as_object_mut().unwrap().remove("purge_cursor");
+        record.as_object_mut().unwrap().remove("purge_pending");
+        write_manifest(transaction, "purging_preserved", false)?;
+        states
+    };
+    verify_journal_progress(&moved.quarantine, &ordered, &states)?;
+
+    let open_paths = purge_open_paths(&moved.quarantine, &ordered, &states);
     let open_pids = lsof_open_paths(&open_paths)?;
     if !open_pids.is_empty() {
         return Err(format!(
@@ -859,63 +1031,310 @@ fn purge_tree(transaction: &mut Transaction, moved: &MovedArtifact) -> Result<()
             open_pids.join(", ")
         ));
     }
-    let mut ordered = moved.signature.clone();
-    ordered.sort_by(|a, b| {
-        b.relative
-            .matches('/')
-            .count()
-            .cmp(&a.relative.matches('/').count())
-            .then_with(|| b.relative.cmp(&a.relative))
-    });
-    let mut cursor = transaction_record_mut(transaction, moved)?["purge_cursor"]
-        .as_u64()
-        .unwrap_or(0) as usize;
-    if cursor > ordered.len() {
-        return Err("quarantine purge cursor is invalid".into());
-    }
-    for (index, entry) in ordered.iter().enumerate().skip(cursor) {
-        let path = if entry.relative == "." {
-            moved.quarantine.clone()
-        } else {
-            moved.quarantine.join(&entry.relative)
-        };
-        let record = transaction_record_mut(transaction, moved)?;
-        if index == cursor
-            && record["purge_pending"] == entry.relative
-            && fs::symlink_metadata(&path).is_err()
-        {
-            record["purge_cursor"] = json!(index + 1);
-            record.as_object_mut().unwrap().remove("purge_pending");
-            write_manifest(transaction, "purging_preserved", false)?;
-            cursor = index + 1;
-            continue;
-        }
-        verify_one(&path, entry)?;
-        record["purge_cursor"] = json!(index);
-        record["purge_pending"] = Value::String(entry.relative.clone());
-        write_manifest(transaction, "purging_preserved", false)?;
-        match entry.kind.as_str() {
-            "directory" => fs::remove_dir(&path),
-            "file" | "symlink" => fs::remove_file(&path),
-            _ => {
-                return Err(format!(
-                    "unsupported artifact type remains quarantined: {}",
-                    path.display()
-                ))
+
+    let mut journal = open_purge_journal_append(&moved.journal)?;
+    for start in (0..ordered.len()).step_by(PURGE_BATCH_ENTRIES) {
+        let end = (start + PURGE_BATCH_ENTRIES).min(ordered.len());
+        for (index, entry) in ordered.iter().enumerate().take(end).skip(start) {
+            if index >= states.len() {
+                append_purge_journal(&mut journal, index, entry, "pending")?;
+                states.push(Some(PurgeJournalState::Pending));
             }
         }
-        .map_err(|error| format!("cannot purge {}: {error}", path.display()))?;
-        sync_dir(path.parent().unwrap_or(&transaction.operation))?;
-        let record = transaction_record_mut(transaction, moved)?;
-        record["purge_cursor"] = json!(index + 1);
-        record.as_object_mut().unwrap().remove("purge_pending");
-        write_manifest(transaction, "purging_preserved", false)?;
-        cursor = index + 1;
+        journal
+            .sync_all()
+            .map_err(|error| format!("cannot sync artifact purge journal: {error}"))?;
+
+        let mut changed_dirs = BTreeSet::new();
+        for (index, entry) in ordered.iter().enumerate().take(end).skip(start) {
+            if states[index] == Some(PurgeJournalState::Deleted) {
+                continue;
+            }
+            let path = if entry.relative == "." {
+                moved.quarantine.clone()
+            } else {
+                moved.quarantine.join(&entry.relative)
+            };
+            changed_dirs.insert(
+                path.parent()
+                    .unwrap_or(&transaction.operation)
+                    .to_path_buf(),
+            );
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    verify_one(&path, entry)?;
+                    match entry.kind.as_str() {
+                        "directory" => fs::remove_dir(&path),
+                        "file" | "symlink" => fs::remove_file(&path),
+                        _ => {
+                            return Err(format!(
+                                "unsupported artifact type remains quarantined: {}",
+                                path.display()
+                            ))
+                        }
+                    }
+                    .map_err(|error| format!("cannot purge {}: {error}", path.display()))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect pending purge entry {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        for directory in changed_dirs {
+            let mut ancestor = directory.as_path();
+            while !fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    format!(
+                        "cannot find a surviving parent directory for {}",
+                        directory.display()
+                    )
+                })?;
+            }
+            sync_dir(ancestor)?;
+        }
+        for (index, entry) in ordered.iter().enumerate().take(end).skip(start) {
+            if states[index] == Some(PurgeJournalState::Deleted) {
+                continue;
+            }
+            append_purge_journal(&mut journal, index, entry, "deleted")?;
+            states[index] = Some(PurgeJournalState::Deleted);
+        }
+        journal
+            .sync_all()
+            .map_err(|error| format!("cannot sync artifact purge journal: {error}"))?;
     }
-    if cursor != ordered.len() {
+    if states.len() != ordered.len()
+        || states
+            .iter()
+            .any(|state| *state != Some(PurgeJournalState::Deleted))
+    {
         return Err("generated artifact purge did not reach its signed end".into());
     }
     Ok(())
+}
+
+fn purge_open_paths(
+    root: &Path,
+    ordered: &[TreeEntry],
+    states: &[Option<PurgeJournalState>],
+) -> Vec<PathBuf> {
+    ordered
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            states.get(*index).copied().flatten() != Some(PurgeJournalState::Deleted)
+                && entry.kind != "symlink"
+                && entry.kind != "special"
+        })
+        .map(|(_, entry)| {
+            if entry.relative == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&entry.relative)
+            }
+        })
+        .collect()
+}
+
+fn create_purge_journal(path: &Path) -> Result<fs::File, String> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("cannot create artifact purge journal: {error}"))
+}
+
+fn open_purge_journal_append(path: &Path) -> Result<fs::File, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect artifact purge journal: {error}"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("artifact purge journal is not a private regular file".into());
+    }
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("cannot open artifact purge journal: {error}"))
+}
+
+fn append_purge_journal(
+    journal: &mut fs::File,
+    index: usize,
+    entry: &TreeEntry,
+    state: &str,
+) -> Result<(), String> {
+    serde_json::to_writer(
+        &mut *journal,
+        &json!({"index": index, "path": entry.relative, "state": state}),
+    )
+    .map_err(|error| format!("cannot encode artifact purge journal: {error}"))?;
+    journal
+        .write_all(b"\n")
+        .map_err(|error| format!("cannot append artifact purge journal: {error}"))
+}
+
+fn read_purge_journal(
+    path: &Path,
+    ordered: &[TreeEntry],
+) -> Result<Vec<Option<PurgeJournalState>>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect artifact purge journal: {error}"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("artifact purge journal is not a private regular file".into());
+    }
+    let mut states = Vec::new();
+    let mut bytes =
+        fs::read(path).map_err(|error| format!("cannot read artifact purge journal: {error}"))?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let valid_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let journal = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("cannot repair artifact purge journal tail: {error}"))?;
+        journal
+            .set_len(valid_len as u64)
+            .and_then(|()| journal.sync_all())
+            .map_err(|error| format!("cannot repair artifact purge journal tail: {error}"))?;
+        bytes.truncate(valid_len);
+    }
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let value: Value = serde_json::from_slice(line)
+            .map_err(|error| format!("artifact purge journal is malformed: {error}"))?;
+        let index = value["index"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "artifact purge journal index is invalid".to_string())?;
+        let path = value["path"]
+            .as_str()
+            .ok_or_else(|| "artifact purge journal path is invalid".to_string())?;
+        let state = match value["state"].as_str() {
+            Some("pending") => PurgeJournalState::Pending,
+            Some("deleted") => PurgeJournalState::Deleted,
+            _ => return Err("artifact purge journal state is invalid".into()),
+        };
+        if index >= ordered.len() || path != ordered[index].relative {
+            return Err("artifact purge journal does not match the signed artifact".into());
+        }
+        match states.get(index).copied().flatten() {
+            None if index == states.len() && state == PurgeJournalState::Pending => {
+                states.push(Some(state));
+            }
+            None if index == states.len() && state == PurgeJournalState::Deleted => {
+                states.push(Some(state));
+            }
+            Some(PurgeJournalState::Pending)
+                if state == PurgeJournalState::Deleted
+                    && states
+                        .iter()
+                        .position(|state| *state == Some(PurgeJournalState::Pending))
+                        == Some(index) =>
+            {
+                states[index] = Some(state);
+            }
+            _ => return Err("artifact purge journal sequence is invalid".into()),
+        }
+    }
+    Ok(states)
+}
+
+fn verify_journal_progress(
+    root: &Path,
+    ordered: &[TreeEntry],
+    states: &[Option<PurgeJournalState>],
+) -> Result<(), String> {
+    if states.len() > ordered.len() {
+        return Err("artifact purge journal exceeds the signed artifact".into());
+    }
+    let first_pending = states
+        .iter()
+        .position(|state| *state == Some(PurgeJournalState::Pending));
+    if states.iter().any(Option::is_none)
+        || first_pending.is_some_and(|index| {
+            states[..index]
+                .iter()
+                .any(|state| *state != Some(PurgeJournalState::Deleted))
+                || states[index..]
+                    .iter()
+                    .any(|state| *state != Some(PurgeJournalState::Pending))
+        })
+    {
+        return Err("artifact purge journal sequence is incomplete".into());
+    }
+    let root_missing = path_is_missing(root)?;
+    if root_missing
+        && !(states.len() == ordered.len()
+            && states
+                .iter()
+                .all(|state| *state == Some(PurgeJournalState::Deleted)))
+        && !(states.last() == Some(&Some(PurgeJournalState::Pending))
+            && ordered[states.len() - 1].relative == ".")
+    {
+        return Err("quarantine root disappeared before its signed purge step".into());
+    }
+    let mut expected_paths = BTreeSet::new();
+    for (index, entry) in ordered.iter().enumerate() {
+        let path = if entry.relative == "." {
+            root.to_path_buf()
+        } else {
+            root.join(&entry.relative)
+        };
+        match states.get(index).copied().flatten() {
+            Some(PurgeJournalState::Deleted) if path_is_missing(&path)? => {}
+            Some(PurgeJournalState::Deleted) => {
+                return Err(format!(
+                    "purged artifact entry reappeared: {}",
+                    path.display()
+                ));
+            }
+            Some(PurgeJournalState::Pending) if path_is_missing(&path)? => {}
+            Some(PurgeJournalState::Pending) | None => {
+                verify_one(&path, entry)?;
+                expected_paths.insert(entry.relative.clone());
+            }
+        }
+    }
+    if !root_missing {
+        let mut observed = BTreeSet::new();
+        collect_relative_paths(root, root, &mut observed)?;
+        if observed != expected_paths {
+            return Err(format!(
+                "quarantine contents differ from signed purge journal: {}",
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn path_is_missing(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "cannot inspect artifact path {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn verify_one(path: &Path, entry: &TreeEntry) -> Result<(), String> {
@@ -973,14 +1392,31 @@ fn lsof_open_paths(paths: &[PathBuf]) -> Result<Vec<String>, String> {
     }) else {
         return Err("lsof is required to verify generated-artifact handles".into());
     };
+    let existing: Vec<_> = paths
+        .iter()
+        .filter(|path| fs::symlink_metadata(path).is_ok())
+        .collect();
     let mut pids = BTreeSet::new();
-    for batch in paths.chunks(64) {
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0;
+    let mut batches = Vec::new();
+    for path in existing {
+        let size = path.as_os_str().as_bytes().len() + 1;
+        if !batch.is_empty() && batch_bytes + size > LSOF_BATCH_BYTES {
+            batches.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes += size;
+        batch.push(path);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    for batch in batches {
         let mut command = std::process::Command::new(&lsof);
         command.arg("-Fpn");
         for path in batch {
-            if fs::symlink_metadata(path).is_ok() {
-                command.arg(path);
-            }
+            command.arg(path);
         }
         let output = command
             .output()
@@ -1338,15 +1774,54 @@ fn random_bytes() -> Result<[u8; 8], String> {
 }
 
 fn remove_transaction_dir(transaction: &Transaction) -> Result<(), String> {
-    let mut entries = fs::read_dir(&transaction.operation)
+    let entries = fs::read_dir(&transaction.operation)
         .map_err(|error| format!("cannot inspect transaction directory: {error}"))?;
-    let first = entries
-        .next()
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    if first.as_ref().map(|entry| entry.path()) != Some(transaction.manifest_path.clone())
-        || entries.next().is_some()
-    {
+    let actual: BTreeSet<String> = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let mut journal_names = BTreeSet::new();
+    if let Some(records) = transaction.manifest["generated_caches"].as_array() {
+        for (index, record) in records.iter().enumerate() {
+            let expected = format!("purge-generated-cache-{index:03}.jsonl");
+            if record["purge_journal"]
+                .as_str()
+                .is_some_and(|name| name != expected)
+            {
+                return Err("generated artifact purge journal path is invalid".into());
+            }
+            if record["purge_journal"] == expected
+                && (actual.contains(&expected)
+                    || matches!(record["purge_state"].as_str(), Some("purging" | "purged")))
+            {
+                journal_names.insert(expected);
+            }
+        }
+    }
+    if transaction.manifest["direnv"].is_object() {
+        if transaction.manifest["direnv"]["purge_journal"]
+            .as_str()
+            .is_some_and(|name| name != "purge-direnv.jsonl")
+        {
+            return Err(".direnv purge journal path is invalid".into());
+        }
+        if transaction.manifest["direnv"]["purge_journal"] == "purge-direnv.jsonl"
+            && (actual.contains("purge-direnv.jsonl")
+                || matches!(
+                    transaction.manifest["direnv"]["purge_state"].as_str(),
+                    Some("purging" | "purged")
+                ))
+        {
+            journal_names.insert("purge-direnv.jsonl".into());
+        }
+    }
+    let expected: BTreeSet<_> = std::iter::once("manifest.json".to_string())
+        .chain(journal_names.iter().cloned())
+        .collect();
+    if actual != expected {
         return Err(format!(
             "unexpected contents in quarantine transaction: {}",
             transaction.operation.display()
@@ -1356,6 +1831,19 @@ fn remove_transaction_dir(transaction: &Transaction) -> Result<(), String> {
         .map_err(|error| format!("cannot inspect transaction manifest: {error}"))?;
     if !manifest.is_file() || manifest.file_type().is_symlink() {
         return Err("transaction manifest changed type".into());
+    }
+    for name in journal_names {
+        let path = transaction.operation.join(name);
+        let journal = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect artifact purge journal: {error}"))?;
+        if !journal.is_file()
+            || journal.file_type().is_symlink()
+            || journal.uid() != unsafe { libc::getuid() }
+            || journal.mode() & 0o077 != 0
+        {
+            return Err("artifact purge journal is not a private regular file".into());
+        }
+        fs::remove_file(path).map_err(|error| error.to_string())?;
     }
     fs::remove_file(&transaction.manifest_path).map_err(|error| error.to_string())?;
     fs::remove_dir(&transaction.operation).map_err(|error| error.to_string())?;
@@ -2534,6 +3022,67 @@ mod tests {
         )
         .is_ok());
         assert!(verify_purge_progress(&artifact, &signature, &json!({"purge_cursor": 0})).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn purge_journal_tracks_signed_entries_and_rejects_unexpected_content() {
+        let root = temp("purge-journal");
+        let artifact = root.join("artifact");
+        fs::create_dir(&artifact).unwrap();
+        fs::write(artifact.join("entry"), b"selected output").unwrap();
+        let signature = sign_tree(&artifact, &root, false, false, false).unwrap();
+        let ordered = purge_order(&signature);
+        assert_eq!(purge_open_paths(&artifact, &ordered, &[]).len(), 2);
+        let journal_path = root.join("purge.jsonl");
+        let mut journal = create_purge_journal(&journal_path).unwrap();
+        for (index, entry) in ordered.iter().enumerate() {
+            append_purge_journal(&mut journal, index, entry, "pending").unwrap();
+        }
+        journal.sync_all().unwrap();
+        let pending = read_purge_journal(&journal_path, &ordered).unwrap();
+        verify_journal_progress(&artifact, &ordered, &pending).unwrap();
+        fs::remove_file(artifact.join("entry")).unwrap();
+        verify_journal_progress(
+            &artifact,
+            &ordered,
+            &read_purge_journal(&journal_path, &ordered).unwrap(),
+        )
+        .unwrap();
+        append_purge_journal(&mut journal, 0, &ordered[0], "deleted").unwrap();
+        journal.sync_all().unwrap();
+        let states = read_purge_journal(&journal_path, &ordered).unwrap();
+        assert_eq!(
+            states,
+            [
+                Some(PurgeJournalState::Deleted),
+                Some(PurgeJournalState::Pending)
+            ]
+        );
+        assert_eq!(
+            purge_open_paths(&artifact, &ordered, &states).as_slice(),
+            std::slice::from_ref(&artifact)
+        );
+        verify_journal_progress(&artifact, &ordered, &states).unwrap();
+        fs::write(artifact.join("unexpected"), b"not signed").unwrap();
+        assert!(verify_journal_progress(&artifact, &ordered, &states).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_purge_order_keeps_root_last_for_every_child_name() {
+        let root = temp("purge-order");
+        let artifact = root.join("artifact");
+        fs::create_dir(&artifact).unwrap();
+        fs::write(artifact.join("!entry"), b"selected output").unwrap();
+        let signature = sign_tree(&artifact, &root, false, false, false).unwrap();
+        let ordered = purge_order(&signature);
+        assert_eq!(ordered.last().unwrap().relative, ".");
+        assert_eq!(ordered.first().unwrap().relative, "!entry");
+        assert_eq!(
+            legacy_purge_order(&signature).first().unwrap().relative,
+            "."
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
