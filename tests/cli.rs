@@ -2318,11 +2318,7 @@ fn foreign_lock_reason_is_respected() {
 fn failed_removal_relocks_with_the_original_reason() {
     let env = Env::new();
     let (id, path) = env.create("relock-task");
-    let real = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let real = real_git_executable().to_string_lossy().into_owned();
     let shim_dir = env.tmp.join("shim");
     fs::create_dir_all(&shim_dir).unwrap();
     let shim = shim_dir.join("git");
@@ -2364,11 +2360,7 @@ fn failed_removal_restores_a_verified_git_annex_pointer() {
     let admin = env.admin(&id);
     fs::remove_file(path.join(".git")).unwrap();
     symlink(&admin, path.join(".git")).unwrap();
-    let real = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let real = real_git_executable().to_string_lossy().into_owned();
     let shim_dir = env.tmp.join("annex-restore-shim");
     fs::create_dir_all(&shim_dir).unwrap();
     let shim = shim_dir.join("git");
@@ -2411,11 +2403,7 @@ fn failed_partial_removal_does_not_restore_over_a_changed_git_pointer() {
     let admin = env.admin(&id);
     fs::remove_file(path.join(".git")).unwrap();
     symlink(&admin, path.join(".git")).unwrap();
-    let real = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let real = real_git_executable().to_string_lossy().into_owned();
     let shim_dir = env.tmp.join("partial-shim");
     fs::create_dir_all(&shim_dir).unwrap();
     let shim = shim_dir.join("git");
@@ -2455,11 +2443,7 @@ fn failed_removal_does_not_replace_a_lock_acquired_after_preflight() {
     let (id, path) = env.create("new-lock");
     let worktree = path.to_string_lossy().into_owned();
     git(&env.repo, &["worktree", "unlock", &worktree]);
-    let real = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let real = real_git_executable().to_string_lossy().into_owned();
     let shim_dir = env.tmp.join("new-lock-shim");
     fs::create_dir_all(&shim_dir).unwrap();
     let shim = shim_dir.join("git");
@@ -2500,11 +2484,7 @@ fn failed_removal_does_not_recreate_a_worktree_after_registration_disappears() {
     let env = Env::new();
     let (id, path) = env.create("registration-gone");
     let worktree = path.to_string_lossy().into_owned();
-    let real = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let real = real_git_executable().to_string_lossy().into_owned();
     let shim_dir = env.tmp.join("registration-gone-shim");
     fs::create_dir_all(&shim_dir).unwrap();
     let shim = shim_dir.join("git");
@@ -2634,11 +2614,7 @@ fn relative_gitdir_worktrees_resolve_against_the_admin_dir() {
 
 /// A PATH whose `git` runs `hook` (shell, with `$sub`/`$verb` set) before the real git.
 fn git_shim(env: &Env, name: &str, hook: &str) -> String {
-    let real = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let real = real_git_executable().to_string_lossy().into_owned();
     let dir = env.tmp.join(name);
     fs::create_dir_all(&dir).unwrap();
     let shim = dir.join("git");
@@ -2655,6 +2631,36 @@ fn git_shim(env: &Env, name: &str, hook: &str) -> String {
         dir.display(),
         std::env::var("PATH").unwrap_or_default()
     )
+}
+
+fn real_git_executable() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("git"))
+        .find_map(|candidate| {
+            let canonical = fs::canonicalize(candidate).ok()?;
+            if cfg!(target_os = "macos") && canonical == Path::new("/usr/bin/git") {
+                None
+            } else {
+                Some(canonical)
+            }
+        })
+        .or_else(|| {
+            if cfg!(target_os = "macos") {
+                let output = Command::new("xcrun")
+                    .args(["--find", "git"])
+                    .output()
+                    .ok()?;
+                output
+                    .status
+                    .success()
+                    .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+                    .and_then(|path| fs::canonicalize(path).ok())
+            } else {
+                None
+            }
+        })
+        .expect("a Git executable that does not re-enter the PATH shim")
 }
 
 #[test]
