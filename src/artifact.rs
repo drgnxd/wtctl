@@ -2770,6 +2770,12 @@ fn is_nix_direnv_cache_at(root: &Path, store_root: &Path) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
     }
+    fn nix_store_hash(value: &str) -> bool {
+        value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&byte))
+    }
     fn store_link(path: &Path, expected: Option<&str>, store_root: &Path) -> bool {
         let Ok(link) = fs::read_link(path) else {
             return false;
@@ -2777,11 +2783,40 @@ fn is_nix_direnv_cache_at(root: &Path, store_root: &Path) -> bool {
         if !link.is_absolute() || link.parent() != Some(store_root) {
             return false;
         }
-        if expected.is_some_and(|leaf| link.file_name() != Some(OsStr::new(leaf))) {
+        let Some(leaf) = link.file_name().and_then(OsStr::to_str) else {
             return false;
+        };
+        if let Some(expected) = expected {
+            if leaf != expected {
+                return false;
+            }
+            let Some(hash_prefix) = leaf.strip_suffix("-source") else {
+                return false;
+            };
+            if !nix_store_hash(hash_prefix) {
+                return false;
+            }
+        } else {
+            let Some(hash_prefix) = leaf.strip_suffix("-nix-shell-env") else {
+                return false;
+            };
+            if !nix_store_hash(hash_prefix) {
+                return false;
+            }
         }
-        fs::canonicalize(&link).ok().as_deref() == Some(link.as_path())
-            && fs::symlink_metadata(&link).is_ok_and(|metadata| metadata.is_dir())
+        match fs::canonicalize(&link) {
+            Ok(canonical) => {
+                canonical == link
+                    && fs::symlink_metadata(&link).is_ok_and(|metadata| {
+                        metadata.is_dir() && !metadata.file_type().is_symlink()
+                    })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::symlink_metadata(&link)
+                    .is_err_and(|metadata| metadata.kind() == std::io::ErrorKind::NotFound)
+            }
+            Err(_) => false,
+        }
     }
     let Ok(store_root) = fs::canonicalize(store_root) else {
         return false;
@@ -2851,7 +2886,7 @@ fn is_nix_direnv_cache_at(root: &Path, store_root: &Path) -> bool {
         let Some(stem) = name.strip_suffix("-source") else {
             return false;
         };
-        if !hash(stem) || !store_link(&input.path(), Some(&name), &store_root) {
+        if !nix_store_hash(stem) || !store_link(&input.path(), Some(&name), &store_root) {
             return false;
         }
     }
@@ -2979,6 +3014,25 @@ mod tests {
         )
         .unwrap();
         assert!(is_nix_direnv_cache_at(&cache, &store));
+
+        fs::remove_dir(store.join(&input)).unwrap();
+        fs::remove_dir(store.join(&profile)).unwrap();
+        assert!(
+            is_nix_direnv_cache_at(&cache, &store),
+            "dangling links to collected Nix store outputs remain a stale cache"
+        );
+
+        let profile_link = cache.join(format!("flake-profile-{profile_hash}"));
+        fs::remove_file(&profile_link).unwrap();
+        symlink(
+            root.join(format!("{profile_hash}-nix-shell-env")),
+            &profile_link,
+        )
+        .unwrap();
+        assert!(!is_nix_direnv_cache_at(&cache, &store));
+        fs::remove_file(&profile_link).unwrap();
+        symlink(store.join(&profile), &profile_link).unwrap();
+
         fs::write(cache.join("unexpected"), "not part of nix-direnv").unwrap();
         assert!(!is_nix_direnv_cache_at(&cache, &store));
         fs::remove_dir_all(root).unwrap();

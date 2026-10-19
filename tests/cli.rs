@@ -228,6 +228,44 @@ impl Env {
     }
 }
 
+fn write_stale_nix_direnv_cache(worktree: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::symlink;
+
+    let cache = worktree.join(".direnv");
+    fs::create_dir_all(cache.join("bin")).unwrap();
+    fs::create_dir_all(cache.join("flake-inputs")).unwrap();
+    let input_hash = "a".repeat(32);
+    let profile_hash = "b".repeat(32);
+    let input_name = format!("{input_hash}-source");
+    let input_target = Path::new("/nix/store").join(&input_name);
+    let profile_target =
+        PathBuf::from("/nix/store").join(format!("{}-nix-shell-env", "c".repeat(32)));
+    assert_eq!(
+        fs::symlink_metadata(&input_target).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        fs::symlink_metadata(&profile_target).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    let reload = cache.join("bin/nix-direnv-reload");
+    fs::write(&reload, "reload").unwrap();
+    fs::set_permissions(&reload, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&input_target, cache.join("flake-inputs").join(&input_name)).unwrap();
+    symlink(
+        profile_target.clone(),
+        cache.join(format!("flake-profile-{profile_hash}")),
+    )
+    .unwrap();
+    fs::write(
+        cache.join(format!("flake-profile-{profile_hash}.rc")),
+        "profile",
+    )
+    .unwrap();
+    (input_target, profile_target)
+}
+
 #[test]
 fn capabilities_reports_the_lifecycle_contract() {
     let env = Env::new();
@@ -1296,6 +1334,41 @@ fn git_annex_finish_quarantines_recognized_direnv_data() {
         fs::read(operation.join(".direnv/user-data/keep")).unwrap(),
         b"direnv data"
     );
+}
+
+#[test]
+fn git_annex_finish_discards_stale_nix_direnv_cache() {
+    let env = Env::new();
+    git(&env.repo, &["annex", "init", "-q"]);
+    fs::write(env.repo.join("annexed.bin"), vec![b'x'; 8192]).unwrap();
+    git(&env.repo, &["annex", "add", "--force-large", "annexed.bin"]);
+    git(&env.repo, &["commit", "-q", "-m", "annexed"]);
+
+    let (id, path) = env.create_annex("annex-stale-direnv");
+    commit_file(&path, "task.txt", "task work\n");
+    commit_file(&env.repo, "main.txt", "main work\n");
+    env.exclude("/.direnv/");
+    let (input_target, profile_target) = write_stale_nix_direnv_cache(&path);
+
+    let finished = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--allow-annex-filter",
+    ]);
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!path.exists());
+    assert!(env.quarantine_root().read_dir().unwrap().next().is_none());
+    assert!(fs::symlink_metadata(input_target).is_err());
+    assert!(fs::symlink_metadata(profile_target).is_err());
 }
 
 #[test]

@@ -121,7 +121,9 @@ Hooks: an executable `reference-transaction` hook always blocks; a
 `finish` discards recognized generated artifacts by default: `.pytest_cache`,
 `.ruff_cache`, `__pycache__`, root `target`, `rust/target`, the root `result`
 symlink, a marked `git-hooks.nix` `.pre-commit-config.yaml`, and a verified
-Nix-direnv `.direnv` cache. Unknown `.direnv` layouts are retained. Direct
+Nix-direnv `.direnv` cache, including stale caches whose correctly formed direct
+`/nix/store` links have been garbage-collected. The full supported layout must
+still match; unknown `.direnv` layouts are retained. Direct
 `remove` keeps generated artifact handling opt-in through
 `--discard-generated-caches`, `--discard-generated-build-outputs`,
 `--discard-direnv-cache`, or `--discard-generated-artifacts`.
