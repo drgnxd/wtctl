@@ -1521,19 +1521,26 @@ fn merge_main_into_task(
         .removable_except_integration()
         .map_err(|why| Fail::new(4, format!("{id} is not safe to merge: {why}")))?;
     let main_worktree = canonical_main_checkout(repo)?;
-    artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup).map_err(
-        |why| {
-            Fail::new(
-                4,
-                format!("{id} must be clean before merging advanced main: {why}"),
-            )
-        },
-    )?;
+    let initial_plan =
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup).map_err(
+            |why| {
+                Fail::new(
+                    4,
+                    format!("{id} must be clean before merging advanced main: {why}"),
+                )
+            },
+        )?;
     if let Some(operation) = initial.in_progress {
         return refuse(format!("{id} has a {operation} in progress"));
     }
     if context.annex {
-        annex_restage(entry, &entry.head)?;
+        annex_restage(
+            entry,
+            &entry.head,
+            main_worktree.as_deref(),
+            context.cleanup,
+            &initial_plan,
+        )?;
     }
     ensure_task_head(entry, context.task_tip)?;
     ensure_no_cwd_users(entry, "merge preparation")?;
@@ -1636,8 +1643,17 @@ fn merge_main_into_task(
     let merged_tip = git::run(&entry.path, ["rev-parse", "HEAD"])?
         .trim()
         .to_string();
+    let merged_plan =
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
+            .map_err(|why| Fail::new(4, format!("{id} changed before annex restage: {why}")))?;
     if context.annex {
-        annex_restage(entry, &merged_tip)?;
+        annex_restage(
+            entry,
+            &merged_tip,
+            main_worktree.as_deref(),
+            context.cleanup,
+            &merged_plan,
+        )?;
     }
     ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
     let actual_tree = git::run(
@@ -2236,7 +2252,13 @@ fn restore_dotgit_symlink(entry: &Entry, original: &OsStr) -> R<()> {
     Ok(())
 }
 
-fn annex_restage(entry: &Entry, expected_head: &str) -> R<()> {
+fn annex_restage(
+    entry: &Entry,
+    expected_head: &str,
+    main_worktree: Option<&Path>,
+    cleanup: artifact::Options,
+    expected_plan: &artifact::Plan,
+) -> R<()> {
     let result = git::output(&entry.path, ["annex", "restage"])?;
     if !result.status.success() {
         return refuse(format!(
@@ -2256,10 +2278,19 @@ fn annex_restage(entry: &Entry, expected_head: &str) -> R<()> {
     {
         return refuse("worktree identity or HEAD changed during git annex restage");
     }
-    let status = git::output(&refreshed.path, git::STATUS_ARGS)?;
-    if !status.status.success() || !git::parse_status(&status.stdout).is_clean() {
+    let refreshed_plan =
+        artifact::inspect_plan(&refreshed.path, main_worktree, cleanup).map_err(|why| {
+            Fail::new(
+                4,
+                format!(
+                    "{} changed during git annex restage: {why}",
+                    refreshed.path.display()
+                ),
+            )
+        })?;
+    if refreshed_plan != *expected_plan {
         return refuse(format!(
-            "{} changed during git annex restage",
+            "{} cleanup artifact plan changed during git annex restage",
             refreshed.path.display()
         ));
     }
@@ -2503,8 +2534,11 @@ fn remove_worktree(
     verify_removal_authority(repo, entry, authority)?;
     let locked = removal_lock_state(entry, authority)?;
     gitfile_pointer(entry)?;
+    let main_worktree = canonical_main_checkout(repo)?;
+    let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+        .map_err(|why| Fail::new(4, format!("{id}: {why}")))?;
     if annex {
-        annex_restage(entry, &entry.head)?;
+        annex_restage(entry, &entry.head, main_worktree.as_deref(), cleanup, &plan)?;
         let refreshed = Entry::load(entry.admin.clone()).ok_or_else(|| {
             Fail::new(
                 4,
@@ -2543,9 +2577,6 @@ fn remove_worktree(
             ));
         }
     }
-    let main_worktree = canonical_main_checkout(repo)?;
-    let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
-        .map_err(|why| Fail::new(4, format!("{id}: {why}")))?;
     let dotgit_symlink = gitfile_pointer(entry)?;
     let mut transaction = artifact::begin_transaction(
         &plan,

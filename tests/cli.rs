@@ -161,6 +161,26 @@ impl Env {
         )
     }
 
+    fn create_annex(&self, slug: &str) -> (String, PathBuf) {
+        let out: Value = serde_json::from_str(&self.ok(&[
+            "create",
+            "--repo",
+            &self.repo_arg(),
+            "--slug",
+            slug,
+            "--task",
+            "example annex task",
+            "--external-writers-quiesced",
+            "--allow-repository-hooks",
+            "--json",
+        ]))
+        .unwrap();
+        (
+            out["task_id"].as_str().unwrap().to_string(),
+            PathBuf::from(out["worktree"].as_str().unwrap()),
+        )
+    }
+
     fn admin(&self, id: &str) -> PathBuf {
         self.repo.join(".git/worktrees").join(id)
     }
@@ -1231,6 +1251,118 @@ fn git_annex_worktree_is_restage_checked_and_removed_from_a_symlink_gitdir() {
     assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main work");
     assert!(!path.exists());
     assert!(!git(&env.repo, &["worktree", "list", "--porcelain"]).contains(path.to_str().unwrap()));
+}
+
+#[test]
+fn git_annex_finish_quarantines_recognized_direnv_data() {
+    let env = Env::new();
+    git(&env.repo, &["annex", "init", "-q"]);
+    fs::write(env.repo.join("annexed.bin"), vec![b'x'; 8192]).unwrap();
+    git(&env.repo, &["annex", "add", "--force-large", "annexed.bin"]);
+    git(&env.repo, &["commit", "-q", "-m", "annexed"]);
+
+    let (id, path) = env.create_annex("annex-direnv");
+    commit_file(&path, "task.txt", "task work\n");
+    commit_file(&env.repo, "main.txt", "main work\n");
+    env.exclude("/.direnv/");
+    fs::create_dir_all(path.join(".direnv/user-data")).unwrap();
+    fs::write(path.join(".direnv/user-data/keep"), b"direnv data").unwrap();
+
+    let finished = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--allow-annex-filter",
+    ]);
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!path.exists());
+    let operation = env
+        .quarantine_root()
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        fs::read(operation.join(".direnv/user-data/keep")).unwrap(),
+        b"direnv data"
+    );
+}
+
+#[test]
+fn git_annex_remove_refuses_unknown_ignored_data_before_restage() {
+    let env = Env::new();
+    git(&env.repo, &["annex", "init", "-q"]);
+    fs::write(env.repo.join("annexed.bin"), vec![b'x'; 8192]).unwrap();
+    git(&env.repo, &["annex", "add", "--force-large", "annexed.bin"]);
+    git(&env.repo, &["commit", "-q", "-m", "annexed"]);
+
+    let (id, path) = env.create_annex("annex-unknown-ignored");
+    env.exclude("/private-data/");
+    fs::create_dir_all(path.join("private-data")).unwrap();
+    fs::write(path.join("private-data/keep"), b"user data").unwrap();
+
+    let refused = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("worktree has unrecognized changes"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(path.join("private-data/keep")).unwrap(),
+        b"user data"
+    );
+}
+
+#[test]
+fn git_annex_remove_refuses_artifact_changed_during_restage() {
+    let env = Env::new();
+    git(&env.repo, &["annex", "init", "-q"]);
+    fs::write(env.repo.join("annexed.bin"), vec![b'x'; 8192]).unwrap();
+    git(&env.repo, &["annex", "add", "--force-large", "annexed.bin"]);
+    git(&env.repo, &["commit", "-q", "-m", "annexed"]);
+
+    let (id, path) = env.create_annex("annex-artifact-change");
+    env.exclude("/target/");
+    fs::create_dir_all(path.join("target/debug")).unwrap();
+    let artifact = path.join("target/debug/artifact");
+    fs::write(&artifact, b"before restage").unwrap();
+    let path_var = git_shim(
+        &env,
+        "mutate-artifact-during-annex-restage",
+        "if [ \"$sub\" = annex ] && [ \"$verb\" = restage ]; then printf 'changed during restage' > \"$WTCTL_TEST_MUTATE\"; fi",
+    );
+
+    let refused = env
+        .cmd(&[
+            "remove",
+            "--repo",
+            &env.repo_arg(),
+            "--id",
+            &id,
+            "--discard-generated-build-outputs",
+        ])
+        .env("PATH", path_var)
+        .env("WTCTL_TEST_MUTATE", &artifact)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("cleanup artifact plan changed during git annex restage"),
+        "{refused:?}"
+    );
+    assert!(path.exists());
+    assert_eq!(fs::read(&artifact).unwrap(), b"changed during restage");
 }
 
 #[test]
@@ -2440,7 +2572,7 @@ fn git_shim(env: &Env, name: &str, hook: &str) -> String {
     fs::write(
         &shim,
         format!(
-            "#!/bin/sh\nsub=\nverb=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ]; then sub=worktree; verb=$a; fi\n  prev=$a\ndone\n{hook}\nexec '{real}' \"$@\"\n"
+            "#!/bin/sh\nsub=\nverb=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ] || [ \"$prev\" = annex ]; then sub=$prev; verb=$a; fi\n  prev=$a\ndone\n{hook}\nexec '{real}' \"$@\"\n"
         ),
     )
     .unwrap();
