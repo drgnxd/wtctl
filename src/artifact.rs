@@ -41,14 +41,14 @@ pub struct Options {
     pub allow_unreferenced_reflog: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignedArtifact {
     pub path: PathBuf,
     pub signature: Vec<TreeEntry>,
     pub preserve: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatabaseLink {
     pub path: PathBuf,
     pub link_text: PathBuf,
@@ -57,7 +57,7 @@ pub struct DatabaseLink {
     pub inode: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Plan {
     pub generated: Vec<SignedArtifact>,
     pub direnv: Option<SignedArtifact>,
