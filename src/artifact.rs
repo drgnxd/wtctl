@@ -3147,11 +3147,17 @@ mod tests {
 
     #[test]
     fn new_purge_order_keeps_root_last_for_every_child_name() {
-        let root = temp("purge-order");
-        let artifact = root.join("artifact");
-        fs::create_dir(&artifact).unwrap();
-        fs::write(artifact.join("!entry"), b"selected output").unwrap();
-        let signature = sign_tree(&artifact, &root, false, false, false).unwrap();
+        let entry = |relative: &str| TreeEntry {
+            relative: relative.into(),
+            kind: "file".into(),
+            device: 0,
+            inode: 0,
+            mode: 0,
+            size: 0,
+            mtime_ns: 0,
+            link_or_digest: String::new(),
+        };
+        let signature = [entry("."), entry("!entry")];
         let ordered = purge_order(&signature);
         assert_eq!(ordered.last().unwrap().relative, ".");
         assert_eq!(ordered.first().unwrap().relative, "!entry");
@@ -3159,6 +3165,5 @@ mod tests {
             legacy_purge_order(&signature).first().unwrap().relative,
             "."
         );
-        fs::remove_dir_all(root).unwrap();
     }
 }
