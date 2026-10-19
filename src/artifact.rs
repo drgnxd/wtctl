@@ -2808,7 +2808,12 @@ fn is_nix_direnv_cache_at(root: &Path, store_root: &Path) -> bool {
             Ok(canonical) => {
                 canonical == link
                     && fs::symlink_metadata(&link).is_ok_and(|metadata| {
-                        metadata.is_dir() && !metadata.file_type().is_symlink()
+                        !metadata.file_type().is_symlink()
+                            && if expected.is_some() {
+                                metadata.is_dir()
+                            } else {
+                                metadata.is_file() || metadata.is_dir()
+                            }
                     })
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3032,6 +3037,23 @@ mod tests {
         assert!(!is_nix_direnv_cache_at(&cache, &store));
         fs::remove_file(&profile_link).unwrap();
         symlink(store.join(&profile), &profile_link).unwrap();
+
+        fs::write(store.join(&profile), "profile").unwrap();
+        assert!(
+            is_nix_direnv_cache_at(&cache, &store),
+            "regular-file profile outputs are valid Nix-direnv targets"
+        );
+        fs::remove_file(store.join(&profile)).unwrap();
+        assert!(
+            is_nix_direnv_cache_at(&cache, &store),
+            "dangling direct profile links remain stale caches"
+        );
+
+        fs::write(store.join(&input), "source").unwrap();
+        assert!(
+            !is_nix_direnv_cache_at(&cache, &store),
+            "flake input source targets must remain directories"
+        );
 
         fs::write(cache.join("unexpected"), "not part of nix-direnv").unwrap();
         assert!(!is_nix_direnv_cache_at(&cache, &store));
