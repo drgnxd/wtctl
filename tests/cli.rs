@@ -77,6 +77,48 @@ fn commit_file(dir: &Path, name: &str, body: &str) -> String {
     git(dir, &["rev-parse", "HEAD"])
 }
 
+fn add_annex_filter_backed_file(env: &Env, name: &str) -> String {
+    git(&env.repo, &["annex", "init", "-q"]);
+    fs::write(
+        env.repo.join(".gitattributes"),
+        format!("{name} annex.largefiles=anything\n"),
+    )
+    .unwrap();
+    git(&env.repo, &["add", ".gitattributes"]);
+    git(&env.repo, &["commit", "-q", "-m", "configure annex filter"]);
+    fs::create_dir_all(env.repo.join(name).parent().unwrap()).unwrap();
+    fs::write(env.repo.join(name), vec![b'x'; 8192]).unwrap();
+    git(&env.repo, &["add", "--", name]);
+    let stage = git(&env.repo, &["ls-files", "--stage", "--", name]);
+    let fields: Vec<_> = stage.split_whitespace().collect();
+    assert_eq!(fields.len(), 4, "unexpected index entry: {stage}");
+    assert_eq!(
+        fields[0], "100644",
+        "annex filter must materialize a regular file"
+    );
+    let raw = git(&env.repo, &["hash-object", "--no-filters", "--", name]);
+    let filtered = git(
+        &env.repo,
+        &[
+            "hash-object",
+            "--filters",
+            &format!("--path={name}"),
+            "--",
+            name,
+        ],
+    );
+    assert_ne!(
+        raw, fields[1],
+        "test fixture must differ without the annex filter"
+    );
+    assert_eq!(
+        filtered, fields[1],
+        "annex clean filter must match the index blob"
+    );
+    git(&env.repo, &["commit", "-q", "-m", "annexed file"]);
+    fields[1].to_string()
+}
+
 impl Env {
     fn new() -> Env {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -133,8 +175,9 @@ impl Env {
         let out = self.run(args);
         assert!(
             out.status.success(),
-            "wtctl {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "wtctl {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
@@ -1167,6 +1210,703 @@ fn finish_aborts_a_clean_merge_when_the_commit_message_hook_rejects_it() {
 }
 
 #[test]
+fn finish_aborts_a_rejected_merge_with_annex_filter_backed_files() {
+    let env = Env::new();
+    let annexed = "media/annex-filtered.jpg";
+    let annex_blob = add_annex_filter_backed_file(&env, annexed);
+    let (id, path) = env.create_annex("finish-annex-filter-recovery");
+    let task_tip = commit_file(&path, "task.txt", "task work\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main work\n");
+    let raw = git(&path, &["hash-object", "--no-filters", "--", annexed]);
+    let filtered = git(
+        &path,
+        &[
+            "hash-object",
+            "--filters",
+            &format!("--path={annexed}"),
+            "--",
+            annexed,
+        ],
+    );
+    assert_ne!(raw, annex_blob);
+    assert_eq!(filtered, annex_blob);
+    write_commit_msg_hook(&env, "exit 1");
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--allow-annex-filter",
+        "--integration-message",
+        "chore: rejected annex merge",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("merge was aborted and task worktree restored"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(git(&env.repo, &["rev-parse", "main"]), main_tip);
+    assert_eq!(git(&path, &["status", "--porcelain"]), "");
+    assert!(!env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(
+        git(
+            &path,
+            &[
+                "hash-object",
+                "--filters",
+                &format!("--path={annexed}"),
+                annexed
+            ]
+        ),
+        annex_blob
+    );
+}
+
+#[test]
+fn integration_and_finish_refuse_main_worktree_annex_filter_override() {
+    let env = Env::new();
+    let annexed = "media/main-filtered.jpg";
+    add_annex_filter_backed_file(&env, annexed);
+    git(&env.repo, &["config", "extensions.worktreeConfig", "true"]);
+    let (id, path) = env.create_annex("main-filter-override");
+    fs::write(path.join(annexed), vec![b'y'; 8192]).unwrap();
+    git(&path, &["add", "--", annexed]);
+    git(&path, &["commit", "-q", "-m", "update annexed file"]);
+    let task_tip = git(&path, &["rev-parse", "HEAD"]);
+    let main_tip = env.main_oid();
+    let marker = env.tmp.join("main-annex-smudge-ran");
+    let overridden_smudge = format!("sh -c 'touch {}; cat'", marker.display());
+    git(
+        &env.repo,
+        &[
+            "config",
+            "--worktree",
+            "filter.annex.smudge",
+            &overridden_smudge,
+        ],
+    );
+
+    let repo_arg = env.repo_arg();
+    for command in ["integrate", "finish"] {
+        let mut args = vec![
+            command,
+            "--repo",
+            &repo_arg,
+            "--id",
+            &id,
+            "--external-writers-quiesced",
+            "--allow-annex-filter",
+        ];
+        if command == "finish" {
+            args.extend(["--integration-message", "docs: reject main filter override"]);
+        }
+        let refused = env.run(&args);
+        assert_eq!(refused.status.code(), Some(4), "{command}: {refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr)
+            .contains("git-annex filter configuration is not verified"));
+        assert!(!marker.exists());
+        assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+        assert_eq!(env.main_oid(), main_tip);
+    }
+}
+
+#[test]
+fn finish_preserves_failed_merge_when_hook_changes_annex_smudge_filter() {
+    let env = Env::new();
+    let annexed = "media/task-only.jpg";
+    add_annex_filter_backed_file(&env, annexed);
+    let (id, path) = env.create_annex("finish-annex-hook");
+    let task_tip = commit_file(&path, "task.txt", "task work\n");
+    git(&env.repo, &["rm", "-q", annexed]);
+    let main_tip = commit_file(&env.repo, "main.txt", "main work\n");
+    let marker = env.tmp.join("annex-smudge-ran");
+    let hook = format!(
+        "git config filter.annex.smudge \"sh -c 'touch {}; cat'\"\nexit 1",
+        marker.display()
+    );
+    write_commit_msg_hook(&env, &hook);
+
+    let failed = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--allow-annex-filter",
+        "--integration-message",
+        "docs: reject merge after filter override",
+    ]);
+    assert_eq!(failed.status.code(), Some(3), "{failed:?}");
+    assert!(String::from_utf8_lossy(&failed.stderr)
+        .contains("task worktree preserved; automatic recovery was not completed"));
+    assert!(String::from_utf8_lossy(&failed.stderr)
+        .contains("git-annex filter configuration is not verified"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert!(!path.join(annexed).exists());
+    assert!(!marker.exists());
+}
+
+#[test]
+fn finish_recovers_a_verified_failed_merge_only_with_opt_in() {
+    let env = Env::new();
+    let annexed = "-recovery-filtered.jpg";
+    let annex_blob = add_annex_filter_backed_file(&env, annexed);
+    git(&env.repo, &["config", "extensions.worktreeConfig", "true"]);
+    let (id, path) = env.create_annex("finish-delayed-recovery");
+    let task_tip = commit_file(&path, "task.txt", "task work\n");
+    let first_main_tip = commit_file(&env.repo, "main.txt", "main work\n");
+    assert_ne!(
+        git(&path, &["hash-object", "--no-filters", "--", annexed]),
+        annex_blob
+    );
+    assert_eq!(
+        git(
+            &path,
+            &[
+                "hash-object",
+                "--filters",
+                &format!("--path={annexed}"),
+                "--",
+                annexed,
+            ]
+        ),
+        annex_blob
+    );
+    env.exclude("/.direnv/");
+    write_stale_nix_direnv_cache(&path);
+    let preserved = path.join(".direnv/bin/nix-direnv-reload");
+    let clean_marker = env.tmp.join("task-clean-filter-ran");
+    let smudge_marker = env.tmp.join("task-smudge-filter-ran");
+    let process_marker = env.tmp.join("task-process-filter-ran");
+    let overridden_clean = format!("sh -c 'touch {}; cat'", clean_marker.display());
+    let overridden_smudge = format!("sh -c 'touch {}; cat'", smudge_marker.display());
+    let overridden_process = format!("sh -c 'touch {}; exit 1'", process_marker.display());
+    git(
+        &path,
+        &[
+            "config",
+            "--worktree",
+            "filter.annex.clean",
+            &overridden_clean,
+        ],
+    );
+    git(
+        &path,
+        &[
+            "config",
+            "--worktree",
+            "filter.annex.smudge",
+            &overridden_smudge,
+        ],
+    );
+    git(
+        &path,
+        &[
+            "config",
+            "--worktree",
+            "filter.annex.process",
+            &overridden_process,
+        ],
+    );
+    let process_setting = git(
+        &path,
+        &["config", "--show-origin", "--get", "filter.annex.process"],
+    );
+    assert!(
+        process_setting.contains(&overridden_process),
+        "task worktree filter override is not effective: {process_setting}"
+    );
+    assert!(!clean_marker.exists());
+    assert!(!smudge_marker.exists());
+    assert!(!process_marker.exists());
+    let bad_task_config = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-annex-filter",
+        "--allow-repository-hooks",
+        "--integration-message",
+        "docs: reject task filter override",
+    ]);
+    assert_eq!(
+        bad_task_config.status.code(),
+        Some(4),
+        "{bad_task_config:?}"
+    );
+    assert!(String::from_utf8_lossy(&bad_task_config.stderr)
+        .contains("git-annex filter configuration is not verified"));
+    assert!(!clean_marker.exists());
+    assert!(!smudge_marker.exists());
+    assert!(!process_marker.exists());
+    assert!(!env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(git(&env.repo, &["rev-parse", "main"]), first_main_tip);
+    git(
+        &path,
+        &["config", "--worktree", "--unset", "filter.annex.clean"],
+    );
+    git(
+        &path,
+        &["config", "--worktree", "--unset", "filter.annex.smudge"],
+    );
+    git(
+        &path,
+        &["config", "--worktree", "--unset", "filter.annex.process"],
+    );
+
+    write_commit_msg_hook(
+        &env,
+        "printf 'hook\\n' >> .direnv/bin/nix-direnv-reload\nexit 1",
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--allow-annex-filter",
+        "--integration-message",
+        "docs: rejected first merge",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("worktree artifacts changed"));
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(fs::read(&preserved).unwrap(), b"reloadhook\n");
+
+    let no_opt_in = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--allow-annex-filter",
+        "--integration-message",
+        "docs: refused without opt in",
+    ]);
+    assert_eq!(no_opt_in.status.code(), Some(4), "{no_opt_in:?}");
+    assert!(String::from_utf8_lossy(&no_opt_in.stderr).contains("MERGE_HEAD in progress"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(env.main_oid(), first_main_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(fs::read(&preserved).unwrap(), b"reloadhook\n");
+
+    git(
+        &path,
+        &[
+            "config",
+            "--worktree",
+            "filter.annex.clean",
+            &overridden_clean,
+        ],
+    );
+    git(
+        &path,
+        &[
+            "config",
+            "--worktree",
+            "filter.annex.smudge",
+            &overridden_smudge,
+        ],
+    );
+    git(
+        &path,
+        &[
+            "config",
+            "--worktree",
+            "filter.annex.process",
+            &overridden_process,
+        ],
+    );
+    let recovery_process_setting = git(
+        &path,
+        &["config", "--show-origin", "--get", "filter.annex.process"],
+    );
+    assert!(
+        recovery_process_setting.contains(&overridden_process),
+        "task worktree filter override is not effective: {recovery_process_setting}"
+    );
+    assert!(!clean_marker.exists());
+    assert!(!smudge_marker.exists());
+    assert!(!process_marker.exists());
+    let bad_recovery_config = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--allow-annex-filter",
+        "--integration-message",
+        "docs: reject task filter recovery override",
+        "--keep-worktree",
+    ]);
+    assert_eq!(
+        bad_recovery_config.status.code(),
+        Some(4),
+        "{bad_recovery_config:?}"
+    );
+    assert!(String::from_utf8_lossy(&bad_recovery_config.stderr)
+        .contains("git-annex filter configuration is not verified"));
+    assert!(
+        !clean_marker.exists() && !smudge_marker.exists() && !process_marker.exists(),
+        "filter ran during delayed recovery: {}; {}; {}; stderr: {}",
+        clean_marker.exists(),
+        smudge_marker.exists(),
+        process_marker.exists(),
+        String::from_utf8_lossy(&bad_recovery_config.stderr)
+    );
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(fs::read(&preserved).unwrap(), b"reloadhook\n");
+    git(
+        &path,
+        &["config", "--worktree", "--unset", "filter.annex.clean"],
+    );
+    git(
+        &path,
+        &["config", "--worktree", "--unset", "filter.annex.smudge"],
+    );
+    git(
+        &path,
+        &["config", "--worktree", "--unset", "filter.annex.process"],
+    );
+
+    fs::remove_file(env.repo.join(".git/hooks/commit-msg")).unwrap();
+    fs::write(&preserved, "reload").unwrap();
+    fs::set_permissions(&preserved, fs::Permissions::from_mode(0o755)).unwrap();
+    let latest_main_tip = commit_file(&env.repo, "later-main.txt", "later main work\n");
+    let recovered = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--allow-annex-filter",
+        "--allow-repository-hooks",
+        "--integration-message",
+        "docs: recover and integrate prepared merge",
+        "--keep-worktree",
+    ]);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(env.main_oid(), git(&path, &["rev-parse", "HEAD"]));
+    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task work");
+    assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main work");
+    assert_eq!(
+        git(&env.repo, &["show", "HEAD:later-main.txt"]),
+        "later main work"
+    );
+    assert_eq!(
+        git(&env.repo, &["log", "-1", "--format=%s", "main"]),
+        "docs: recover and integrate prepared merge"
+    );
+    git(
+        &env.repo,
+        &["merge-base", "--is-ancestor", &latest_main_tip, "HEAD"],
+    );
+    assert!(!env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(fs::read(&preserved).unwrap(), b"reload");
+    assert_eq!(
+        git(
+            &path,
+            &[
+                "hash-object",
+                "--filters",
+                &format!("--path={annexed}"),
+                "--",
+                annexed,
+            ]
+        ),
+        annex_blob
+    );
+    assert!(git(&path, &["status", "--porcelain", "--ignored"]).contains("!! .direnv/"));
+}
+
+#[test]
+fn finish_recovery_refuses_ignored_file_colliding_with_a_restored_path() {
+    let env = Env::new();
+    commit_file(&env.repo, "restore-on-abort.txt", "base content\n");
+    let (id, path) = env.create("finish-recovery-path-collision");
+    let task_tip = commit_file(&path, "task.txt", "task work\n");
+    fs::remove_file(env.repo.join("restore-on-abort.txt")).unwrap();
+    git(&env.repo, &["add", "--update"]);
+    let main_tip = commit_file(&env.repo, "main.txt", "main work\n");
+    fs::write(env.repo.join(".git/info/exclude"), "restore-on-abort.txt\n").unwrap();
+    write_commit_msg_hook(&env, "printf 'user data\\n' > restore-on-abort.txt\nexit 1");
+
+    let failed = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--integration-message",
+        "docs: create pending merge",
+    ]);
+    assert_eq!(failed.status.code(), Some(3), "{failed:?}");
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    let user_file = path.join("restore-on-abort.txt");
+    assert_eq!(fs::read(&user_file).unwrap(), b"user data\n");
+
+    fs::remove_file(env.repo.join(".git/hooks/commit-msg")).unwrap();
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--integration-message",
+        "docs: must preserve restore collision",
+        "--keep-worktree",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("collides with path"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(fs::read(&user_file).unwrap(), b"user data\n");
+    assert!(git(&path, &["status", "--porcelain", "--ignored"]).contains("!! restore-on-abort.txt"));
+}
+
+#[test]
+fn finish_recovery_refuses_custom_filter_on_task_only_restore_path() {
+    let env = Env::new();
+    fs::write(
+        env.repo.join(".gitattributes"),
+        "restore-custom.txt filter=custom\n",
+    )
+    .unwrap();
+    git(&env.repo, &["config", "filter.custom.clean", "cat"]);
+    git(&env.repo, &["config", "filter.custom.smudge", "cat"]);
+    fs::write(env.repo.join("restore-custom.txt"), "task tree content\n").unwrap();
+    git(&env.repo, &["add", ".gitattributes", "restore-custom.txt"]);
+    git(
+        &env.repo,
+        &["commit", "-q", "-m", "add filtered restore path"],
+    );
+    let (id, path) = env.create("finish-custom-restore");
+    let task_tip = commit_file(&path, "task.txt", "task work\n");
+    fs::remove_file(env.repo.join("restore-custom.txt")).unwrap();
+    git(&env.repo, &["add", "--update"]);
+    let main_tip = commit_file(&env.repo, "main.txt", "main work\n");
+
+    git(
+        &path,
+        &[
+            "merge",
+            "--no-commit",
+            "--no-ff",
+            "--no-overwrite-ignore",
+            "-m",
+            "prepare merge before filter override",
+            "main",
+        ],
+    );
+    let marker = env.tmp.join("custom-smudge-ran");
+    let smudge = format!("sh -c 'touch {}; cat'", marker.display());
+    git(&path, &["config", "filter.custom.smudge", &smudge]);
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--integration-message",
+        "docs: reject custom restore filter",
+        "--keep-worktree",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("task-tip paths restored by abort use an unreviewed or mismatched filter"));
+    assert!(!marker.exists());
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+}
+
+#[test]
+fn finish_recovery_refuses_merge_autostash_without_mutating() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-recovery-autostash");
+    let task_tip = commit_file(&path, "task.txt", "task work\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main work\n");
+    env.exclude("sentinel.txt");
+    write_commit_msg_hook(&env, "printf 'preserved\\n' > sentinel.txt\nexit 1");
+
+    let failed = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--integration-message",
+        "docs: leave failed merge",
+    ]);
+    assert_eq!(failed.status.code(), Some(3), "{failed:?}");
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    fs::remove_file(env.repo.join(".git/hooks/commit-msg")).unwrap();
+
+    fs::write(env.admin(&id).join("ORIG_HEAD"), format!("{main_tip}\n")).unwrap();
+    let wrong_orig = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--integration-message",
+        "docs: refuse wrong ORIG_HEAD",
+        "--keep-worktree",
+    ]);
+    assert_eq!(wrong_orig.status.code(), Some(4), "{wrong_orig:?}");
+    assert!(String::from_utf8_lossy(&wrong_orig.stderr).contains("ORIG_HEAD does not match"));
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(fs::read(path.join("sentinel.txt")).unwrap(), b"preserved\n");
+    fs::write(env.admin(&id).join("ORIG_HEAD"), format!("{task_tip}\n")).unwrap();
+
+    fs::write(env.admin(&id).join("MERGE_HEAD"), format!("{task_tip}\n")).unwrap();
+    let wrong_merge = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--integration-message",
+        "docs: refuse wrong MERGE_HEAD",
+        "--keep-worktree",
+    ]);
+    assert_eq!(wrong_merge.status.code(), Some(4), "{wrong_merge:?}");
+    assert!(
+        String::from_utf8_lossy(&wrong_merge.stderr).contains("not an ancestor of current main")
+    );
+    fs::write(env.admin(&id).join("MERGE_HEAD"), format!("{main_tip}\n")).unwrap();
+
+    let task_file = path.join("task.txt");
+    fs::remove_file(&task_file).unwrap();
+    std::os::unix::fs::symlink("different-target", &task_file).unwrap();
+    let wrong_type = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--integration-message",
+        "docs: refuse changed worktree type",
+        "--keep-worktree",
+    ]);
+    assert_eq!(wrong_type.status.code(), Some(4), "{wrong_type:?}");
+    assert!(String::from_utf8_lossy(&wrong_type.stderr)
+        .contains("tracked worktree files differ from the merge index"));
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    fs::remove_file(&task_file).unwrap();
+    fs::write(&task_file, "task work\n").unwrap();
+
+    fs::write(
+        env.admin(&id).join("CHERRY_PICK_HEAD"),
+        b"another operation\n",
+    )
+    .unwrap();
+
+    let other_operation = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--integration-message",
+        "docs: refuse another operation",
+        "--keep-worktree",
+    ]);
+    assert_eq!(
+        other_operation.status.code(),
+        Some(4),
+        "{other_operation:?}"
+    );
+    assert!(String::from_utf8_lossy(&other_operation.stderr)
+        .contains("another Git operation is in progress (CHERRY_PICK_HEAD)"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    fs::remove_file(env.admin(&id).join("CHERRY_PICK_HEAD")).unwrap();
+    fs::write(env.admin(&id).join("MERGE_AUTOSTASH"), b"autostash\n").unwrap();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+        "--integration-message",
+        "docs: do not apply autostash",
+        "--keep-worktree",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("MERGE_AUTOSTASH is present"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(fs::read(path.join("sentinel.txt")).unwrap(), b"preserved\n");
+}
+
+#[test]
+fn finish_recover_failed_merge_requires_an_explicit_integration_message() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-recovery-message-required");
+    let main_tip = env.main_oid();
+    let output = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--recover-failed-merge",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("requires an explicit --integration-message"));
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(path.is_dir());
+}
+
+#[test]
 fn finish_preserves_an_unexpected_index_change_after_a_failed_merge_commit() {
     let env = Env::new();
     let (id, path) = env.create("finish-hook-index");
@@ -1656,7 +2396,7 @@ fn finish_refuses_an_unreviewed_filter_or_unapproved_commit_signer() {
             "filter",
             "filter.unreviewed.clean",
             "command:unreviewed",
-            "unreviewed Git filters",
+            "unreviewed or mismatched filter",
         ),
         (
             "signer",

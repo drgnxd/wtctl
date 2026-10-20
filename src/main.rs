@@ -34,7 +34,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
-  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id>
   remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
@@ -142,6 +142,7 @@ const FLAG_OPTS: &[&str] = &[
     "--keep-worktree",
     "--allow-annex-filter",
     "--allow-commit-signing",
+    "--recover-failed-merge",
 ];
 
 impl Args {
@@ -1316,6 +1317,8 @@ fn integrate_task(
     let tip = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, format!("cannot resolve {id} HEAD")))?;
+    let tip_tree = format!("{tip}^{{tree}}");
+    verify_tracked_filter_safety(repo, &entry.path, &tip_tree, allow_annex_filter)?;
     require_no_gitlink_changes(&repo.root, task_base, &tip)?;
     let facts = task::facts(&[entry], refname)?;
     let f = facts.first().cloned().unwrap_or_default();
@@ -1353,7 +1356,7 @@ fn integrate_task(
     }
     ensure_task_head(entry, &tip)?;
     ensure_no_cwd_users(entry, "integration")?;
-    check_active_filters(repo, &old, &tip, allow_annex_filter)?;
+    check_active_filters(repo, &entry.path, &old, &tip, allow_annex_filter)?;
     if !is_ancestor(&repo.root, &old, &tip)? {
         let mt = git::output(
             &repo.root,
@@ -1390,6 +1393,7 @@ fn integrate_task(
     ensure_no_cwd_users(entry, "integration")?;
     match main_checkout(repo, refname)? {
         Some(checkout) => {
+            check_active_filters(repo, &checkout, &old, &tip, allow_annex_filter)?;
             check_hooks(
                 &active_hooks(
                     &checkout,
@@ -1510,6 +1514,8 @@ fn merge_main_into_task(
 ) -> R<String> {
     ensure_task_head(entry, context.task_tip)?;
     ensure_no_cwd_users(entry, "merge preparation")?;
+    let task_tree = format!("{}^{{tree}}", context.task_tip);
+    verify_tracked_filter_safety(repo, &entry.path, &task_tree, context.allow_annex_filter)?;
     if !is_ancestor(&repo.root, task_base, context.main_tip)?
         || !is_ancestor(&repo.root, task_base, context.task_tip)?
     {
@@ -1533,19 +1539,6 @@ fn merge_main_into_task(
     if let Some(operation) = initial.in_progress {
         return refuse(format!("{id} has a {operation} in progress"));
     }
-    if context.annex {
-        annex_restage(
-            entry,
-            &entry.head,
-            main_worktree.as_deref(),
-            context.cleanup,
-            &initial_plan,
-        )?;
-    }
-    ensure_task_head(entry, context.task_tip)?;
-    ensure_no_cwd_users(entry, "merge preparation")?;
-    let merge_plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
-        .map_err(|why| Fail::new(4, format!("{id} changed during merge preparation: {why}")))?;
     let preview = git::output(
         &repo.root,
         [
@@ -1572,6 +1565,7 @@ fn merge_main_into_task(
             check_commit_signing(repo, context.allow_commit_signing)?;
             check_active_filters(
                 repo,
+                &entry.path,
                 context.task_tip,
                 &merged_tree,
                 context.allow_annex_filter,
@@ -1594,6 +1588,7 @@ fn merge_main_into_task(
             ));
         }
     };
+    verify_tracked_filter_safety(repo, &entry.path, &task_tree, context.allow_annex_filter)?;
     let hooks = active_hooks(
         &entry.path,
         &[
@@ -1606,6 +1601,50 @@ fn merge_main_into_task(
         None,
     )?;
     check_hooks(&hooks, context.allow_hooks)?;
+    ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
+    ensure_task_head(entry, context.task_tip)?;
+    ensure_no_cwd_users(entry, "merge")?;
+    ensure_no_merge_autostash(&entry.path).map_err(|why| {
+        Fail::new(
+            4,
+            format!("{id} cannot merge with MERGE_AUTOSTASH present: {why}"),
+        )
+    })?;
+    ensure_visible_index_flags(&entry.path)
+        .map_err(|why| Fail::new(4, format!("{id} index state is unsafe to merge: {why}")))?;
+    if context.annex {
+        annex_restage(
+            entry,
+            &entry.head,
+            main_worktree.as_deref(),
+            context.cleanup,
+            &initial_plan,
+        )?;
+    }
+    ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
+    ensure_task_head(entry, context.task_tip)?;
+    ensure_no_cwd_users(entry, "merge preparation")?;
+    let merge_plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
+        .map_err(|why| Fail::new(4, format!("{id} changed during merge preparation: {why}")))?;
+    if merge_plan != initial_plan {
+        return refuse(format!(
+            "{id} cleanup artifact plan changed during merge preparation"
+        ));
+    }
+    preflight::check_merge_paths(&entry.path, context.task_tip, &expected_tree).map_err(|why| {
+        Fail::new(
+            4,
+            format!("final merge tree is unsafe after restage: {why}"),
+        )
+    })?;
+    check_active_filters(
+        repo,
+        &entry.path,
+        context.task_tip,
+        &expected_tree,
+        context.allow_annex_filter,
+    )?;
+    verify_tracked_filter_safety(repo, &entry.path, &task_tree, context.allow_annex_filter)?;
     ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
     ensure_task_head(entry, context.task_tip)?;
     ensure_no_cwd_users(entry, "merge")?;
@@ -1651,6 +1690,7 @@ fn merge_main_into_task(
             &extras_before,
             main_worktree.as_deref(),
             &merge_plan,
+            context.allow_annex_filter,
         );
         let (status, detail) = match recovery {
             Ok(()) => (
@@ -1743,6 +1783,7 @@ fn abort_failed_merge(
     extras_before: &[git::StatusEntry],
     main_worktree: Option<&Path>,
     merge_plan: &artifact::Plan,
+    allow_annex_filter: bool,
 ) -> Result<(), String> {
     let refuse = |reason: &str| Err(format!("recovery safety check failed: {reason}"));
     ensure_no_cwd_users(entry, "failed merge recovery").map_err(|error| error.msg)?;
@@ -1773,9 +1814,23 @@ fn abort_failed_merge(
     if !index_matches_tree(&entry.path, expected_tree)? {
         return refuse("the merge index differs from the preflight tree");
     }
-    if !tracked_worktree_matches_index(&entry.path)? {
+    verify_tracked_filter_safety(repo, &entry.path, expected_tree, allow_annex_filter)
+        .map_err(|error| format!("recovery safety check failed: {}", error.msg))?;
+    if !tracked_worktree_matches_index(repo, &entry.path, expected_tree, allow_annex_filter)? {
         return refuse("tracked worktree files differ from the merge index");
     }
+    let restore_paths =
+        verify_abort_restore_paths(&entry.path, task_tip, expected_tree, extras_before)?;
+    let task_tree = format!("{task_tip}^{{tree}}");
+    verify_filter_paths(
+        repo,
+        &entry.path,
+        &restore_paths,
+        &task_tree,
+        allow_annex_filter,
+        "task-tip paths restored by abort",
+    )
+    .map_err(|error| format!("recovery safety check failed: {}", error.msg))?;
     if extra_status_entries(&entry.path)? != extras_before {
         return refuse("untracked or ignored worktree paths changed during the failed merge");
     }
@@ -1829,7 +1884,12 @@ fn abort_failed_merge(
     if !index_matches_tree(&entry.path, &original_tree)? {
         return Err("abort completed but the index differs from the starting tree".into());
     }
-    if !tracked_worktree_matches_index(&entry.path)? {
+    if !tracked_worktree_matches_index(
+        repo,
+        &entry.path,
+        &format!("{task_tip}^{{tree}}"),
+        allow_annex_filter,
+    )? {
         return Err(
             "abort completed but tracked worktree files differ from the starting tree".into(),
         );
@@ -1858,6 +1918,302 @@ fn abort_failed_merge(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn recover_pending_merge(
+    repo: &Repo,
+    id: &str,
+    entry: &Entry,
+    main_ref: &str,
+    main_tip: &str,
+    task_base: &str,
+    task_tip: &str,
+    allow_annex_filter: bool,
+    external_writers_quiesced: bool,
+) -> R<()> {
+    let refuse = |reason: &str| {
+        Fail::new(
+            4,
+            format!("{id} failed-merge recovery stopped before abort: {reason}"),
+        )
+    };
+    if !external_writers_quiesced {
+        return Err(refuse(
+            "inspect scheduled and non-cooperating writers, then pass --external-writers-quiesced",
+        ));
+    }
+    ensure_no_cwd_users(entry, "failed-merge recovery preparation")?;
+    ensure_task_head(entry, task_tip)?;
+    let task_tree = format!("{task_tip}^{{tree}}");
+    verify_tracked_filter_safety(repo, &entry.path, &task_tree, allow_annex_filter)
+        .map_err(|error| refuse(&error.msg))?;
+    let head = git::run(&entry.path, ["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if head != task_tip {
+        return Err(refuse("task HEAD differs from its registered tip"));
+    }
+    for operation in [
+        "rebase-merge",
+        "rebase-apply",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "BISECT_START",
+        "sequencer",
+    ] {
+        if entry.admin.join(operation).exists() {
+            return Err(refuse(&format!(
+                "another Git operation is in progress ({operation})"
+            )));
+        }
+    }
+    let orig_head = read_pseudo_ref(&entry.path, "ORIG_HEAD").map_err(|reason| refuse(&reason))?;
+    if orig_head.as_deref() != Some(format!("{task_tip}\n").as_bytes()) {
+        return Err(refuse("ORIG_HEAD does not match the task tip"));
+    }
+    ensure_no_merge_autostash(&entry.path).map_err(|reason| refuse(&reason))?;
+    let merge_head = read_pseudo_ref(&entry.path, "MERGE_HEAD")
+        .map_err(|reason| refuse(&reason))?
+        .ok_or_else(|| refuse("MERGE_HEAD is missing"))?;
+    let merge_head_text =
+        std::str::from_utf8(&merge_head).map_err(|_| refuse("MERGE_HEAD is not valid UTF-8"))?;
+    let merge_head = merge_head_text
+        .strip_suffix('\n')
+        .unwrap_or(merge_head_text);
+    if !git::is_oid(merge_head) {
+        return Err(refuse("MERGE_HEAD is not a valid commit ID"));
+    }
+    if !is_ancestor(&repo.root, task_base, task_tip)?
+        || !is_ancestor(&repo.root, task_base, merge_head)?
+    {
+        return Err(refuse("task and recorded merge do not share the task base"));
+    }
+    if !is_ancestor(&repo.root, merge_head, main_tip)? {
+        return Err(refuse("MERGE_HEAD is not an ancestor of current main"));
+    }
+    ensure_ref(&repo.root, main_ref, main_tip)?;
+    ensure_visible_index_flags(&entry.path).map_err(|reason| refuse(&reason))?;
+    let unmerged = git::output(&entry.path, ["ls-files", "--unmerged"])?;
+    if !unmerged.status.success() || !unmerged.stdout.is_empty() {
+        return Err(refuse("the merge index contains unresolved entries"));
+    }
+
+    let preview = git::output(
+        &repo.root,
+        [
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            task_tip,
+            merge_head,
+        ],
+    )?;
+    if preview.status.code() != Some(0) {
+        return Err(refuse(
+            "the recorded merge no longer has a clean merge tree",
+        ));
+    }
+    let expected_tree = String::from_utf8_lossy(&preview.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !git::is_oid(&expected_tree) {
+        return Err(refuse("merge-tree returned no valid result tree"));
+    }
+    let task_tree = format!("{task_tip}^{{tree}}");
+    let restore_paths = verify_abort_restore_paths(&entry.path, task_tip, &expected_tree, &[])
+        .map_err(|reason| refuse(&reason))?;
+    verify_filter_paths(
+        repo,
+        &entry.path,
+        &restore_paths,
+        &task_tree,
+        allow_annex_filter,
+        "task-tip paths restored by abort",
+    )
+    .map_err(|error| refuse(&error.msg))?;
+    verify_tracked_filter_safety(repo, &entry.path, &expected_tree, allow_annex_filter)
+        .map_err(|error| refuse(&error.msg))?;
+    preflight::check_merge_paths(&entry.path, task_tip, &expected_tree)
+        .map_err(|reason| refuse(&reason))?;
+    if !index_matches_tree(&entry.path, &expected_tree).map_err(|reason| refuse(&reason))? {
+        return Err(refuse(
+            "the merge index differs from its expected merge tree",
+        ));
+    }
+    if !tracked_worktree_matches_index(repo, &entry.path, &expected_tree, allow_annex_filter)
+        .map_err(|reason| refuse(&reason))?
+    {
+        return Err(refuse(
+            "tracked worktree files differ from the merge index after verified filters",
+        ));
+    }
+
+    let extras_before = extra_status_entries(&entry.path).map_err(|reason| refuse(&reason))?;
+    verify_abort_restore_paths(&entry.path, task_tip, &expected_tree, &extras_before)
+        .map_err(|reason| refuse(&reason))?;
+    let refs_before = git::run(
+        &repo.root,
+        ["for-each-ref", "--format=%(refname) %(objectname)"],
+    )?;
+    ensure_ref(&repo.root, main_ref, main_tip)?;
+    ensure_no_cwd_users(entry, "failed-merge recovery")?;
+    let no_artifact_plan = artifact::Plan::default();
+    let open_users = worktree_open_path_users(entry, &extras_before, &no_artifact_plan)
+        .map_err(|reason| refuse(&reason))?;
+    if !open_users.is_empty() {
+        return Err(refuse(&format!(
+            "processes have open handles in the task worktree (pids: {})",
+            open_users.join(", ")
+        )));
+    }
+    if extra_status_entries(&entry.path).map_err(|reason| refuse(&reason))? != extras_before {
+        return Err(refuse(
+            "untracked or ignored paths changed during recovery checks",
+        ));
+    }
+    verify_abort_restore_paths(&entry.path, task_tip, &expected_tree, &extras_before)
+        .map_err(|reason| refuse(&reason))?;
+    ensure_no_merge_autostash(&entry.path).map_err(|reason| refuse(&reason))?;
+    ensure_ref(&repo.root, main_ref, main_tip)?;
+    let refs_now = git::run(
+        &repo.root,
+        ["for-each-ref", "--format=%(refname) %(objectname)"],
+    )?;
+    if refs_now != refs_before {
+        return Err(refuse("Git refs changed during recovery checks"));
+    }
+    ensure_no_cwd_users(entry, "failed-merge recovery abort")?;
+
+    let abort = git::output(&entry.path, ["merge", "--abort"])?;
+    if !abort.status.success() {
+        return Err(Fail::new(
+            4,
+            format!(
+                "{id} recovery abort failed; inspect the current worktree state: {}",
+                git::stderr_of(&abort)
+            ),
+        ));
+    }
+    let restored_head = git::run(&entry.path, ["rev-parse", "HEAD"])?;
+    if restored_head.trim() != task_tip {
+        return Err(Fail::new(
+            4,
+            format!("{id} abort completed but task HEAD differs from its original tip"),
+        ));
+    }
+    ensure_no_merge_autostash(&entry.path)
+        .map_err(|reason| Fail::new(4, format!("{id} abort completed but {reason}")))?;
+    ensure_pseudo_ref_absent(&entry.path, "MERGE_HEAD")
+        .map_err(|reason| Fail::new(4, format!("{id} abort completed but {reason}")))?;
+    if !index_matches_tree(&entry.path, &task_tree)
+        .map_err(|reason| Fail::new(4, format!("{id} abort completed but {reason}")))?
+        || !tracked_worktree_matches_index(repo, &entry.path, &task_tree, allow_annex_filter)
+            .map_err(|reason| Fail::new(4, format!("{id} abort completed but {reason}")))?
+    {
+        return Err(Fail::new(
+            4,
+            format!("{id} abort completed but tracked state differs from the original task tip"),
+        ));
+    }
+    let current_main = git::run(&repo.root, ["rev-parse", "--verify", main_ref])?;
+    if current_main.trim() != main_tip {
+        return Err(Fail::new(
+            4,
+            format!("{id} abort completed but main moved during recovery"),
+        ));
+    }
+    let refs_after = git::run(
+        &repo.root,
+        ["for-each-ref", "--format=%(refname) %(objectname)"],
+    )?;
+    if refs_after != refs_before {
+        return Err(Fail::new(
+            4,
+            format!("{id} abort completed but Git refs changed during recovery"),
+        ));
+    }
+    if extra_status_entries(&entry.path)
+        .map_err(|reason| Fail::new(4, format!("{id} abort completed but {reason}")))?
+        != extras_before
+    {
+        return Err(Fail::new(
+            4,
+            format!("{id} abort completed but untracked or ignored paths changed"),
+        ));
+    }
+    Ok(())
+}
+
+fn tree_entries(worktree: &Path, treeish: &str) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
+    let output = git::output(worktree, ["ls-tree", "-r", "-z", "--full-tree", treeish])
+        .map_err(|error| error.msg)?;
+    if !output.status.success() {
+        return Err(format!("git ls-tree failed: {}", git::stderr_of(&output)));
+    }
+    let mut entries = BTreeMap::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|r| !r.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "git ls-tree returned a malformed entry".to_string())?;
+        entries.insert(record[tab + 1..].to_vec(), record[..tab].to_vec());
+    }
+    Ok(entries)
+}
+
+fn trim_trailing_slashes(mut path: &[u8]) -> &[u8] {
+    while path.last() == Some(&b'/') {
+        path = &path[..path.len() - 1];
+    }
+    path
+}
+
+fn paths_overlap(left: &[u8], right: &[u8]) -> bool {
+    let left = trim_trailing_slashes(left);
+    let right = trim_trailing_slashes(right);
+    let component_prefix = |prefix: &[u8], path: &[u8]| {
+        path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.get(prefix.len()) == Some(&b'/')
+    };
+    left == right || component_prefix(left, right) || component_prefix(right, left)
+}
+
+fn verify_abort_restore_paths(
+    worktree: &Path,
+    task_tip: &str,
+    merge_tree: &str,
+    extras: &[git::StatusEntry],
+) -> Result<Vec<Vec<u8>>, String> {
+    let task_entries = tree_entries(worktree, task_tip)?;
+    let merge_entries = tree_entries(worktree, merge_tree)?;
+    let restored: Vec<_> = task_entries
+        .iter()
+        .filter(|(path, entry)| merge_entries.get(*path) != Some(*entry))
+        .map(|(path, _)| path.clone())
+        .collect();
+    for extra in extras {
+        if let Some(path) = restored
+            .iter()
+            .find(|tracked| paths_overlap(&extra.path, tracked))
+        {
+            return Err(format!(
+                "untracked or ignored path {:?} collides with path {:?} restored by abort",
+                String::from_utf8_lossy(&extra.path),
+                String::from_utf8_lossy(path)
+            ));
+        }
+    }
+    Ok(restored)
+}
+
 fn worktree_open_path_users(
     entry: &Entry,
     extras: &[git::StatusEntry],
@@ -1875,8 +2231,22 @@ fn worktree_open_path_users(
     {
         paths.insert(entry.path.join(OsString::from_vec(path.to_vec())));
     }
+    let mut expanded_extra_paths = 0usize;
     for extra in extras {
-        paths.insert(entry.path.join(OsString::from_vec(extra.path.clone())));
+        let relative = Path::new(OsStr::from_bytes(&extra.path));
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err("untracked or ignored path is outside the worktree".into());
+        }
+        collect_open_paths(
+            &entry.path.join(OsString::from_vec(extra.path.clone())),
+            &mut paths,
+            &mut expanded_extra_paths,
+        )?;
     }
     for artifact in plan.generated.iter().chain(plan.direnv.iter()) {
         for entry in &artifact.signature {
@@ -1888,6 +2258,52 @@ fn worktree_open_path_users(
         }
     }
     artifact::open_path_users(&paths.into_iter().collect::<Vec<_>>())
+}
+
+const MAX_EXTRA_OPEN_PATHS: usize = 100_000;
+
+fn collect_open_paths(
+    path: &Path,
+    paths: &mut BTreeSet<PathBuf>,
+    count: &mut usize,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect untracked or ignored path {}: {error}",
+            path.display()
+        )
+    })?;
+    *count = count
+        .checked_add(1)
+        .ok_or_else(|| "too many untracked or ignored paths to inspect".to_string())?;
+    if *count > MAX_EXTRA_OPEN_PATHS {
+        return Err("too many untracked or ignored paths to inspect".into());
+    }
+    // lsof follows symlinks; probing generated or broken targets is outside this worktree check.
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if !paths.insert(path.to_path_buf()) {
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() {
+        return Ok(());
+    }
+    for child in fs::read_dir(path).map_err(|error| {
+        format!(
+            "cannot read untracked or ignored directory {}: {error}",
+            path.display()
+        )
+    })? {
+        let child = child.map_err(|error| {
+            format!(
+                "cannot enumerate untracked or ignored directory {}: {error}",
+                path.display()
+            )
+        })?;
+        collect_open_paths(&child.path(), paths, count)?;
+    }
+    Ok(())
 }
 
 fn extra_status_entries(worktree: &Path) -> Result<Vec<git::StatusEntry>, String> {
@@ -1977,11 +2393,191 @@ fn index_matches_tree(worktree: &Path, tree: &str) -> Result<bool, String> {
     }
 }
 
-fn tracked_worktree_matches_index(worktree: &Path) -> Result<bool, String> {
+const FILTER_SCAN_BATCH_PATHS: usize = 256;
+const FILTER_SCAN_MAX_PATHS: usize = 100_000;
+const FILTER_SCAN_MAX_PATH_BYTES: usize = 16 * 1024 * 1024;
+const FILTER_SCAN_MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
+
+fn worktree_filter_attributes(
+    worktree: &Path,
+    source_tree: Option<&str>,
+    paths: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![OsString::from("check-attr")];
+    if let Some(tree) = source_tree {
+        args.push(format!("--source={tree}").into());
+    }
+    args.extend(["-z".into(), "filter".into(), "--stdin".into()]);
+    let mut command = git::command(worktree, args);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot run git check-attr: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "git check-attr stdin was unavailable".to_string())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git check-attr stdout was unavailable".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "git check-attr stderr was unavailable".to_string())?;
+    let writer_paths = paths.to_vec();
+    let writer = std::thread::Builder::new()
+        .name("wtctl-check-attr-stdin".into())
+        .spawn(move || -> Result<(), String> {
+            for path in &writer_paths {
+                stdin
+                    .write_all(path)
+                    .map_err(|error| format!("cannot write filter path: {error}"))?;
+                stdin
+                    .write_all(b"\0")
+                    .map_err(|error| format!("cannot write filter path terminator: {error}"))?;
+            }
+            Ok(())
+        })
+        .map_err(|error| format!("cannot start git check-attr writer: {error}"))?;
+    let stdout_reader = std::thread::Builder::new()
+        .name("wtctl-check-attr-stdout".into())
+        .spawn(move || -> Result<Vec<u8>, String> {
+            let mut output = Vec::new();
+            stdout
+                .read_to_end(&mut output)
+                .map_err(|error| format!("cannot read git check-attr stdout: {error}"))?;
+            Ok(output)
+        })
+        .map_err(|error| format!("cannot start git check-attr stdout reader: {error}"))?;
+    let stderr_reader = std::thread::Builder::new()
+        .name("wtctl-check-attr-stderr".into())
+        .spawn(move || -> Result<Vec<u8>, String> {
+            let mut output = Vec::new();
+            stderr
+                .read_to_end(&mut output)
+                .map_err(|error| format!("cannot read git check-attr stderr: {error}"))?;
+            Ok(output)
+        })
+        .map_err(|error| format!("cannot start git check-attr stderr reader: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("cannot wait for git check-attr: {error}"))?;
+    let write_result = writer
+        .join()
+        .map_err(|_| "git check-attr stdin writer panicked".to_string())?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "git check-attr stdout reader panicked".to_string())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "git check-attr stderr reader panicked".to_string())??;
+    if !status.success() {
+        return Err(format!(
+            "git check-attr failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    write_result?;
+    let mut fields: Vec<_> = stdout.split(|byte| *byte == 0).collect();
+    if fields.last() == Some(&&b""[..]) {
+        fields.pop();
+    }
+    if fields.len() != paths.len() * 3 {
+        return Err("git check-attr returned malformed filter data".into());
+    }
+    let mut values = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        let fields = &fields[index * 3..index * 3 + 3];
+        if fields[0] != path.as_slice() || fields[1] != b"filter" {
+            return Err("git check-attr returned malformed filter data".into());
+        }
+        values.push(fields[2].to_vec());
+    }
+    Ok(values)
+}
+
+fn worktree_filter_attribute(
+    worktree: &Path,
+    source_tree: Option<&str>,
+    relative_path: &Path,
+) -> Result<Vec<u8>, String> {
+    worktree_filter_attributes(
+        worktree,
+        source_tree,
+        &[relative_path.as_os_str().as_bytes().to_vec()],
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| "git check-attr returned no filter value".into())
+}
+
+fn annex_filter_matches_path(
+    repo: &Repo,
+    worktree: &Path,
+    expected_tree: &str,
+    relative_path: &Path,
+    allow_annex_filter: bool,
+    annex_filter_verified: &mut bool,
+) -> Result<bool, String> {
+    if !allow_annex_filter {
+        return Ok(false);
+    }
+    let current = worktree_filter_attribute(worktree, None, relative_path)?;
+    let expected = worktree_filter_attribute(worktree, Some(expected_tree), relative_path)?;
+    if current.as_slice() != b"annex" || expected.as_slice() != b"annex" {
+        return Ok(false);
+    }
+    if !*annex_filter_verified {
+        verify_annex_filter_config(repo, worktree).map_err(|error| error.msg)?;
+        *annex_filter_verified = true;
+    }
+    Ok(true)
+}
+
+fn hash_worktree_path_with_filters(
+    worktree: &Path,
+    relative_path: &Path,
+) -> Result<String, String> {
+    let mut path_arg = OsString::from("--path=");
+    path_arg.push(relative_path.as_os_str());
+    let output = git::output(
+        worktree,
+        [
+            OsStr::new("hash-object"),
+            OsStr::new("--filters"),
+            path_arg.as_os_str(),
+            OsStr::new("--"),
+            relative_path.as_os_str(),
+        ],
+    )
+    .map_err(|error| error.msg)?;
+    if !output.status.success() {
+        return Err(format!(
+            "git hash-object with verified Git filters failed: {}",
+            git::stderr_of(&output)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn tracked_worktree_matches_index(
+    repo: &Repo,
+    worktree: &Path,
+    expected_tree: &str,
+    allow_annex_filter: bool,
+) -> Result<bool, String> {
     let index = git::output(worktree, ["ls-files", "--stage", "-z"]).map_err(|error| error.msg)?;
     if !index.status.success() {
         return Err(format!("git ls-files failed: {}", git::stderr_of(&index)));
     }
+    let mut annex_filter_verified = false;
     for entry in index
         .stdout
         .split(|byte| *byte == 0)
@@ -2043,7 +2639,19 @@ fn tracked_worktree_matches_index(worktree: &Path) -> Result<bool, String> {
                     ));
                 }
                 if String::from_utf8_lossy(&hash.stdout).trim() != oid {
-                    return Ok(false);
+                    let annex_filter = annex_filter_matches_path(
+                        repo,
+                        worktree,
+                        expected_tree,
+                        relative_path,
+                        allow_annex_filter,
+                        &mut annex_filter_verified,
+                    )?;
+                    if !annex_filter
+                        || hash_worktree_path_with_filters(worktree, relative_path)? != oid
+                    {
+                        return Ok(false);
+                    }
                 }
             }
             b"120000" => {
@@ -2144,7 +2752,13 @@ fn merge_state_diagnostic(entry: &Entry) -> String {
     )
 }
 
-fn check_active_filters(repo: &Repo, old: &str, tree: &str, allow_annex_filter: bool) -> R<()> {
+fn check_active_filters(
+    repo: &Repo,
+    worktree: &Path,
+    old: &str,
+    tree: &str,
+    allow_annex_filter: bool,
+) -> R<()> {
     let changed = git::output(
         &repo.root,
         ["diff", "--name-only", "-z", "--no-renames", old, tree],
@@ -2155,68 +2769,47 @@ fn check_active_filters(repo: &Repo, old: &str, tree: &str, allow_annex_filter: 
             git::stderr_of(&changed)
         ));
     }
-    let paths: Vec<&[u8]> = changed
+    if changed.stdout.len() > FILTER_SCAN_MAX_INDEX_BYTES {
+        return refuse("changed paths exceed the filter-scan size limit");
+    }
+    let paths: Vec<Vec<u8>> = changed
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
         .collect();
     if paths.is_empty() {
         return Ok(());
     }
-    let source = format!("--source={tree}");
-    let mut command = git::command(
-        &repo.root,
-        ["check-attr", source.as_str(), "-z", "filter", "--stdin"],
-    );
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| Fail::new(1, format!("cannot run git check-attr: {error}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        for path in &paths {
-            stdin
-                .write_all(path)
-                .map_err(|error| Fail::new(1, format!("cannot write filter paths: {error}")))?;
-            stdin
-                .write_all(b"\0")
-                .map_err(|error| Fail::new(1, format!("cannot write filter paths: {error}")))?;
-        }
+    if paths.len() > FILTER_SCAN_MAX_PATHS
+        || paths.iter().map(Vec::len).sum::<usize>() > FILTER_SCAN_MAX_PATH_BYTES
+    {
+        return refuse("changed paths exceed the filter-scan path limit");
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| Fail::new(1, format!("cannot read git check-attr: {error}")))?;
-    if !output.status.success() {
-        return refuse(format!(
-            "git check-attr failed: {}",
-            git::stderr_of(&output)
-        ));
-    }
-    let fields: Vec<&[u8]> = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .collect();
     let mut active = Vec::new();
     let mut annex = Vec::new();
-    for triple in fields.chunks(3) {
-        if triple.len() != 3 {
-            return refuse("git check-attr returned malformed output");
-        }
-        if triple[1] != b"filter" || matches!(triple[2], b"unspecified" | b"unset") {
-            continue;
-        }
-        let description = format!(
-            "{}:filter={}",
-            String::from_utf8_lossy(triple[0]),
-            String::from_utf8_lossy(triple[2])
-        );
-        if triple[2] == b"annex" {
-            annex.push(description);
-        } else {
-            active.push(description);
+    for batch in paths.chunks(FILTER_SCAN_BATCH_PATHS) {
+        let current = worktree_filter_attributes(worktree, None, batch)
+            .map_err(|reason| Fail::new(1, reason))?;
+        let expected = worktree_filter_attributes(worktree, Some(tree), batch)
+            .map_err(|reason| Fail::new(1, reason))?;
+        for ((path, current), expected) in batch.iter().zip(current).zip(expected) {
+            let current_active = !matches!(current.as_slice(), b"unspecified" | b"unset");
+            let expected_active = !matches!(expected.as_slice(), b"unspecified" | b"unset");
+            if !current_active && !expected_active {
+                continue;
+            }
+            let description = format!(
+                "{}: current filter={}, expected filter={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(&current),
+                String::from_utf8_lossy(&expected)
+            );
+            if current.as_slice() == b"annex" && expected.as_slice() == b"annex" {
+                annex.push(description);
+            } else {
+                active.push(description);
+            }
         }
     }
     if !active.is_empty() {
@@ -2232,26 +2825,140 @@ fn check_active_filters(repo: &Repo, old: &str, tree: &str, allow_annex_filter: 
                 annex.join(", ")
             ));
         }
-        let expected = [
-            ("filter.annex.clean", "git-annex smudge --clean -- %f"),
-            ("filter.annex.smudge", "git-annex smudge -- %f"),
-            ("filter.annex.process", "git-annex filter-process"),
-        ];
-        let mut mismatches = Vec::new();
-        for (key, expected) in expected {
-            let config = git::output(&repo.root, ["config", "--get", key])?;
-            if !config.status.success()
-                || String::from_utf8_lossy(&config.stdout).trim() != expected
-            {
-                mismatches.push(key);
-            }
+        verify_annex_filter_config(repo, worktree)?;
+    }
+    Ok(())
+}
+
+fn indexed_filter_paths(worktree: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let index = git::output(worktree, ["ls-files", "--stage", "-z"]).map_err(|error| error.msg)?;
+    if !index.status.success() {
+        return Err(format!("git ls-files failed: {}", git::stderr_of(&index)));
+    }
+    if index.stdout.len() > FILTER_SCAN_MAX_INDEX_BYTES {
+        return Err("index exceeds the filter-scan size limit".into());
+    }
+    let mut paths = Vec::new();
+    let mut path_bytes = 0usize;
+    for entry in index
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "git ls-files returned a malformed index entry".to_string())?;
+        let fields: Vec<_> = entry[..tab].split(|byte| *byte == b' ').collect();
+        if fields.len() != 3 || fields[2] != b"0" {
+            return Err("index contains a non-stage-0 or malformed entry".into());
         }
-        if !mismatches.is_empty() || !repo.require_annex_ready(true)? {
+        let path = entry[tab + 1..].to_vec();
+        let relative = Path::new(OsStr::from_bytes(&path));
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err("index contains a path outside the worktree".into());
+        }
+        path_bytes = path_bytes
+            .checked_add(path.len())
+            .ok_or_else(|| "index paths exceed the filter-scan size limit".to_string())?;
+        if paths.len() >= FILTER_SCAN_MAX_PATHS || path_bytes > FILTER_SCAN_MAX_PATH_BYTES {
+            return Err("index paths exceed the filter-scan path limit".into());
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn verify_tracked_filter_safety(
+    repo: &Repo,
+    worktree: &Path,
+    task_tree: &str,
+    allow_annex_filter: bool,
+) -> R<()> {
+    let paths = indexed_filter_paths(worktree).map_err(|reason| Fail::new(4, reason))?;
+    verify_filter_paths(
+        repo,
+        worktree,
+        &paths,
+        task_tree,
+        allow_annex_filter,
+        "tracked paths",
+    )
+}
+
+fn verify_filter_paths(
+    repo: &Repo,
+    worktree: &Path,
+    paths: &[Vec<u8>],
+    expected_tree: &str,
+    allow_annex_filter: bool,
+    scope: &str,
+) -> R<()> {
+    let path_bytes = paths
+        .iter()
+        .try_fold(0usize, |total, path| total.checked_add(path.len()));
+    if paths.len() > FILTER_SCAN_MAX_PATHS
+        || path_bytes.is_none_or(|total| total > FILTER_SCAN_MAX_PATH_BYTES)
+    {
+        return refuse(format!("{scope} exceed the filter-scan path limit"));
+    }
+    let mut annex = false;
+    for batch in paths.chunks(FILTER_SCAN_BATCH_PATHS) {
+        let current = worktree_filter_attributes(worktree, None, batch)
+            .map_err(|reason| Fail::new(1, reason))?;
+        let expected = worktree_filter_attributes(worktree, Some(expected_tree), batch)
+            .map_err(|reason| Fail::new(1, reason))?;
+        for ((path, current), expected) in batch.iter().zip(current).zip(expected) {
+            let current_active = !matches!(current.as_slice(), b"unspecified" | b"unset");
+            let expected_active = !matches!(expected.as_slice(), b"unspecified" | b"unset");
+            if !current_active && !expected_active {
+                continue;
+            }
+            if current.as_slice() != b"annex" || expected.as_slice() != b"annex" {
+                return refuse(format!(
+                    "{scope} use an unreviewed or mismatched filter: {} (current={}, expected tree={})",
+                    String::from_utf8_lossy(path),
+                    String::from_utf8_lossy(&current),
+                    String::from_utf8_lossy(&expected)
+                ));
+            }
+            annex = true;
+        }
+    }
+    if annex {
+        if !allow_annex_filter {
             return refuse(format!(
-                "git-annex filter configuration is not verified: {}",
-                mismatches.join(", ")
+                "{scope} use Git-annex filters; pass --allow-annex-filter"
             ));
         }
+        verify_annex_filter_config(repo, worktree)?;
+    }
+    Ok(())
+}
+
+fn verify_annex_filter_config(repo: &Repo, worktree: &Path) -> R<()> {
+    let expected = [
+        ("filter.annex.clean", "git-annex smudge --clean -- %f"),
+        ("filter.annex.smudge", "git-annex smudge -- %f"),
+        ("filter.annex.process", "git-annex filter-process"),
+    ];
+    let mut mismatches = Vec::new();
+    for (key, expected) in expected {
+        let config = git::output(worktree, ["config", "--get", key])?;
+        if !config.status.success() || String::from_utf8_lossy(&config.stdout).trim() != expected {
+            mismatches.push(key);
+        }
+    }
+    if !mismatches.is_empty() || !repo.require_annex_ready(true)? {
+        return refuse(format!(
+            "git-annex filter configuration is not verified: {}",
+            mismatches.join(", ")
+        ));
     }
     Ok(())
 }
@@ -2280,6 +2987,7 @@ fn cmd_finish(a: &Args) -> R<()> {
     let id = a.get("--id")?;
     let legacy_id = a.get("--legacy-worktree-id")?;
     let branch = a.get("--expect-branch")?;
+    let recover_failed_merge = a.flag("--recover-failed-merge");
     if [id, legacy_id, branch]
         .into_iter()
         .filter(Option::is_some)
@@ -2295,9 +3003,17 @@ fn cmd_finish(a: &Args) -> R<()> {
         return Err(Fail::new(2, "--delete-branch requires --expect-branch"));
     }
     let keep_worktree = a.flag("--keep-worktree");
-    let integration_message = a
-        .get("--integration-message")?
-        .unwrap_or("chore: integrate task worktree");
+    let integration_message_arg = a.get("--integration-message")?;
+    if recover_failed_merge && id.is_none() {
+        return Err(Fail::new(2, "--recover-failed-merge requires --id"));
+    }
+    if recover_failed_merge && integration_message_arg.is_none() {
+        return Err(Fail::new(
+            2,
+            "--recover-failed-merge requires an explicit --integration-message",
+        ));
+    }
+    let integration_message = integration_message_arg.unwrap_or("chore: integrate task worktree");
     if integration_message.trim().is_empty()
         || integration_message.contains('\n')
         || integration_message.contains('\r')
@@ -2378,12 +3094,48 @@ fn cmd_finish(a: &Args) -> R<()> {
         };
         (entry, task_base, None, removal, display_id, me()?)
     };
-    let main_tip = git::run(&repo.root, ["rev-parse", "--verify", &refname])?
+    let mut main_tip = git::run(&repo.root, ["rev-parse", "--verify", &refname])?
         .trim()
         .to_string();
     let task_tip = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, format!("cannot resolve {display_id} HEAD")))?;
+    if recover_failed_merge {
+        let external_writers_quiesced = a.flag("--external-writers-quiesced");
+        verify_removal_authority(&repo, &entry, &removal)?;
+        if let Some(marker) = &marker {
+            require_owner(marker)?;
+        }
+        recover_pending_merge(
+            &repo,
+            &display_id,
+            &entry,
+            &refname,
+            &main_tip,
+            &task_base,
+            &task_tip,
+            a.flag("--allow-annex-filter"),
+            external_writers_quiesced,
+        )?;
+        entry = Entry::load(entry.admin.clone()).ok_or_else(|| {
+            Fail::new(
+                4,
+                format!("{display_id} registration disappeared after merge recovery"),
+            )
+        })?;
+        verify_removal_authority(&repo, &entry, &removal)?;
+        if let Some(marker) = &marker {
+            require_owner(marker)?;
+        }
+        if entry.current_oid().as_deref() != Some(task_tip.as_str()) {
+            return refuse(format!(
+                "{display_id} HEAD changed after failed-merge recovery"
+            ));
+        }
+        main_tip = git::run(&repo.root, ["rev-parse", "--verify", &refname])?
+            .trim()
+            .to_string();
+    }
     if !is_ancestor(&repo.root, &main_tip, &task_tip)?
         && !is_ancestor(&repo.root, &task_tip, &main_tip)?
     {
@@ -2952,6 +3704,8 @@ fn remove_worktree(
             return refuse(format!("run this outside {}", entry.path.display()));
         }
     }
+    let expected_tree = format!("{expected_head}^{{tree}}");
+    verify_tracked_filter_safety(repo, &entry.path, &expected_tree, annex)?;
     let facts = task::facts(&[entry], main_ref)?;
     facts
         .first()
@@ -3706,6 +4460,7 @@ fn run(argv: &[OsString]) -> R<()> {
     }
     if cmd != "finish"
         && (args.flag("--allow-commit-signing")
+            || args.flag("--recover-failed-merge")
             || args.flag("--keep-worktree")
             || args.os("--integration-message").is_some())
     {
@@ -3877,6 +4632,127 @@ mod tests {
         fs::write(outside.join("file.txt"), b"tracked content\n").unwrap();
         std::os::unix::fs::symlink(&outside, worktree.join("linked")).unwrap();
         assert!(!tracked_parent_dirs_are_real(&worktree, Path::new("linked/file.txt")).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn annex_hash_fallback_never_runs_a_custom_filter() {
+        for source in ["worktree", "info", "core", "annex-no-ack"] {
+            let dir = scratch(&format!("custom-filter-{source}"));
+            let annex_attributes = source != "core";
+            if annex_attributes {
+                fs::write(dir.join(".gitattributes"), "-foo.bin filter=annex\n").unwrap();
+                sh(&dir, &["config", "filter.annex.clean", "cat"]);
+                sh(&dir, &["add", ".gitattributes"]);
+                sh(&dir, &["commit", "-q", "-m", "annex attributes"]);
+            }
+            fs::write(dir.join("-foo.bin"), b"pointer\n").unwrap();
+            sh(&dir, &["add", "--", "-foo.bin"]);
+            sh(&dir, &["commit", "-q", "-m", "pointer blob"]);
+            let expected_tree = sh(&dir, &["rev-parse", "HEAD^{tree}"]);
+            fs::write(dir.join("-foo.bin"), b"materialized content\n").unwrap();
+
+            let marker = dir.join("custom-filter-ran");
+            let command = format!("sh -c 'touch {}; cat'", marker.display());
+            if source == "annex-no-ack" {
+                sh(&dir, &["config", "filter.annex.clean", &command]);
+            } else {
+                sh(&dir, &["config", "filter.custom.clean", &command]);
+            }
+            match source {
+                "worktree" => {
+                    fs::write(dir.join(".gitattributes"), "-foo.bin filter=custom\n").unwrap()
+                }
+                "info" => {
+                    fs::write(dir.join(".git/info/attributes"), "-foo.bin filter=custom\n").unwrap()
+                }
+                "core" => {
+                    let attributes = dir.join("external.attributes");
+                    fs::write(&attributes, "-foo.bin filter=custom\n").unwrap();
+                    sh(
+                        &dir,
+                        &[
+                            "config",
+                            "core.attributesFile",
+                            attributes.to_str().unwrap(),
+                        ],
+                    );
+                }
+                "annex-no-ack" => {}
+                _ => unreachable!(),
+            }
+
+            let repo = Repo::open(&dir).unwrap();
+            assert!(
+                !tracked_worktree_matches_index(
+                    &repo,
+                    &dir,
+                    &expected_tree,
+                    source != "annex-no-ack",
+                )
+                .unwrap(),
+                "{source} override must prevent filter-aware matching"
+            );
+            assert!(
+                !marker.exists(),
+                "custom clean filter ran for {source} attributes"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn filter_attribute_batch_drains_output_while_writing_long_paths() {
+        let dir = scratch("filter-attribute-pipes");
+        let first = "a".repeat(180);
+        let second = "b".repeat(180);
+        let paths: Vec<Vec<u8>> = (0..FILTER_SCAN_BATCH_PATHS)
+            .map(|index| format!("{first}/{index}{second}/{first}").into_bytes())
+            .collect();
+        let path_count = paths.len();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(worktree_filter_attributes(&worker_dir, None, &paths));
+        });
+
+        let attributes = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("filter attribute batching deadlocked")
+            .unwrap();
+        assert_eq!(attributes.len(), path_count);
+        assert!(attributes.iter().all(|value| value == b"unspecified"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn abort_restore_path_conflicts_use_component_boundaries() {
+        assert!(paths_overlap(b"restore", b"restore/child"));
+        assert!(paths_overlap(b"restore/child", b"restore/"));
+        assert!(paths_overlap(b"restore", b"restore"));
+        assert!(!paths_overlap(b"restore/a", b"restore/b"));
+        assert!(!paths_overlap(b"restore", b"restore-old"));
+    }
+
+    #[test]
+    fn open_path_collection_recurses_without_following_symlinks() {
+        let dir = std::env::temp_dir().join(format!("wtctl-open-paths-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("ignored");
+        let external = dir.join("external");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(root.join("nested/file"), b"ignored data").unwrap();
+        fs::write(external.join("outside"), b"external data").unwrap();
+        std::os::unix::fs::symlink(&external, root.join("external-link")).unwrap();
+        let mut paths = BTreeSet::new();
+        let mut count = 0;
+
+        collect_open_paths(&root, &mut paths, &mut count).unwrap();
+
+        assert!(paths.contains(&root.join("nested/file")));
+        assert!(!paths.contains(&root.join("external-link")));
+        assert!(!paths.contains(&external.join("outside")));
         fs::remove_dir_all(&dir).unwrap();
     }
 
