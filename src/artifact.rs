@@ -1441,6 +1441,10 @@ fn lsof_open_paths(paths: &[PathBuf]) -> Result<Vec<String>, String> {
     Ok(pids.into_iter().collect())
 }
 
+pub fn open_path_users(paths: &[PathBuf]) -> Result<Vec<String>, String> {
+    lsof_open_paths(paths)
+}
+
 fn signature_json(signature: &[TreeEntry]) -> Value {
     Value::Array(
         signature
@@ -2106,6 +2110,25 @@ pub fn inspect_plan(
         }
     }
     Ok(plan)
+}
+
+pub fn verify_plan_artifacts(
+    plan: &Plan,
+    worktree: &Path,
+    main_worktree: Option<&Path>,
+) -> Result<(), String> {
+    for artifact in plan.generated.iter().chain(plan.direnv.iter()) {
+        verify_signature(&artifact.path, &artifact.signature, worktree)?;
+    }
+    if let Some(link) = &plan.database_link {
+        if canonical_database_link(worktree, main_worktree).as_ref() != Some(link) {
+            return Err(format!(
+                "canonical database link changed during merge: {}",
+                link.path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn check_pending_transaction(repo_name: &str, worktree: &Path) -> Result<(), String> {

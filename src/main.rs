@@ -11,13 +11,13 @@ mod preflight;
 mod procinfo;
 mod task;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1544,10 +1544,8 @@ fn merge_main_into_task(
     }
     ensure_task_head(entry, context.task_tip)?;
     ensure_no_cwd_users(entry, "merge preparation")?;
-    let refreshed_plan =
-        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
-            .map_err(|why| Fail::new(4, format!("{id} changed during merge preparation: {why}")))?;
-    drop(refreshed_plan);
+    let merge_plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
+        .map_err(|why| Fail::new(4, format!("{id} changed during merge preparation: {why}")))?;
     let preview = git::output(
         &repo.root,
         [
@@ -1611,6 +1609,24 @@ fn merge_main_into_task(
     ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
     ensure_task_head(entry, context.task_tip)?;
     ensure_no_cwd_users(entry, "merge")?;
+    ensure_no_merge_autostash(&entry.path).map_err(|why| {
+        Fail::new(
+            4,
+            format!("{id} cannot merge with MERGE_AUTOSTASH present: {why}"),
+        )
+    })?;
+    ensure_visible_index_flags(&entry.path)
+        .map_err(|why| Fail::new(4, format!("{id} index state is unsafe to merge: {why}")))?;
+    let refs_before = git::run(
+        &repo.root,
+        ["for-each-ref", "--format=%(refname) %(objectname)"],
+    )?;
+    let extras_before = extra_status_entries(&entry.path).map_err(|why| {
+        Fail::new(
+            4,
+            format!("cannot snapshot untracked worktree paths before merge: {why}"),
+        )
+    })?;
     let merge = git::output(
         &entry.path,
         [
@@ -1624,19 +1640,40 @@ fn merge_main_into_task(
         ],
     )?;
     if !merge.status.success() {
-        let status = git::output(
-            &entry.path,
-            ["status", "--porcelain=v1", "--untracked-files=all"],
-        )?;
-        let conflicts = String::from_utf8_lossy(&status.stdout)
-            .trim()
-            .replace('\n', ", ");
+        let recovery = abort_failed_merge(
+            repo,
+            entry,
+            context.task_tip,
+            context.main_ref,
+            context.main_tip,
+            &expected_tree,
+            &refs_before,
+            &extras_before,
+            main_worktree.as_deref(),
+            &merge_plan,
+        );
+        let (status, detail) = match recovery {
+            Ok(()) => (
+                "merge was aborted and task worktree restored",
+                git::stderr_of(&merge),
+            ),
+            Err(reason) => (
+                "task worktree preserved; automatic recovery was not completed",
+                format!(
+                    "starting task HEAD {}, {}={}; {reason}; {}; original merge error: {}",
+                    context.task_tip,
+                    context.main_ref,
+                    context.main_tip,
+                    merge_state_diagnostic(entry),
+                    git::stderr_of(&merge)
+                ),
+            ),
+        };
         return Err(Fail::new(
             3,
             format!(
-                "merge of advanced main into {id} failed; worktree preserved for resolution ({}): {}",
+                "merge of advanced main into {id} failed; {status} ({}): {detail}",
                 entry.path.display(),
-                if conflicts.is_empty() { git::stderr_of(&merge) } else { conflicts }
             ),
         ));
     }
@@ -1692,6 +1729,419 @@ fn merge_main_into_task(
         ));
     }
     Ok(merged_tip)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn abort_failed_merge(
+    repo: &Repo,
+    entry: &Entry,
+    task_tip: &str,
+    main_ref: &str,
+    main_tip: &str,
+    expected_tree: &str,
+    refs_before: &str,
+    extras_before: &[git::StatusEntry],
+    main_worktree: Option<&Path>,
+    merge_plan: &artifact::Plan,
+) -> Result<(), String> {
+    let refuse = |reason: &str| Err(format!("recovery safety check failed: {reason}"));
+    ensure_no_cwd_users(entry, "failed merge recovery").map_err(|error| error.msg)?;
+    let head = git::run(&entry.path, ["rev-parse", "HEAD"]).map_err(|error| error.msg)?;
+    if head.trim() != task_tip {
+        return refuse("task HEAD changed during the failed merge");
+    }
+    if let Err(reason) = ensure_no_merge_autostash(&entry.path) {
+        return refuse(&reason);
+    }
+    if let Err(reason) = ensure_visible_index_flags(&entry.path) {
+        return refuse(&reason);
+    }
+    let orig_head = read_pseudo_ref(&entry.path, "ORIG_HEAD")?;
+    if orig_head.as_deref() != Some(format!("{task_tip}\n").as_bytes()) {
+        return refuse("ORIG_HEAD does not match the task commit used to start the merge");
+    }
+    let merge_head = read_pseudo_ref(&entry.path, "MERGE_HEAD")?
+        .ok_or_else(|| "recovery safety check failed: MERGE_HEAD is missing".to_string())?;
+    if merge_head != format!("{main_tip}\n").as_bytes() {
+        return refuse("MERGE_HEAD is missing or does not contain only the expected main commit");
+    }
+    let unmerged =
+        git::output(&entry.path, ["ls-files", "--unmerged"]).map_err(|error| error.msg)?;
+    if !unmerged.status.success() || !unmerged.stdout.is_empty() {
+        return refuse("the merge index contains unresolved entries");
+    }
+    if !index_matches_tree(&entry.path, expected_tree)? {
+        return refuse("the merge index differs from the preflight tree");
+    }
+    if !tracked_worktree_matches_index(&entry.path)? {
+        return refuse("tracked worktree files differ from the merge index");
+    }
+    if extra_status_entries(&entry.path)? != extras_before {
+        return refuse("untracked or ignored worktree paths changed during the failed merge");
+    }
+    if artifact::verify_plan_artifacts(merge_plan, &entry.path, main_worktree).is_err() {
+        return refuse("untracked or ignored worktree artifacts changed during the failed merge");
+    }
+    let current_main =
+        git::run(&repo.root, ["rev-parse", "--verify", main_ref]).map_err(|error| error.msg)?;
+    if current_main.trim() != main_tip {
+        return refuse("main moved during the failed merge");
+    }
+    let refs_now = git::run(
+        &repo.root,
+        ["for-each-ref", "--format=%(refname) %(objectname)"],
+    )
+    .map_err(|error| error.msg)?;
+    if refs_now != refs_before {
+        return refuse("Git refs changed during the failed merge");
+    }
+    ensure_no_cwd_users(entry, "failed merge abort").map_err(|error| error.msg)?;
+    let open_users = worktree_open_path_users(entry, extras_before, merge_plan)?;
+    if !open_users.is_empty() {
+        return refuse(&format!(
+            "processes have open handles in the task worktree (pids: {})",
+            open_users.join(", ")
+        ));
+    }
+
+    let abort = git::output(&entry.path, ["merge", "--abort"]).map_err(|error| error.msg)?;
+    if !abort.status.success() {
+        return Err(format!(
+            "git merge --abort failed: {}",
+            git::stderr_of(&abort)
+        ));
+    }
+    let restored_head = git::run(&entry.path, ["rev-parse", "HEAD"]).map_err(|error| error.msg)?;
+    if restored_head.trim() != task_tip {
+        return Err("abort completed but task HEAD does not match its starting commit".into());
+    }
+    ensure_no_merge_autostash(&entry.path)
+        .map_err(|reason| format!("abort completed but {reason}"))?;
+    ensure_visible_index_flags(&entry.path)
+        .map_err(|reason| format!("abort completed but {reason}"))?;
+    let restored_orig_head = read_pseudo_ref(&entry.path, "ORIG_HEAD")?;
+    if restored_orig_head.as_deref() != Some(format!("{task_tip}\n").as_bytes()) {
+        return Err("abort completed but ORIG_HEAD does not match the starting task commit".into());
+    }
+    ensure_pseudo_ref_absent(&entry.path, "MERGE_HEAD")
+        .map_err(|reason| format!("abort completed but {reason}"))?;
+    let original_tree = format!("{task_tip}^{{tree}}");
+    if !index_matches_tree(&entry.path, &original_tree)? {
+        return Err("abort completed but the index differs from the starting tree".into());
+    }
+    if !tracked_worktree_matches_index(&entry.path)? {
+        return Err(
+            "abort completed but tracked worktree files differ from the starting tree".into(),
+        );
+    }
+    let refs_after = git::run(
+        &repo.root,
+        ["for-each-ref", "--format=%(refname) %(objectname)"],
+    )
+    .map_err(|error| error.msg)?;
+    if refs_after != refs_before {
+        return Err("abort completed but Git refs differ from their starting state".into());
+    }
+    if extra_status_entries(&entry.path)? != extras_before {
+        return Err("abort completed but untracked or ignored worktree paths changed".into());
+    }
+    if artifact::verify_plan_artifacts(merge_plan, &entry.path, main_worktree).is_err() {
+        return Err(
+            "abort completed but worktree artifacts differ from their starting state".into(),
+        );
+    }
+    if !worktree_open_path_users(entry, extras_before, merge_plan)?.is_empty() {
+        return Err(
+            "abort completed but a process still has open handles in the task worktree".into(),
+        );
+    }
+    Ok(())
+}
+
+fn worktree_open_path_users(
+    entry: &Entry,
+    extras: &[git::StatusEntry],
+    plan: &artifact::Plan,
+) -> Result<Vec<String>, String> {
+    let tracked = git::output(&entry.path, ["ls-files", "-z"]).map_err(|error| error.msg)?;
+    if !tracked.status.success() {
+        return Err(format!("git ls-files failed: {}", git::stderr_of(&tracked)));
+    }
+    let mut paths = BTreeSet::from([entry.path.clone()]);
+    for path in tracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        paths.insert(entry.path.join(OsString::from_vec(path.to_vec())));
+    }
+    for extra in extras {
+        paths.insert(entry.path.join(OsString::from_vec(extra.path.clone())));
+    }
+    for artifact in plan.generated.iter().chain(plan.direnv.iter()) {
+        for entry in &artifact.signature {
+            paths.insert(if entry.relative == "." {
+                artifact.path.clone()
+            } else {
+                artifact.path.join(&entry.relative)
+            });
+        }
+    }
+    artifact::open_path_users(&paths.into_iter().collect::<Vec<_>>())
+}
+
+fn extra_status_entries(worktree: &Path) -> Result<Vec<git::StatusEntry>, String> {
+    let status = git::output(worktree, git::STATUS_ARGS).map_err(|error| error.msg)?;
+    if !status.status.success() {
+        return Err(format!("git status failed: {}", git::stderr_of(&status)));
+    }
+    Ok(git::parse_status_entries(&status.stdout)
+        .map_err(|why| format!("git status returned malformed data: {why}"))?
+        .into_iter()
+        .filter(|entry| entry.code == *b"??" || entry.code == *b"!!")
+        .collect())
+}
+
+fn ensure_no_merge_autostash(worktree: &Path) -> Result<(), String> {
+    ensure_pseudo_ref_absent(worktree, "MERGE_AUTOSTASH")
+}
+
+fn ensure_pseudo_ref_absent(worktree: &Path, name: &str) -> Result<(), String> {
+    if read_pseudo_ref(worktree, name)?.is_some() {
+        return Err(format!("{name} is present"));
+    }
+    Ok(())
+}
+
+fn read_pseudo_ref(worktree: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let raw = git::run(worktree, ["rev-parse", "--git-path", name]).map_err(|error| error.msg)?;
+    let path = PathBuf::from(raw.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    };
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot open {name}: {error}")),
+    };
+    if !file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {name}: {error}"))?
+        .is_file()
+    {
+        return Err(format!("{name} is not a regular file"));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|error| format!("cannot read {name}: {error}"))?;
+    Ok(Some(contents))
+}
+
+fn ensure_visible_index_flags(worktree: &Path) -> Result<(), String> {
+    let flags = git::output(worktree, ["ls-files", "-v", "-z"]).map_err(|error| error.msg)?;
+    if !flags.status.success() {
+        return Err(format!("git ls-files failed: {}", git::stderr_of(&flags)));
+    }
+    if git::count_hidden(&flags.stdout) > 0 {
+        return Err("index contains assume-unchanged or skip-worktree entries".into());
+    }
+    Ok(())
+}
+
+fn index_matches_tree(worktree: &Path, tree: &str) -> Result<bool, String> {
+    let diff = git::output(
+        worktree,
+        [
+            "diff",
+            "--cached",
+            "--quiet",
+            "--ignore-submodules=none",
+            tree,
+            "--",
+        ],
+    )
+    .map_err(|error| error.msg)?;
+    match diff.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git diff --cached failed: {}",
+            git::stderr_of(&diff)
+        )),
+    }
+}
+
+fn tracked_worktree_matches_index(worktree: &Path) -> Result<bool, String> {
+    let index = git::output(worktree, ["ls-files", "--stage", "-z"]).map_err(|error| error.msg)?;
+    if !index.status.success() {
+        return Err(format!("git ls-files failed: {}", git::stderr_of(&index)));
+    }
+    for entry in index
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "git ls-files returned a malformed index entry".to_string())?;
+        let fields: Vec<_> = entry[..tab].split(|byte| *byte == b' ').collect();
+        if fields.len() != 3 || fields[2] != b"0" {
+            return Err("index contains a non-stage-0 or malformed entry".into());
+        }
+        let mode = fields[0];
+        let oid = std::str::from_utf8(fields[1])
+            .map_err(|_| "git ls-files returned a non-UTF-8 object ID".to_string())?;
+        let relative = OsString::from_vec(entry[tab + 1..].to_vec());
+        let relative_path = Path::new(&relative);
+        if relative_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err("index contains a path outside the worktree".into());
+        }
+        if !tracked_parent_dirs_are_real(worktree, relative_path)? {
+            return Ok(false);
+        }
+        let path = worktree.join(&relative);
+        match mode {
+            b"100644" | b"100755" => {
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(format!("cannot inspect tracked file: {error}")),
+                };
+                if !metadata.file_type().is_file() {
+                    return Ok(false);
+                }
+                let executable = metadata.mode() & 0o111 != 0;
+                if executable != (mode == b"100755") {
+                    return Ok(false);
+                }
+                let hash = git::output(
+                    worktree,
+                    [
+                        OsStr::new("hash-object"),
+                        OsStr::new("--no-filters"),
+                        path.as_os_str(),
+                    ],
+                )
+                .map_err(|error| error.msg)?;
+                if !hash.status.success() {
+                    return Err(format!(
+                        "cannot hash tracked file {}: {}",
+                        path.display(),
+                        git::stderr_of(&hash)
+                    ));
+                }
+                if String::from_utf8_lossy(&hash.stdout).trim() != oid {
+                    return Ok(false);
+                }
+            }
+            b"120000" => {
+                let target = match fs::read_link(&path) {
+                    Ok(target) => target,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(format!("cannot read tracked symlink: {error}")),
+                };
+                let hash = hash_blob_bytes(worktree, target.as_os_str().as_bytes())?;
+                if hash != oid {
+                    return Ok(false);
+                }
+            }
+            b"160000" => {
+                return Err(
+                    "automatic recovery is disabled for worktrees containing gitlinks".into(),
+                )
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported tracked mode {}",
+                    String::from_utf8_lossy(mode)
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn tracked_parent_dirs_are_real(worktree: &Path, relative: &Path) -> Result<bool, String> {
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty() {
+        return Ok(false);
+    }
+    let mut path = worktree.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        let Component::Normal(name) = component else {
+            return Err("tracked path contains a non-normal parent component".into());
+        };
+        path.push(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect tracked parent {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        if !metadata.file_type().is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn hash_blob_bytes(worktree: &Path, bytes: &[u8]) -> Result<String, String> {
+    let mut command = git::command(worktree, ["hash-object", "--stdin"]);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start git hash-object: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "git hash-object stdin was unavailable".to_string())?
+        .write_all(bytes)
+        .map_err(|error| format!("cannot send symlink content to git hash-object: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for git hash-object: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn merge_state_diagnostic(entry: &Entry) -> String {
+    let read = |args: &[&str]| match git::output(&entry.path, args) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => format!("error: {}", git::stderr_of(&output)),
+        Err(error) => format!("error: {}", error.msg),
+    };
+    format!(
+        "current HEAD={}, MERGE_HEAD={}, status={:?}",
+        read(&["rev-parse", "HEAD"]),
+        read(&["rev-parse", "--verify", "MERGE_HEAD"]),
+        read(git::STATUS_ARGS)
+    )
 }
 
 fn check_active_filters(repo: &Repo, old: &str, tree: &str, allow_annex_filter: bool) -> R<()> {
@@ -3413,6 +3863,20 @@ mod tests {
 
         restore_dotgit_symlink(&entry, &original).unwrap();
         assert_eq!(gitfile_pointer(&entry).unwrap(), Some(original));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tracked_content_verification_rejects_a_symlink_parent() {
+        let dir = std::env::temp_dir().join(format!("wtctl-parent-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let worktree = dir.join("worktree");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("file.txt"), b"tracked content\n").unwrap();
+        std::os::unix::fs::symlink(&outside, worktree.join("linked")).unwrap();
+        assert!(!tracked_parent_dirs_are_real(&worktree, Path::new("linked/file.txt")).unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
 
