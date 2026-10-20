@@ -1114,6 +1114,542 @@ fn finish_uses_the_supplied_integration_commit_message() {
 }
 
 #[test]
+fn finish_aborts_a_clean_merge_when_the_commit_message_hook_rejects_it() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-retry");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(
+        &env,
+        "case \"$(cat \"$1\")\" in *'chore: integrate task worktree'*) exit 1;; esac\nexit 0",
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("merge was aborted and task worktree restored"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(git(&path, &["status", "--porcelain"]), "");
+    assert!(!env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("task.txt")).unwrap(), b"task\n");
+    assert!(!path.join("main.txt").exists());
+
+    env.ok(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--integration-message",
+        "chore: integrate prepared main update",
+    ]);
+    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task");
+    assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main");
+    assert_eq!(
+        git(&env.repo, &["log", "-1", "--format=%s", "main"]),
+        "chore: integrate prepared main update"
+    );
+}
+
+#[test]
+fn finish_preserves_an_unexpected_index_change_after_a_failed_merge_commit() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-index");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(
+        &env,
+        "printf 'hook\\n' > hook-added.txt\ngit add hook-added.txt\nexit 1",
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("merge index differs from the preflight tree"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("hook-added.txt")).unwrap(), b"hook\n");
+    assert!(git(&path, &["diff", "--cached", "--name-only"]).contains("hook-added.txt"));
+}
+
+#[test]
+fn finish_preserves_a_tracked_worktree_change_after_a_failed_merge_commit() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-worktree");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(&env, "printf 'hook\\n' >> task.txt\nexit 1");
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("tracked worktree files differ from the merge index"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("task.txt")).unwrap(), b"task\nhook\n");
+}
+
+#[test]
+fn finish_detects_same_size_worktree_edits_with_restored_mtime() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-stat-cache");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    let original = env.tmp.join("original-task.txt");
+    git(&env.repo, &["config", "core.trustctime", "false"]);
+    write_commit_msg_hook(
+        &env,
+        &format!(
+            "cp task.txt '{}'\nprintf 'hask\\n' > task.txt\ntouch -r '{}' task.txt\nexit 1",
+            original.display(),
+            original.display(),
+        ),
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("tracked worktree files differ from the merge index"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("task.txt")).unwrap(), b"hask\n");
+}
+
+#[test]
+fn finish_preserves_raw_line_ending_changes_hidden_by_clean_conversion() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-line-endings");
+    git(&env.repo, &["config", "core.autocrlf", "true"]);
+    commit_file(&path, ".gitattributes", "*.txt text eol=lf\n");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(&env, "printf 'task\\r\\n' > task.txt\nexit 1");
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("tracked worktree files differ from the merge index"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("task.txt")).unwrap(), b"task\r\n");
+}
+
+#[test]
+fn finish_reports_merge_abort_failure_without_a_destructive_fallback() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-abort");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(&env, "exit 1");
+    let path_var = git_shim(
+        &env,
+        "shim-merge-abort",
+        "if [ \"$3\" = merge ] && [ \"$4\" = --abort ]; then exit 1; fi",
+    );
+
+    let refused = env
+        .cmd(&[
+            "finish",
+            "--repo",
+            &env.repo_arg(),
+            "--id",
+            &id,
+            "--external-writers-quiesced",
+            "--allow-repository-hooks",
+        ])
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("git merge --abort failed"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("current HEAD="));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("MERGE_HEAD="));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(git(&path, &["status", "--porcelain"]), "A  main.txt");
+}
+
+#[test]
+fn finish_preserves_failed_merge_when_an_external_process_holds_a_worktree_file() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-open-file");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    let task_file = path.join("task.txt");
+    write_commit_msg_hook(&env, "exit 1");
+    let open_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&task_file)
+        .unwrap();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    drop(open_file);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("processes have open handles in the task worktree"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(task_file).unwrap(), b"task\n");
+}
+
+#[test]
+fn finish_preserves_a_hook_changed_orig_head_without_aborting() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-orig-head");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(
+        &env,
+        &format!("git update-ref ORIG_HEAD {main_tip}\nexit 1"),
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("ORIG_HEAD does not match"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(git(&path, &["rev-parse", "ORIG_HEAD"]), main_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(git(&path, &["status", "--porcelain"]), "A  main.txt");
+}
+
+#[test]
+fn finish_preserves_an_unexpected_additional_merge_head_without_aborting() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-merge-head");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    let expected_merge_head_path =
+        PathBuf::from(git(&path, &["rev-parse", "--git-path", "MERGE_HEAD"]));
+    let expected_merge_head_path = if expected_merge_head_path.is_absolute() {
+        expected_merge_head_path
+    } else {
+        path.join(expected_merge_head_path)
+    };
+    write_commit_msg_hook(&env, "exit 1");
+    let path_var = git_shim_after(
+        &env,
+        "shim-extra-merge-head",
+        &format!(
+            "if [ \"$3\" = merge ] && [ \"$4\" != --abort ] && [ -f '{}' ]; then printf '{task_tip}\\n' >> '{}'; fi",
+            expected_merge_head_path.display(),
+            expected_merge_head_path.display(),
+        ),
+    );
+
+    let refused = env
+        .cmd(&[
+            "finish",
+            "--repo",
+            &env.repo_arg(),
+            "--id",
+            &id,
+            "--external-writers-quiesced",
+            "--allow-repository-hooks",
+        ])
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("MERGE_HEAD is missing or does not contain only the expected main commit"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(
+        fs::read(env.admin(&id).join("MERGE_HEAD")).unwrap(),
+        format!("{main_tip}\n{task_tip}\n").as_bytes()
+    );
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("task.txt")).unwrap(), b"task\n");
+}
+
+#[test]
+fn finish_preserves_a_hook_changed_merge_autostash_without_aborting() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-autostash");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(
+        &env,
+        &format!("git update-ref MERGE_AUTOSTASH {main_tip}\nexit 1"),
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("MERGE_AUTOSTASH is present"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(
+        git(&path, &["rev-parse", "--verify", "MERGE_AUTOSTASH"]),
+        main_tip
+    );
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("task.txt")).unwrap(), b"task\n");
+}
+
+#[test]
+fn finish_refuses_to_start_with_a_merge_autostash_file() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-existing-autostash");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    let autostash = PathBuf::from(git(&path, &["rev-parse", "--git-path", "MERGE_AUTOSTASH"]));
+    let autostash = if autostash.is_absolute() {
+        autostash
+    } else {
+        path.join(autostash)
+    };
+    fs::write(&autostash, format!("{main_tip}\n")).unwrap();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("MERGE_AUTOSTASH is present"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(!env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(
+        fs::read(&autostash).unwrap(),
+        format!("{main_tip}\n").as_bytes()
+    );
+}
+
+#[test]
+fn finish_preserves_index_flags_and_tracked_content_after_failed_merge_commit() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-index-flags");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(
+        &env,
+        "git update-index --assume-unchanged task.txt\nprintf 'hook\\n' >> task.txt\nexit 1",
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("assume-unchanged or skip-worktree"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(git(&path, &["ls-files", "-v", "--", "task.txt"]).starts_with("h "));
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(path.join("task.txt")).unwrap(), b"task\nhook\n");
+}
+
+#[test]
+fn finish_detects_gitlink_index_changes_with_submodules_ignored() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-gitlink");
+    commit_file(&path, "task.txt", "task\n");
+    let original_gitlink = git(&path, &["rev-parse", "HEAD"]);
+    git(
+        &path,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{original_gitlink},submodule"),
+        ],
+    );
+    git(&path, &["commit", "-q", "-m", "add gitlink"]);
+    let task_tip = git(&path, &["rev-parse", "HEAD"]);
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    git(&env.repo, &["config", "diff.ignoreSubmodules", "all"]);
+    write_commit_msg_hook(
+        &env,
+        &format!("git update-index --cacheinfo 160000,{main_tip},submodule\nexit 1"),
+    );
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("merge index differs from the preflight tree"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(git(&path, &["ls-files", "--stage", "--", "submodule"]).contains(&main_tip));
+}
+
+#[test]
+fn finish_preserves_merge_state_for_worktrees_with_gitlinks() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-existing-gitlink");
+    commit_file(&path, "task.txt", "task\n");
+    let gitlink = git(&path, &["rev-parse", "HEAD"]);
+    git(
+        &path,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{gitlink},submodule"),
+        ],
+    );
+    git(&path, &["commit", "-q", "-m", "add gitlink"]);
+    let task_tip = git(&path, &["rev-parse", "HEAD"]);
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    git(&env.repo, &["config", "diff.ignoreSubmodules", "all"]);
+    write_commit_msg_hook(&env, "exit 1");
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("automatic recovery is disabled for worktrees containing gitlinks"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+}
+
+#[test]
+fn finish_reports_a_failed_abort_postcondition_without_overwriting_it() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-postcheck");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let main_tip = commit_file(&env.repo, "main.txt", "main\n");
+    write_commit_msg_hook(&env, "exit 1");
+    let task_file = path.join("task.txt");
+    let after_abort = format!(
+        "if [ \"$3\" = merge ] && [ \"$4\" = --abort ]; then printf 'hook\\n' >> '{}'; fi",
+        task_file.display()
+    );
+    let path_var = git_shim_after(&env, "shim-post-abort-change", &after_abort);
+
+    let refused = env
+        .cmd(&[
+            "finish",
+            "--repo",
+            &env.repo_arg(),
+            "--id",
+            &id,
+            "--external-writers-quiesced",
+            "--allow-repository-hooks",
+        ])
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("abort completed but tracked worktree files differ from the starting tree"));
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert!(!env.admin(&id).join("MERGE_HEAD").exists());
+    assert_eq!(env.main_oid(), main_tip);
+    assert_eq!(fs::read(task_file).unwrap(), b"task\nhook\n");
+}
+
+#[test]
 fn finish_refuses_an_unreviewed_filter_or_unapproved_commit_signer() {
     for (name, setting, value, expected) in [
         (
@@ -1940,6 +2476,14 @@ fn write_hook(env: &Env, name: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn write_commit_msg_hook(env: &Env, script: &str) {
+    let hooks = env.repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let path = hooks.join("commit-msg");
+    fs::write(&path, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn reflog_only_commits_block_reap_and_remove() {
     let env = Env::new();
@@ -2623,6 +3167,24 @@ fn git_shim(env: &Env, name: &str, hook: &str) -> String {
         format!(
             "#!/bin/sh\nsub=\nverb=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ] || [ \"$prev\" = annex ]; then sub=$prev; verb=$a; fi\n  prev=$a\ndone\n{hook}\nexec '{real}' \"$@\"\n"
         ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn git_shim_after(env: &Env, name: &str, after: &str) -> String {
+    let real = real_git_executable().to_string_lossy().into_owned();
+    let dir = env.tmp.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("git");
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\n'{real}' \"$@\"\ncode=$?\n{after}\nexit \"$code\"\n"),
     )
     .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
