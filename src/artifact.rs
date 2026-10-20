@@ -1392,10 +1392,20 @@ fn lsof_open_paths(paths: &[PathBuf]) -> Result<Vec<String>, String> {
     }) else {
         return Err("lsof is required to verify generated-artifact handles".into());
     };
-    let existing: Vec<_> = paths
-        .iter()
-        .filter(|path| fs::symlink_metadata(path).is_ok())
-        .collect();
+    let mut existing = Vec::new();
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => existing.push(path),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect open path {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
     let mut pids = BTreeSet::new();
     let mut batch = Vec::new();
     let mut batch_bytes = 0;
@@ -2978,6 +2988,32 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn lsof_does_not_follow_symlink_targets_outside_the_worktree() {
+        let root = temp("open-symlink");
+        let target = root.parent().unwrap().join(format!(
+            "wtctl-artifact-external-target-{}",
+            std::process::id()
+        ));
+        let link = root.join("tracked-link");
+        let _ = fs::remove_file(&target);
+        fs::write(&target, "content").unwrap();
+        symlink(&target, &link).unwrap();
+        let open = fs::File::open(&target).unwrap();
+        let pid = std::process::id().to_string();
+
+        assert!(lsof_open_paths(&[target]).unwrap().contains(&pid));
+        assert!(!lsof_open_paths(&[link]).unwrap().contains(&pid));
+        drop(open);
+        fs::remove_file(root.join("tracked-link")).unwrap();
+        fs::remove_dir(&root).unwrap();
+        fs::remove_file(root.parent().unwrap().join(format!(
+            "wtctl-artifact-external-target-{}",
+            std::process::id()
+        )))
+        .unwrap();
     }
 
     #[test]

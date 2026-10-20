@@ -7,7 +7,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -2065,13 +2065,18 @@ fn finish_reports_merge_abort_failure_without_a_destructive_fallback() {
 fn finish_preserves_failed_merge_when_an_external_process_holds_a_worktree_file() {
     let env = Env::new();
     let (id, path) = env.create("finish-hook-open-file");
-    let task_tip = commit_file(&path, "task.txt", "task\n");
+    commit_file(&path, "task.txt", "task\n");
+    symlink("task.txt", path.join("task-link.txt")).unwrap();
+    git(&path, &["add", "--", "task-link.txt"]);
+    git(&path, &["commit", "-q", "-m", "add tracked symlink"]);
+    let task_tip = git(&path, &["rev-parse", "HEAD"]);
     let main_tip = commit_file(&env.repo, "main.txt", "main\n");
     let task_file = path.join("task.txt");
+    let task_link = path.join("task-link.txt");
     write_commit_msg_hook(&env, "exit 1");
     let open_file = fs::OpenOptions::new()
         .append(true)
-        .open(&task_file)
+        .open(&task_link)
         .unwrap();
 
     let refused = env.run(&[
