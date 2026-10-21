@@ -29,7 +29,7 @@ check. Supported systems: aarch64-darwin, x86_64-linux, aarch64-linux.
 | `whoami [--path <p>]` | Map a path inside a task worktree back to its task, owner, and owner state. |
 | `list [--mine\|--orphans\|--all\|--wtctl\|--legacy] [--active-hours <n>] [--main <branch>\|--base <ref>] [--json]` | Owner/session activity, integration, cleanliness, and removal status for wtctl and legacy worktrees. |
 | `integrate --repo <repo> --id <id> --external-writers-quiesced [--main <branch>] [--allow-annex-filter]` | Fast-forward `main` to the task tip. |
-| `finish --repo <repo> (--id <id>\|--legacy-worktree-id <id>\|--expect-branch <branch>) --external-writers-quiesced` | Integrate completed work and remove that exact worktree under one lock; supports `--keep-worktree`, `--integration-message`, filter/signing opt-ins, and artifact cleanup options. |
+| `finish --repo <repo> (--id <id>\|--legacy-worktree-id <id>\|--expect-branch <branch>) --external-writers-quiesced` | Integrate completed work and remove that exact worktree under one lock; supports `--keep-worktree`, `--integration-message`, `--recover-failed-merge`, filter/signing opt-ins, and artifact cleanup options. |
 | `remove --repo <repo> (--id <id>\|--legacy-worktree-id <id>\|--expect-branch <branch>) [--external-writers-quiesced] [--base <ref>]` | Remove one exact wtctl or legacy worktree owned by the caller; actual removal requires writer acknowledgement and supports dry-run, reflog opt-in, and artifact cleanup options. |
 | `reap [--dry-run] [--grace-secs <n>] [--external-writers-quiesced] [--main <branch>\|--base <ref>]` | Delete removable worktrees whose owner is dead. |
 | `adopt --repo <repo> --id <id>` | Take over a task whose owner is dead. |
@@ -54,6 +54,24 @@ is versioned independently of the package version.
    If `main` advanced, it merges `main` into the owned task worktree without
    rebasing. A conflict leaves the worktree in place for resolution. Use
    `--keep-worktree` to integrate without removing it.
+
+If a rejected merge commit leaves `MERGE_HEAD` in the task worktree, `finish`
+refuses by default. With a wtctl task `--id` and explicit
+`--integration-message`, `--recover-failed-merge` permits aborting the current
+merge only after verifying its task/main relationship, expected merge
+tree, index and tracked files, autostash state, open worktree users, and any
+untracked/ignored paths that could collide with files restored from the task
+tip. Recovery requires an explicit `--integration-message`; after a verified
+abort, `finish` retries the normal merge with current `main`. A pre-abort check
+failure leaves `MERGE_HEAD`, index, tracked worktree, and untracked/ignored paths
+unchanged; a failed post-abort check reports the state reached and does not
+promise rollback. Annex clean-filter evaluation may have its normal annex-side
+effects. With `--allow-annex-filter`, verified Git-annex clean filtering may be
+used only when raw file hashing does not match and both the current and
+expected-tree attributes resolve to `filter=annex`; other filters are never
+run by recovery. Before finish, integration, or removal inspects status or
+restages an annex worktree, it checks tracked-path attributes and the effective
+task worktree filter configuration, including per-worktree config overrides.
 
 After a crash or resume, `list --orphans` shows tasks whose owner is dead.
 Nothing is adopted automatically.
