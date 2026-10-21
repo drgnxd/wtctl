@@ -32,14 +32,15 @@ const USAGE: &str = "usage: wtctl <command> [options]
   capabilities [--json]       Report lifecycle capabilities for caller gating
   create  --repo <path> --slug <slug> [--task <text>] [--session <id>] [--from <commit>] [--parent <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
   whoami  [--path <path>] [--json]
-  list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
+  list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy | --abandoned] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
   finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id> [--session <id>]
   show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
   describe --repo <path> --id <task-id> [--task <text>] [--session <id>] [--json]
-  remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
+  restore --repo <path> --id <abandoned-task-id> --slug <slug> [--task <text>] [--session <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
+  remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--abandon] [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
 
   artifact cleanup options: --discard-direnv-cache, --discard-generated-caches,
     --discard-generated-build-outputs, --discard-generated-artifacts,
@@ -93,6 +94,7 @@ fn command_help(name: &str) -> R<()> {
     Ok(())
 }
 
+mod abandon;
 mod show;
 
 #[derive(Debug)]
@@ -183,6 +185,8 @@ const FLAG_OPTS: &[&str] = &[
     "--discard-unverified-direnv",
     "--allow-unreferenced-reflog",
     "--keep-worktree",
+    "--abandon",
+    "--abandoned",
     "--allow-annex-filter",
     "--allow-commit-signing",
     "--recover-failed-merge",
@@ -988,6 +992,9 @@ fn legacy_audit_state(
 
 fn cmd_list(a: &Args) -> R<()> {
     let repo = a.repo(false)?;
+    if a.flag("--abandoned") {
+        return abandon::list(a, &repo);
+    }
     let (_, main_ref) = base_ref(a, &repo.root)?;
     let modes: Vec<&str> = ["--mine", "--orphans", "--all", "--wtctl", "--legacy"]
         .into_iter()
@@ -4331,7 +4338,16 @@ fn cmd_remove(a: &Args) -> R<()> {
     if a.flag("--delete-branch") && branch.is_none() {
         return Err(Fail::new(2, "--delete-branch requires --expect-branch"));
     }
-    let (_, main_ref) = base_ref(a, &repo.root)?;
+    let abandon = a.flag("--abandon");
+    if abandon
+        && (id.is_none() || a.os("--base").is_some() || a.flag("--allow-unreferenced-reflog"))
+    {
+        return Err(Fail::new(
+            2,
+            "--abandon needs --id and cannot be combined with --base or --allow-unreferenced-reflog",
+        ));
+    }
+    let (_, mut main_ref) = base_ref(a, &repo.root)?;
     let external_writers_quiesced = a.flag("--external-writers-quiesced") || a.flag("--dry-run");
     let annex = repo.require_annex_ready(external_writers_quiesced)?;
     if !a.flag("--dry-run") && !external_writers_quiesced {
@@ -4373,6 +4389,21 @@ fn cmd_remove(a: &Args) -> R<()> {
         };
         (entry, authority)
     };
+    let mut abandoned_ref = None;
+    if abandon {
+        // Commits reachable from the preserved tip count as kept, so every
+        // other removal check still applies (reflog-only commits still refuse).
+        let tip = entry
+            .current_oid()
+            .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD"))?;
+        let refname = if a.flag("--dry-run") {
+            abandon::ref_name(&authority.worktree_id)
+        } else {
+            abandon::preserve(&repo, &authority.worktree_id, &tip)?
+        };
+        main_ref = tip;
+        abandoned_ref = Some(refname);
+    }
     let facts = task::facts(&[&entry], &main_ref)?;
     let f = facts.first().cloned().unwrap_or_default();
     f.removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
@@ -4465,14 +4496,20 @@ fn cmd_remove(a: &Args) -> R<()> {
             delete_legacy_branch(&repo, branch, &head, &main_ref)?;
         }
     }
-    repo.audit(json!({"at": now(), "event": "remove", "worktree_id": authority.worktree_id}));
+    repo.audit(json!({"at": now(), "event": "remove", "worktree_id": authority.worktree_id, "abandoned_ref": abandoned_ref}));
     if a.flag("--json") {
         out!(
             "{}",
-            json!({"status": "removed", "worktree_id": authority.worktree_id, "branch_deleted": a.flag("--delete-branch")})
+            json!({"status": "removed", "worktree_id": authority.worktree_id, "branch_deleted": a.flag("--delete-branch"), "abandoned_ref": abandoned_ref})
         );
     } else {
         out!("removed {}", authority.worktree_id);
+        if let Some(refname) = &abandoned_ref {
+            out!(
+                "preserved {head} as {refname}; restore with `wtctl restore --id {}`",
+                authority.worktree_id
+            );
+        }
     }
     Ok(())
 }
@@ -4566,6 +4603,12 @@ fn run(argv: &[OsString]) -> R<()> {
             "--session is only valid for create, adopt, or describe",
         ));
     }
+    if cmd != "remove" && args.flag("--abandon") {
+        return Err(Fail::new(2, "--abandon is only valid for remove"));
+    }
+    if cmd != "list" && args.flag("--abandoned") {
+        return Err(Fail::new(2, "--abandoned is only valid for list"));
+    }
     if cmd != "remove" && args.os("--lock-name").is_some() {
         return Err(Fail::new(2, "--lock-name is only valid for remove"));
     }
@@ -4578,6 +4621,7 @@ fn run(argv: &[OsString]) -> R<()> {
         "finish" => cmd_finish(&args),
         "reap" => cmd_reap(&args),
         "adopt" => cmd_adopt(&args),
+        "restore" => abandon::cmd_restore(&args),
         "show" => show::cmd_show(&args),
         "describe" => show::cmd_describe(&args),
         "remove" => cmd_remove(&args),

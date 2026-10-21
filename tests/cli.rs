@@ -4254,3 +4254,96 @@ fn show_reports_task_details_and_unintegrated_commits() {
     assert!(text.contains("commit "));
     assert!(text.contains("unintegrated=1"));
 }
+
+#[test]
+fn abandon_preserves_unintegrated_work_and_restore_recovers_it() {
+    let env = Env::new();
+    let (id, path) = env.create("abandon-task");
+    let tip = commit_file(&path, "keep.txt", "keep me\n");
+    let repo = env.repo_arg();
+
+    let plain = env.run(&["remove", "--repo", &repo, "--id", &id]);
+    assert_eq!(plain.status.code(), Some(4));
+    let flags_without_id = env.run(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--abandon",
+        "--expect-branch",
+        "x",
+    ]);
+    assert_eq!(flags_without_id.status.code(), Some(2));
+
+    env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--dry-run",
+    ]);
+    assert!(path.exists());
+    let ref_name = format!("refs/wtctl/abandoned/{id}");
+    let missing = git_cmd(&env.repo, &["rev-parse", "--verify", "--quiet", &ref_name])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success(), "dry-run must not create the ref");
+
+    fs::write(path.join("dirty.txt"), "uncommitted\n").unwrap();
+    let dirty = env.run(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    assert_eq!(dirty.status.code(), Some(4));
+    assert!(path.exists());
+    fs::remove_file(path.join("dirty.txt")).unwrap();
+
+    let removed: Value = serde_json::from_str(&env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(removed["status"], "removed");
+    assert_eq!(removed["abandoned_ref"], ref_name);
+    assert!(!path.exists());
+    assert_eq!(git(&env.repo, &["rev-parse", &ref_name]), tip);
+    assert_eq!(env.main_oid(), git(&env.repo, &["rev-parse", "main"]));
+
+    let listed: Value =
+        serde_json::from_str(&env.ok(&["list", "--repo", &repo, "--abandoned", "--json"])).unwrap();
+    assert_eq!(listed[0]["id"], id);
+    assert_eq!(listed[0]["head"], tip);
+    assert_eq!(listed[0]["subject"], "keep.txt");
+
+    let restored: Value = serde_json::from_str(&env.ok(&[
+        "restore",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--slug",
+        "restored-task",
+        "--json",
+    ]))
+    .unwrap();
+    let new_path = PathBuf::from(restored["worktree"].as_str().unwrap());
+    assert_eq!(git(&new_path, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(restored["parent"], id);
+    assert_eq!(
+        env.run(&[
+            "restore",
+            "--repo",
+            &repo,
+            "--id",
+            "no-such-task-20260101-00000000",
+            "--slug",
+            "no-such"
+        ])
+        .status
+        .code(),
+        Some(1)
+    );
+}
