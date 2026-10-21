@@ -39,6 +39,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
   adopt   --repo <path> --id <task-id> [--session <id>]
   show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
   describe --repo <path> --id <task-id> [--task <text>] [--session <id>] [--json]
+  doctor  --repo <path> [--fix-stale-lock --external-writers-quiesced] [--json]
   restore --repo <path> --id <abandoned-task-id> --slug <slug> [--task <text>] [--session <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
   remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--abandon] [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
 
@@ -95,6 +96,7 @@ fn command_help(name: &str) -> R<()> {
 }
 
 mod abandon;
+mod doctor;
 mod finish_plan;
 mod show;
 mod strategy;
@@ -189,6 +191,7 @@ const FLAG_OPTS: &[&str] = &[
     "--keep-worktree",
     "--abandon",
     "--squash",
+    "--fix-stale-lock",
     "--rebase",
     "--abandoned",
     "--allow-annex-filter",
@@ -4686,6 +4689,9 @@ fn run(argv: &[OsString]) -> R<()> {
             "--squash and --rebase are only valid for finish",
         ));
     }
+    if cmd != "doctor" && args.flag("--fix-stale-lock") {
+        return Err(Fail::new(2, "--fix-stale-lock is only valid for doctor"));
+    }
     if cmd != "remove" && args.flag("--abandon") {
         return Err(Fail::new(2, "--abandon is only valid for remove"));
     }
@@ -4705,6 +4711,7 @@ fn run(argv: &[OsString]) -> R<()> {
         "reap" => cmd_reap(&args),
         "adopt" => cmd_adopt(&args),
         "restore" => abandon::cmd_restore(&args),
+        "doctor" => doctor::cmd_doctor(&args),
         "show" => show::cmd_show(&args),
         "describe" => show::cmd_describe(&args),
         "remove" => cmd_remove(&args),

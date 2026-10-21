@@ -4644,3 +4644,90 @@ fn finish_dry_run_understands_rebase_and_squash() {
     );
     assert!(path.exists());
 }
+
+#[test]
+fn doctor_reports_problems_and_releases_only_a_provably_stale_lock() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("doctor-task");
+    let clean: Value =
+        serde_json::from_str(&env.ok(&["doctor", "--repo", &repo, "--json"])).unwrap();
+    assert_eq!(clean["status"], "ok");
+
+    let lock_dir = env.repo.join(".git/main-integration.lock");
+    fs::create_dir(&lock_dir).unwrap();
+    let host = String::from_utf8(Command::new("hostname").output().unwrap().stdout).unwrap();
+    let host = host.trim();
+    fs::write(
+        lock_dir.join("owner"),
+        format!("tok\n{}\n{host}\n", absent_pid()),
+    )
+    .unwrap();
+
+    let stale = env.run(&["doctor", "--repo", &repo, "--json"]);
+    assert_eq!(stale.status.code(), Some(4));
+    let report: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(report["findings"][0]["code"], "lock-stale");
+    assert!(lock_dir.exists());
+    let unacked = env.run(&["doctor", "--repo", &repo, "--fix-stale-lock"]);
+    assert_eq!(unacked.status.code(), Some(4));
+    assert!(lock_dir.exists());
+
+    let fixed: Value = serde_json::from_str(&env.ok(&[
+        "doctor",
+        "--repo",
+        &repo,
+        "--fix-stale-lock",
+        "--external-writers-quiesced",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(fixed["status"], "ok");
+    assert!(!lock_dir.exists());
+
+    // A lock held by a live process, or from another host, is never touched.
+    fs::create_dir(&lock_dir).unwrap();
+    fs::write(
+        lock_dir.join("owner"),
+        format!("tok\n{}\n{host}\n", std::process::id()),
+    )
+    .unwrap();
+    env.run(&[
+        "doctor",
+        "--repo",
+        &repo,
+        "--fix-stale-lock",
+        "--external-writers-quiesced",
+    ]);
+    assert!(lock_dir.exists());
+    fs::write(
+        lock_dir.join("owner"),
+        format!("tok\n{}\nother-host\n", absent_pid()),
+    )
+    .unwrap();
+    let foreign: Value = serde_json::from_slice(
+        &env.run(&[
+            "doctor",
+            "--repo",
+            &repo,
+            "--fix-stale-lock",
+            "--external-writers-quiesced",
+            "--json",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(foreign["findings"][0]["code"], "lock-unverified");
+    assert!(lock_dir.exists());
+    fs::remove_dir_all(&lock_dir).unwrap();
+
+    fs::remove_dir_all(&path).unwrap();
+    let missing: Value =
+        serde_json::from_str(&env.ok(&["doctor", "--repo", &repo, "--json"])).unwrap();
+    assert_eq!(missing["status"], "warnings");
+    assert_eq!(missing["findings"][0]["code"], "worktree-missing");
+    assert!(missing["findings"][0]["detail"]
+        .as_str()
+        .unwrap()
+        .contains(&id));
+}

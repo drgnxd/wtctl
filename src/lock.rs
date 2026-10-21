@@ -40,7 +40,7 @@ pub fn flock(path: &Path) -> Result<Flock, Fail> {
     Ok(Flock { _file: file })
 }
 
-fn hostname() -> String {
+pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: buf is writable for its full length.
     if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
