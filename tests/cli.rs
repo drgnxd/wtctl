@@ -4347,3 +4347,126 @@ fn abandon_preserves_unintegrated_work_and_restore_recovers_it() {
         Some(1)
     );
 }
+
+#[test]
+fn finish_dry_run_reports_requirements_without_changing_anything() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("preflight-task");
+    let tip = commit_file(&path, "pre.txt", "pre\n");
+    let before = env.main_oid();
+
+    let report: Value = serde_json::from_str(&env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--dry-run",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(report["status"], "ok");
+    assert_eq!(report["integration"], "fast-forward");
+    assert_eq!(report["new_commits"], 1);
+    assert_eq!(report["task_tip"], tip);
+    assert!(report["required_flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|flag| flag == "--external-writers-quiesced"));
+    assert_eq!(env.main_oid(), before);
+    assert!(path.exists());
+
+    // Diverge main so the real run needs a signed merge.
+    commit_file(&env.repo, "main-only.txt", "main\n");
+    git(&env.repo, &["config", "commit.gpgsign", "true"]);
+    let needs = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(needs.status.code(), Some(4));
+    let report: Value = serde_json::from_slice(&needs.stdout).unwrap();
+    assert_eq!(report["status"], "needs-flags");
+    assert_eq!(report["integration"], "merge");
+    assert!(report["required_flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|flag| flag == "--allow-commit-signing"));
+    assert!(!report.to_string().contains("\"error\""));
+    git(&env.repo, &["config", "--unset", "commit.gpgsign"]);
+
+    let ok = env.run(&["finish", "--repo", &repo, "--id", &id, "--dry-run"]);
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("merge"));
+    assert!(path.exists());
+    assert_eq!(
+        env.run(&[
+            "finish",
+            "--repo",
+            &repo,
+            "--expect-branch",
+            "x",
+            "--dry-run"
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn finish_dry_run_reports_merge_conflicts_as_blocked() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("conflict-task");
+    commit_file(&path, "f.txt", "task side\n");
+    commit_file(&env.repo, "f.txt", "main side\n");
+    let out = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["status"], "blocked");
+    let conflict = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "merge-conflicts")
+        .unwrap();
+    assert_eq!(conflict["state"], "blocked");
+}
+
+#[test]
+fn finish_reports_the_main_movement_and_removed_path() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("report-task");
+    let before = env.main_oid();
+    let tip = commit_file(&path, "report.txt", "report\n");
+    let text = env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert!(text.contains(&format!("{before} -> {tip}")), "{text}");
+    assert!(
+        text.contains(&format!("removed {}", path.display())),
+        "{text}"
+    );
+}

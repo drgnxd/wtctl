@@ -34,7 +34,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy | --abandoned] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
-  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id> [--session <id>]
   show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
@@ -95,6 +95,7 @@ fn command_help(name: &str) -> R<()> {
 }
 
 mod abandon;
+mod finish_plan;
 mod show;
 
 #[derive(Debug)]
@@ -3049,6 +3050,9 @@ fn check_commit_signing(repo: &Repo, allow_commit_signing: bool) -> R<()> {
 }
 
 fn cmd_finish(a: &Args) -> R<()> {
+    if a.flag("--dry-run") {
+        return finish_plan::cmd_finish_preflight(a);
+    }
     let repo = a.repo(true)?;
     let id = a.get("--id")?;
     let legacy_id = a.get("--legacy-worktree-id")?;
@@ -3163,6 +3167,7 @@ fn cmd_finish(a: &Args) -> R<()> {
     let mut main_tip = git::run(&repo.root, ["rev-parse", "--verify", &refname])?
         .trim()
         .to_string();
+    let main_before = main_tip.clone();
     let task_tip = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, format!("cannot resolve {display_id} HEAD")))?;
@@ -3304,10 +3309,18 @@ fn cmd_finish(a: &Args) -> R<()> {
                     "task_id": display_id,
                     "worktree_id": removal.worktree_id,
                     "task_tip": finish_head,
+                    "main_before": main_before,
+                    "worktree_path": fresh.path,
                 })
             );
         } else {
             out!("integrated {display_id}: {main} (worktree kept)");
+            if already {
+                out!("  already integrated; {main} stays at {tip}");
+            } else {
+                out!("  {main}: {main_before} -> {tip}");
+            }
+            out!("  kept {}", fresh.path.display());
         }
         return Ok(());
     }
@@ -3360,10 +3373,18 @@ fn cmd_finish(a: &Args) -> R<()> {
                 "worktree_id": removal.worktree_id,
                 "task_tip": finished_head,
                 "already_integrated": already,
+                "main_before": main_before,
+                "worktree_path": fresh.path,
             })
         );
     } else {
         out!("finished {display_id}: {main}");
+        if already {
+            out!("  already integrated; {main} stays at {tip}");
+        } else {
+            out!("  {main}: {main_before} -> {tip}");
+        }
+        out!("  removed {}", fresh.path.display());
     }
     Ok(())
 }
@@ -4633,7 +4654,8 @@ fn main() {
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     let json_output = argv.iter().any(|arg| arg.as_bytes() == b"--json");
     let result = run(&argv);
-    if let Err(fail) = &result {
+    // An empty message means the command already printed its own report.
+    if let Some(fail) = result.as_ref().err().filter(|fail| !fail.msg.is_empty()) {
         if json_output {
             out!(
                 "{}",
