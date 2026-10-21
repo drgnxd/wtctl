@@ -4523,7 +4523,7 @@ fn finish_rebase_replays_task_commits_onto_an_advanced_main() {
     assert_eq!(
         git(
             &env.repo,
-            &["rev-parse", &format!("refs/wtctl/superseded/{id}")]
+            &["rev-parse", &format!("refs/wtctl/superseded/{id}.1")]
         ),
         original
     );
@@ -4553,7 +4553,7 @@ fn finish_rebase_conflict_leaves_the_worktree_and_the_original_tip() {
     assert_eq!(
         git(
             &env.repo,
-            &["rev-parse", &format!("refs/wtctl/superseded/{id}")]
+            &["rev-parse", &format!("refs/wtctl/superseded/{id}.1")]
         ),
         original
     );
@@ -4595,6 +4595,13 @@ fn finish_squash_integrates_one_commit_with_the_given_message() {
     assert!(!path.exists());
     assert_eq!(git(&env.repo, &["rev-parse", "HEAD~1"]), before);
     assert_eq!(
+        git(
+            &env.repo,
+            &["rev-list", "--count", &format!("{before}..HEAD")]
+        ),
+        "1"
+    );
+    assert_eq!(
         git(&env.repo, &["log", "-1", "--format=%s"]),
         "feat: squashed task"
     );
@@ -4603,7 +4610,7 @@ fn finish_squash_integrates_one_commit_with_the_given_message() {
     assert_eq!(
         git(
             &env.repo,
-            &["rev-parse", &format!("refs/wtctl/superseded/{id}")]
+            &["rev-parse", &format!("refs/wtctl/superseded/{id}.1")]
         ),
         last
     );
@@ -5115,6 +5122,7 @@ fn squash_and_rebase_keep_refusing_unrelated_reflog_only_commits() {
         let (id, path) = env.create(&slug);
         commit_file(&path, &format!("{slug}-a.txt"), "a\n");
         commit_file(&path, &format!("{slug}-b.txt"), "b\n");
+        commit_file(&path, &format!("{slug}-c.txt"), "c\n");
         git(&path, &["reset", "--hard", "HEAD~1"]);
         if mode == "--rebase" {
             commit_file(&env.repo, &format!("{slug}-main.txt"), "main\n");
@@ -5190,7 +5198,7 @@ fn prune_ages_kept_refs_by_when_they_were_kept_not_by_commit_date() {
     );
     env.ok(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
     let ref_name = format!("refs/wtctl/abandoned/{id}");
-    env.ok(&[
+    let report: Value = serde_json::from_str(&env.ok(&[
         "prune",
         "--repo",
         &repo,
@@ -5198,7 +5206,11 @@ fn prune_ages_kept_refs_by_when_they_were_kept_not_by_commit_date() {
         "7",
         "--refs",
         "--external-writers-quiesced",
-    ]);
+        "--json",
+    ]))
+    .unwrap();
+    // Neither deleted nor skipped: the age was read, and it is new.
+    assert_eq!(report["actions"].as_array().unwrap().len(), 0, "{report}");
     git(&env.repo, &["rev-parse", "--verify", &ref_name]);
 }
 
@@ -5295,7 +5307,7 @@ fn dry_run_is_rejected_where_it_would_be_ignored() {
         assert_eq!(env.run(&args).status.code(), Some(2), "{args:?}");
     }
     assert_eq!(
-        env.run(&["list", "--repo", &repo, "--all-repos", "--abandoned"])
+        env.run(&["list", "--all-repos", "--abandoned"])
             .status
             .code(),
         Some(2)
@@ -5397,4 +5409,49 @@ fn a_failed_push_still_reports_the_finished_result_in_json() {
         .unwrap()
         .contains("integration itself succeeded"));
     assert!(!path.exists());
+}
+
+#[test]
+fn abandon_never_overwrites_a_kept_tip_that_the_new_tip_does_not_contain() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("abandon-clash");
+    commit_file(&path, "clash.txt", "clash\n");
+    let tree = git(&env.repo, &["hash-object", "-t", "tree", "-w", "--stdin"]);
+    let unrelated = git(&env.repo, &["commit-tree", &tree, "-m", "unrelated"]);
+    let ref_name = format!("refs/wtctl/abandoned/{id}");
+    git(&env.repo, &["update-ref", &ref_name, &unrelated]);
+    let out = env.run(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already preserves"));
+    assert_eq!(git(&env.repo, &["rev-parse", &ref_name]), unrelated);
+    assert!(path.exists());
+}
+
+#[test]
+fn rebase_retry_after_main_moves_keeps_each_attempt_and_finishes() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("rebase-retry");
+    commit_file(&path, "task.txt", "task\n");
+    commit_file(&env.repo, "m1.txt", "1\n");
+    let hook = env.repo.join(".git/hooks/post-merge");
+    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let args = [
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--rebase",
+        "--external-writers-quiesced",
+    ];
+    assert_eq!(env.run(&args).status.code(), Some(4));
+    fs::remove_file(&hook).unwrap();
+    commit_file(&env.repo, "m2.txt", "2\n");
+    env.ok(&args);
+    assert!(!path.exists());
+    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task");
+    assert_eq!(git(&env.repo, &["show", "HEAD:m2.txt"]), "2");
 }

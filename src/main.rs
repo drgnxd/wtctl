@@ -1759,17 +1759,7 @@ fn merge_main_into_task(
         }
     };
     verify_tracked_filter_safety(repo, &entry.path, &task_tree, context.allow_annex_filter)?;
-    let hooks = active_hooks(
-        &entry.path,
-        &[
-            "pre-merge-commit",
-            "commit-msg",
-            "post-merge",
-            "reference-transaction",
-        ],
-        None,
-        None,
-    )?;
+    let hooks = active_hooks(&entry.path, strategy::MERGE_HOOKS, None, None)?;
     check_hooks(&hooks, context.allow_hooks)?;
     ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
     ensure_task_head(entry, context.task_tip)?;
@@ -3382,15 +3372,8 @@ fn cmd_finish(a: &Args) -> R<()> {
         let current = entry
             .current_oid()
             .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before squash"))?;
-        let parent = git::output(
-            &repo.root,
-            ["rev-parse", "--verify", "--quiet", &format!("{current}^")],
-        )
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
         // A retry after a refused integration finds the squash already done.
-        let already_squashed = parent.as_deref() == Some(main_tip.as_str());
+        let already_squashed = strategy::already_squashed(&repo, &display_id, &current, &main_tip)?;
         if current != main_tip
             && !already_squashed
             && !is_ancestor(&repo.root, &current, &main_tip)?
@@ -3418,24 +3401,7 @@ fn cmd_finish(a: &Args) -> R<()> {
     }
     // The tip kept before a rewrite counts as preserved when removal checks
     // for commits that main does not contain; nothing else is exempted.
-    let kept: Vec<String> = if strategy == strategy::Strategy::Merge {
-        Vec::new()
-    } else {
-        git::output(
-            &repo.root,
-            [
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &strategy::superseded_ref(&display_id),
-            ],
-        )
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .into_iter()
-        .collect()
-    };
+    let kept = strategy::kept_tips(&repo, &display_id);
     let finish_head = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before integration"))?;
@@ -3542,8 +3508,13 @@ fn cmd_finish(a: &Args) -> R<()> {
         return Err(Fail::new(
             fail.code,
             format!(
-                "{display_id} integrated but cleanup is pending: {}",
-                fail.msg
+                "{display_id} integrated but cleanup is pending: {}{}",
+                fail.msg,
+                if push_remote.is_some() {
+                    "; --push was not run"
+                } else {
+                    ""
+                }
             ),
         ));
     }
@@ -4656,7 +4627,13 @@ fn cmd_remove(a: &Args) -> R<()> {
         main_ref = tip;
         abandoned_ref = Some(abandon::ref_name(&authority.worktree_id));
     }
-    let facts = task::facts(&[&entry], &main_ref)?;
+    // Tips kept by an earlier squash or rebase of this task count as preserved.
+    let kept = if id.is_some() {
+        strategy::kept_tips(&repo, &authority.worktree_id)
+    } else {
+        Vec::new()
+    };
+    let facts = task::facts_excluding(&[&entry], &main_ref, &kept)?;
     let f = facts.first().cloned().unwrap_or_default();
     f.removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
         .or_else(|why| refuse(format!("{}: {why}", authority.worktree_id)))?;
@@ -4750,7 +4727,7 @@ fn cmd_remove(a: &Args) -> R<()> {
         &authority,
         RemovalContext {
             main_ref: &main_ref,
-            kept: &[],
+            kept: &kept,
             cwds: &procinfo::scan_cwds(),
             annex,
             cleanup,
@@ -4855,6 +4832,12 @@ fn run(argv: &[OsString]) -> R<()> {
         return Err(Fail::new(
             2,
             "--base is only valid for list, reap, or remove",
+        ));
+    }
+    if cmd == "restore" && (args.os("--parent").is_some() || args.os("--from").is_some()) {
+        return Err(Fail::new(
+            2,
+            "restore sets --parent and --from itself; do not pass them",
         ));
     }
     if !matches!(cmd, "create" | "restore")

@@ -167,12 +167,7 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
                         if integration == "rebase" {
                             strategy::REBASE_HOOKS
                         } else {
-                            &[
-                                "pre-merge-commit",
-                                "commit-msg",
-                                "post-merge",
-                                "reference-transaction",
-                            ]
+                            strategy::MERGE_HOOKS
                         },
                         None,
                         None,

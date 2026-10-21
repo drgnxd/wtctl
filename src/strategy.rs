@@ -15,13 +15,75 @@ pub const REBASE_HOOKS: &[&str] = &[
     "pre-rebase",
     "post-rewrite",
     "post-checkout",
+    "post-index-change",
+    "prepare-commit-msg",
     "commit-msg",
     "post-commit",
     "reference-transaction",
 ];
 
-pub fn superseded_ref(id: &str) -> String {
-    format!("refs/wtctl/superseded/{id}")
+/// Hooks a merge commit can trigger, shared by the merge path and its preflight.
+pub const MERGE_HOOKS: &[&str] = &[
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-merge",
+    "post-index-change",
+    "reference-transaction",
+];
+
+/// Every tip kept for `id`, as `(ref, oid)`. Each rewrite attempt keeps its own
+/// ref (`<id>.<n>`), so a retry after the tip changed never has to overwrite one.
+fn superseded_refs(repo: &Repo, id: &str) -> Vec<(String, String)> {
+    git::run(
+        &repo.root,
+        [
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            &format!("refs/wtctl/superseded/{id}.*"),
+        ],
+    )
+    .map(|text| {
+        text.lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(name, oid)| (name.to_string(), oid.to_string()))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+pub fn kept_tips(repo: &Repo, id: &str) -> Vec<String> {
+    superseded_refs(repo, id)
+        .into_iter()
+        .map(|(_, oid)| oid)
+        .collect()
+}
+
+fn keep_tip(repo: &Repo, id: &str, tip: &str, message: &str) -> R<String> {
+    let existing = superseded_refs(repo, id);
+    if let Some((name, _)) = existing.iter().find(|(_, oid)| oid == tip) {
+        return Ok(name.clone());
+    }
+    let refname = format!("refs/wtctl/superseded/{id}.{}", existing.len() + 1);
+    abandon::preserve_at(repo, refname, tip, message)
+}
+
+/// True when HEAD is already the single squashed commit this id produced on
+/// `main_tip`, so a retry must not squash (and keep) a second time.
+pub fn already_squashed(repo: &Repo, id: &str, head: &str, main_tip: &str) -> R<bool> {
+    let parents = git::run(&repo.root, ["rev-list", "--parents", "-n1", head])?;
+    let fields: Vec<&str> = parents.split_whitespace().collect();
+    if fields.len() != 2 || fields[1] != main_tip {
+        return Ok(false);
+    }
+    let tree = git::run(&repo.root, ["rev-parse", &format!("{head}^{{tree}}")])?;
+    for tip in kept_tips(repo, id) {
+        let kept_tree = git::run(&repo.root, ["rev-parse", &format!("{tip}^{{tree}}")])?;
+        if kept_tree.trim() == tree.trim() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn parse(a: &Args) -> R<Strategy> {
@@ -106,7 +168,27 @@ fn refuse_ignored_collisions(r: &Rebase<'_>) -> R<()> {
     if !changed.status.success() {
         return Err(Fail::new(1, git::stderr_of(&changed)));
     }
-    for path in changed.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+    // Replaying commit by commit also touches paths that a later commit reverts.
+    let touched = git::output(
+        &r.entry.path,
+        [
+            "log",
+            "--format=",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &format!("{}..{}", r.main_tip, r.task_tip),
+        ],
+    )?;
+    if !touched.status.success() {
+        return Err(Fail::new(1, git::stderr_of(&touched)));
+    }
+    let paths = changed
+        .stdout
+        .split(|b| *b == 0)
+        .chain(touched.stdout.split(|b| *b == 0))
+        .filter(|p| !p.is_empty());
+    for path in paths {
         if ignored.iter().any(|extra| paths_overlap(extra, path)) {
             return refuse(format!(
                 "{}: ignored path overlaps {}, which the rebase would overwrite",
@@ -148,12 +230,9 @@ pub fn rebase_onto_main(repo: &Repo, r: Rebase<'_>) -> R<String> {
         allow_signing,
     })?;
     verify_tracked_filter_safety(repo, &entry.path, &format!("{task_tip}^{{tree}}"), false)?;
-    let kept = abandon::preserve_at(
-        repo,
-        superseded_ref(id),
-        task_tip,
-        &format!("wtctl: rebase {id}"),
-    )?;
+    // The checkout of main's files runs their filters too.
+    check_active_filters(repo, &entry.path, task_tip, main_tip, false)?;
+    let kept = keep_tip(repo, id, task_tip, &format!("wtctl: rebase {id}"))?;
     let out = git::output(
         &entry.path,
         [
@@ -211,11 +290,11 @@ pub fn squash_onto_main(
             "git commit-tree returned an unexpected result",
         ));
     }
-    abandon::preserve_at(
-        repo,
-        superseded_ref(id),
-        task_tip,
-        &format!("wtctl: squash {id}"),
+    keep_tip(repo, id, task_tip, &format!("wtctl: squash {id}"))?;
+    // `reset` runs in the worktree, whose own hooks path may differ from the repository's.
+    check_hooks(
+        &active_hooks(&entry.path, &["reference-transaction"], None, None)?,
+        false,
     )?;
     git::run(&entry.path, ["reset", "--soft", &squashed])?;
     let fresh = Entry::load(entry.admin.clone())

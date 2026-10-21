@@ -91,7 +91,8 @@ Nothing is adopted automatically.
   print the matching resume command for known clients
   (`claude --resume <id>`, `opencode --session <id>`).
 - `remove --id <id> --abandon` discards unintegrated work without losing it:
-  the task tip is kept under `refs/wtctl/abandoned/<id>` (never overwritten),
+  the task tip is kept under `refs/wtctl/abandoned/<id>` (it only ever moves
+  forward to a descendant on a retry),
   then every normal removal check runs against that tip, so a dirty worktree or
   reflog-only commits still refuse. `list --abandoned` shows what is kept and
   `restore` starts a new task from it.
@@ -103,7 +104,7 @@ Nothing is adopted automatically.
   given.
 - `finish --squash --integration-message <text>` integrates one commit; `finish
   --rebase` replays the task onto an advanced `main` instead of merging `main`
-  into it. Both keep the original tip under `refs/wtctl/superseded/<id>`,
+  into it. Both keep the original tip under `refs/wtctl/superseded/<id>.<n>` (one ref per attempt),
   require a clean worktree, refuse git-annex repositories, honor
   `--allow-commit-signing` and `--allow-repository-hooks`, and leave the
   worktree in place when a rebase conflicts. The default remains a merge.

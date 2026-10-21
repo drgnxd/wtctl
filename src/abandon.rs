@@ -138,7 +138,8 @@ pub fn cmd_restore(a: &Args) -> R<()> {
     // The restored work forked from main at the merge base, so a later default
     // merge finish sees a base that main contains.
     let tip = String::from_utf8_lossy(&found.stdout).trim().to_string();
-    let fork = git::output(&repo.root, ["merge-base", "refs/heads/main", &tip])?;
+    let (_, main) = main_ref(a, &repo.root)?;
+    let fork = git::output(&repo.root, ["merge-base", &main, &tip])?;
     if fork.status.success() {
         values.insert(
             "--marker-base".into(),

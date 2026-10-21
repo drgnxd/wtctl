@@ -36,7 +36,8 @@ fn pid_exists(pid: i32) -> Option<bool> {
 
 enum LockState {
     Live,
-    Stale,
+    /// Carries the owner file that was judged dead.
+    Stale(String),
     Unknown(String),
 }
 
@@ -53,7 +54,7 @@ fn lock_state(dir: &Path) -> LockState {
     }
     match pid_exists(pid) {
         Some(true) => LockState::Live,
-        Some(false) => LockState::Stale,
+        Some(false) => LockState::Stale(owner),
         None => LockState::Unknown(format!("pid {pid} cannot be inspected")),
     }
 }
@@ -61,8 +62,7 @@ fn lock_state(dir: &Path) -> LockState {
 /// Releases `dir` with the same rename-then-delete protocol a normal release
 /// uses. The owner is re-read after the rename: a legacy writer that took the
 /// lock over between the check and the rename gets it back untouched.
-fn release_stale(common: &Path, dir: &Path) -> Result<(), String> {
-    let judged = fs::read_to_string(dir.join("owner")).unwrap_or_default();
+fn release_stale(common: &Path, dir: &Path, judged: &str) -> Result<(), String> {
     let released = common.join(format!("{}.released.stale-{}", lock::LEGACY_LOCK, now()));
     fs::rename(dir, &released).map_err(|error| error.to_string())?;
     let moved = fs::read_to_string(released.join("owner")).unwrap_or_default();
@@ -127,12 +127,12 @@ pub fn cmd_doctor(a: &Args) -> R<()> {
                 "lock-live",
                 format!("{} is held by a live process", lock_dir.display()),
             )),
-            LockState::Stale if can_fix => {
-                release_stale(&repo.common, &lock_dir)
+            LockState::Stale(judged) if can_fix => {
+                release_stale(&repo.common, &lock_dir, &judged)
                     .map_err(|error| Fail::new(4, format!("cannot release stale lock: {error}")))?;
                 fixed.push(format!("released stale {}", lock_dir.display()));
             }
-            LockState::Stale => findings.push(finding(
+            LockState::Stale(_) => findings.push(finding(
                 "error",
                 "lock-stale",
                 format!(
