@@ -107,20 +107,30 @@ pub fn cmd_quarantine(a: &Args) -> R<()> {
     Ok(())
 }
 
-/// Seconds since a kept ref was created, from its first reflog entry.
+/// Seconds since a kept ref was created, from its oldest reflog entry. The
+/// entry's own time is used (`%gd`), not the date of the commit it names.
 fn ref_age_secs(repo: &Repo, refname: &str) -> Option<i64> {
     let text = git::run(
         &repo.root,
         [
             "reflog",
             "show",
-            "--format=%ct",
+            "--date=unix",
+            "--format=%gd",
             "--end-of-options",
             refname,
         ],
     )
     .ok()?;
-    let created = text.lines().last()?.trim().parse::<i64>().ok()?;
+    let created = text
+        .lines()
+        .last()?
+        .trim()
+        .rsplit_once("@{")?
+        .1
+        .strip_suffix('}')?
+        .parse::<i64>()
+        .ok()?;
     Some((now() - created).max(0))
 }
 
@@ -167,6 +177,9 @@ pub fn cmd_prune(a: &Args) -> R<()> {
         }
     }
     if prune_refs {
+        if !dry_run {
+            deny_reference_hook(&repo)?;
+        }
         for prefix in [abandon::PREFIX, "refs/wtctl/superseded/"] {
             let listing = git::run(
                 &repo.root,

@@ -601,6 +601,15 @@ fn check_hooks(found: &[String], allow: bool) -> R<()> {
     Ok(())
 }
 
+/// wtctl never runs a `reference-transaction` hook, so every command that
+/// writes refs outside the audited lifecycle paths refuses when one exists.
+fn deny_reference_hook(repo: &Repo) -> R<()> {
+    check_hooks(
+        &active_hooks(&repo.root, &["reference-transaction"], None, None)?,
+        false,
+    )
+}
+
 // ----------------------------------------------------------------- commands
 
 fn relock(repo: &Repo, path: &OsStr, id: &str) -> R<()> {
@@ -718,6 +727,11 @@ fn cmd_create(a: &Args) -> R<()> {
         ],
     )?;
 
+    // `restore` starts from a kept tip but records where that work forked from main.
+    let marker_base = a
+        .get("--marker-base")?
+        .filter(|oid| git::is_oid(oid))
+        .map_or_else(|| base.clone(), str::to_string);
     let gitdir_ok = task::registered_path(&admin) == Some(canon(&path));
     let session_var = match owner.client.as_str() {
         "claude" => "CLAUDE_CODE_SESSION_ID",
@@ -734,7 +748,7 @@ fn cmd_create(a: &Args) -> R<()> {
         "tool": "wtctl",
         "task_id": id,
         "worktree": worktree,
-        "base": base,
+        "base": marker_base,
         "owner": owner_json(&owner),
         "session_hint": session_hint,
         "task": text,
@@ -1061,7 +1075,7 @@ fn list_rows(a: &Args, repo: &Repo) -> R<Vec<Value>> {
     let all = task::entries(&repo.common);
     let legacy: HashMap<PathBuf, HashMap<String, String>> = all
         .iter()
-        .filter_map(|entry| legacy_metadata(&repo, entry).map(|meta| (entry.admin.clone(), meta)))
+        .filter_map(|entry| legacy_metadata(repo, entry).map(|meta| (entry.admin.clone(), meta)))
         .collect();
     let selected: Vec<&Entry> = all
         .iter()
@@ -1080,7 +1094,7 @@ fn list_rows(a: &Args, repo: &Repo) -> R<Vec<Value>> {
         })
         .collect();
     let facts = task::facts(&selected, &main_ref)?;
-    let main_worktree = canonical_main_checkout(&repo)?;
+    let main_worktree = canonical_main_checkout(repo)?;
     let mut rows = Vec::new();
     for (e, f) in selected.iter().zip(&facts) {
         let legacy_row = legacy.get(&e.admin);
@@ -1122,7 +1136,7 @@ fn list_rows(a: &Args, repo: &Repo) -> R<Vec<Value>> {
             },
         };
         let audit_state = if kind == "legacy" {
-            legacy_audit_state(&repo, e, legacy_row, state, f, &main_ref)
+            legacy_audit_state(repo, e, legacy_row, state, f, &main_ref)
         } else if kind == "wtctl" {
             match state {
                 Liveness::Alive => "ACTIVE".into(),
@@ -3202,7 +3216,7 @@ fn cmd_finish(a: &Args) -> R<()> {
             "inspect scheduled and non-cooperating writers, then pass --external-writers-quiesced",
         );
     }
-    let mut cleanup = if keep_worktree {
+    let cleanup = if keep_worktree {
         artifact::Options::default()
     } else {
         artifact_options(a, true)?
@@ -3310,13 +3324,15 @@ fn cmd_finish(a: &Args) -> R<()> {
     if diverged && strategy == strategy::Strategy::Rebase {
         let rebased = strategy::rebase_onto_main(
             &repo,
-            &display_id,
-            &entry,
-            &refname,
-            &main_tip,
-            &task_tip,
-            a.flag("--allow-repository-hooks"),
-            a.flag("--allow-commit-signing"),
+            strategy::Rebase {
+                id: &display_id,
+                entry: &entry,
+                main_ref: &refname,
+                main_tip: &main_tip,
+                task_tip: &task_tip,
+                allow_hooks: a.flag("--allow-repository-hooks"),
+                allow_signing: a.flag("--allow-commit-signing"),
+            },
         )?;
         entry = Entry::load(entry.admin.clone()).ok_or_else(|| {
             Fail::new(
@@ -3328,9 +3344,6 @@ fn cmd_finish(a: &Args) -> R<()> {
             return refuse(format!("{display_id} HEAD changed after rebase"));
         }
         verify_removal_authority(&repo, &entry, &removal)?;
-        // The pre-rebase commits live only in the reflog, which this opt-in
-        // accepts now that HEAD is based on main; the tip is kept in a ref.
-        cleanup.allow_unreferenced_reflog = true;
     } else if diverged {
         let merged_tip = merge_main_into_task(
             &repo,
@@ -3369,7 +3382,19 @@ fn cmd_finish(a: &Args) -> R<()> {
         let current = entry
             .current_oid()
             .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before squash"))?;
-        if current != main_tip && !is_ancestor(&repo.root, &current, &main_tip)? {
+        let parent = git::output(
+            &repo.root,
+            ["rev-parse", "--verify", "--quiet", &format!("{current}^")],
+        )
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+        // A retry after a refused integration finds the squash already done.
+        let already_squashed = parent.as_deref() == Some(main_tip.as_str());
+        if current != main_tip
+            && !already_squashed
+            && !is_ancestor(&repo.root, &current, &main_tip)?
+        {
             let squashed = strategy::squash_onto_main(
                 &repo,
                 &display_id,
@@ -3389,9 +3414,28 @@ fn cmd_finish(a: &Args) -> R<()> {
                 return refuse(format!("{display_id} HEAD changed after squash"));
             }
             verify_removal_authority(&repo, &entry, &removal)?;
-            cleanup.allow_unreferenced_reflog = true;
         }
     }
+    // The tip kept before a rewrite counts as preserved when removal checks
+    // for commits that main does not contain; nothing else is exempted.
+    let kept: Vec<String> = if strategy == strategy::Strategy::Merge {
+        Vec::new()
+    } else {
+        git::output(
+            &repo.root,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &strategy::superseded_ref(&display_id),
+            ],
+        )
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .into_iter()
+        .collect()
+    };
     let finish_head = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before integration"))?;
@@ -3448,18 +3492,13 @@ fn cmd_finish(a: &Args) -> R<()> {
             "already_integrated": already,
             "pid": caller.pid,
         }));
-        let pushed = match &push_remote {
-            Some(name) => {
-                remote::push(&repo, name, &refname)?;
-                Some(name.as_str())
-            }
-            None => None,
-        };
+        let (pushed, push_error) = push_outcome(&repo, push_remote.as_deref(), &refname);
         if a.flag("--json") {
             out!(
                 "{}",
                 json!({
                     "pushed": pushed,
+                    "push_error": push_error,
                     "status": "integrated-kept",
                     "repo": repo.root,
                     "main_tip": tip,
@@ -3472,7 +3511,7 @@ fn cmd_finish(a: &Args) -> R<()> {
             );
         } else {
             out!("integrated {display_id}: {main} (worktree kept)");
-            if let Some(name) = pushed {
+            if let Some(name) = &pushed {
                 out!("  pushed {main} to {name}");
             }
             if already {
@@ -3482,7 +3521,7 @@ fn cmd_finish(a: &Args) -> R<()> {
             }
             out!("  kept {}", fresh.path.display());
         }
-        return Ok(());
+        return push_result(a, push_error);
     }
     let finished_head = fresh
         .current_oid()
@@ -3493,6 +3532,7 @@ fn cmd_finish(a: &Args) -> R<()> {
         &removal,
         RemovalContext {
             main_ref: &refname,
+            kept: &kept,
             cwds: &procinfo::scan_cwds(),
             annex,
             cleanup,
@@ -3522,18 +3562,13 @@ fn cmd_finish(a: &Args) -> R<()> {
         "already_integrated": already,
         "pid": caller.pid,
     }));
-    let pushed = match &push_remote {
-        Some(name) => {
-            remote::push(&repo, name, &refname)?;
-            Some(name.as_str())
-        }
-        None => None,
-    };
+    let (pushed, push_error) = push_outcome(&repo, push_remote.as_deref(), &refname);
     if a.flag("--json") {
         out!(
             "{}",
             json!({
                 "pushed": pushed,
+                "push_error": push_error,
                 "status": "finished",
                 "repo": repo.root,
                 "main_tip": tip,
@@ -3553,11 +3588,36 @@ fn cmd_finish(a: &Args) -> R<()> {
             out!("  {main}: {main_before} -> {tip}");
         }
         out!("  removed {}", fresh.path.display());
-        if let Some(name) = pushed {
+        if let Some(name) = &pushed {
             out!("  pushed {main} to {name}");
         }
     }
-    Ok(())
+    push_result(a, push_error)
+}
+
+/// The push runs after the integration, so its failure is reported alongside a
+/// complete result instead of replacing it.
+fn push_outcome(
+    repo: &Repo,
+    remote_name: Option<&str>,
+    refname: &str,
+) -> (Option<String>, Option<String>) {
+    match remote_name {
+        None => (None, None),
+        Some(name) => match remote::push(repo, name, refname) {
+            Ok(()) => (Some(name.to_string()), None),
+            Err(fail) => (None, Some(fail.msg)),
+        },
+    }
+}
+
+fn push_result(a: &Args, push_error: Option<String>) -> R<()> {
+    match push_error {
+        None => Ok(()),
+        // The JSON report above already carries the message.
+        Some(_) if a.flag("--json") => Err(Fail::new(1, "")),
+        Some(message) => Err(Fail::new(1, message)),
+    }
 }
 
 fn gitfile_pointer(entry: &Entry) -> R<Option<OsString>> {
@@ -3897,6 +3957,8 @@ fn verify_removal_authority(repo: &Repo, entry: &Entry, authority: &RemovalAutho
 
 struct RemovalContext<'a> {
     main_ref: &'a str,
+    /// Tips kept in refs, counted as preserved like `main_ref`'s history.
+    kept: &'a [String],
     cwds: &'a procinfo::CwdScan,
     annex: bool,
     cleanup: artifact::Options,
@@ -3911,6 +3973,7 @@ fn remove_worktree(
 ) -> R<()> {
     let RemovalContext {
         main_ref,
+        kept,
         cwds,
         annex,
         cleanup,
@@ -3964,7 +4027,7 @@ fn remove_worktree(
     }
     let expected_tree = format!("{expected_head}^{{tree}}");
     verify_tracked_filter_safety(repo, &entry.path, &expected_tree, annex)?;
-    let facts = task::facts(&[entry], main_ref)?;
+    let facts = task::facts_excluding(&[entry], main_ref, kept)?;
     facts
         .first()
         .cloned()
@@ -4014,7 +4077,7 @@ fn remove_worktree(
             return refuse(format!("{id} changed during git annex restage"));
         }
         verify_removal_authority(repo, &refreshed, authority)?;
-        let facts = task::facts(&[&refreshed], main_ref)?;
+        let facts = task::facts_excluding(&[&refreshed], main_ref, kept)?;
         facts
             .first()
             .cloned()
@@ -4058,7 +4121,7 @@ fn remove_worktree(
                 Fail::new(4, format!("cannot quarantine worktree artifacts: {why}"))
             })?;
         }
-        let facts = task::facts(&[entry], main_ref)?;
+        let facts = task::facts_excluding(&[entry], main_ref, kept)?;
         facts
             .first()
             .cloned()
@@ -4299,6 +4362,7 @@ fn cmd_reap(a: &Args) -> R<()> {
                     &removal,
                     RemovalContext {
                         main_ref: &main_ref,
+                        kept: &[],
                         cwds: &cwds,
                         annex,
                         cleanup: artifact::Options {
@@ -4588,13 +4652,9 @@ fn cmd_remove(a: &Args) -> R<()> {
         let tip = entry
             .current_oid()
             .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD"))?;
-        let refname = if a.flag("--dry-run") {
-            abandon::ref_name(&authority.worktree_id)
-        } else {
-            abandon::preserve(&repo, &authority.worktree_id, &tip)?
-        };
+        // The ref is written only after every check has passed, just before removal.
         main_ref = tip;
-        abandoned_ref = Some(refname);
+        abandoned_ref = Some(abandon::ref_name(&authority.worktree_id));
     }
     let facts = task::facts(&[&entry], &main_ref)?;
     let f = facts.first().cloned().unwrap_or_default();
@@ -4671,12 +4731,26 @@ fn cmd_remove(a: &Args) -> R<()> {
         }
         return Ok(());
     }
+    if abandon {
+        // Same checks as --dry-run, so the ref is written only for a removal
+        // that is expected to proceed.
+        let main_worktree = canonical_main_checkout(&repo)?;
+        artifact::check_pending_transaction(&repo.name(), &entry.path)
+            .map_err(|why| Fail::new(4, why))?;
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+            .map_err(|why| Fail::new(4, why))?;
+        verify_removal_authority(&repo, &entry, &authority)?;
+        removal_lock_state(&entry, &authority)?;
+        ensure_no_cwd_users(&entry, "removal")?;
+        abandon::preserve(&repo, &authority.worktree_id, &head)?;
+    }
     remove_worktree(
         &repo,
         &entry,
         &authority,
         RemovalContext {
             main_ref: &main_ref,
+            kept: &[],
             cwds: &procinfo::scan_cwds(),
             annex,
             cleanup,
@@ -4783,16 +4857,31 @@ fn run(argv: &[OsString]) -> R<()> {
             "--base is only valid for list, reap, or remove",
         ));
     }
-    if cmd != "create" && (args.os("--parent").is_some() || args.os("--worktrees-root").is_some()) {
+    if !matches!(cmd, "create" | "restore")
+        && (args.os("--parent").is_some() || args.os("--worktrees-root").is_some())
+    {
         return Err(Fail::new(
             2,
             "--parent and --worktrees-root are only valid for create",
         ));
     }
-    if !matches!(cmd, "create" | "adopt" | "describe") && args.os("--session").is_some() {
+    if !matches!(cmd, "create" | "adopt" | "describe" | "restore") && args.os("--session").is_some()
+    {
         return Err(Fail::new(
             2,
-            "--session is only valid for create, adopt, or describe",
+            "--session is only valid for create, adopt, describe, or restore",
+        ));
+    }
+    if !matches!(cmd, "finish" | "remove" | "reap" | "prune") && args.flag("--dry-run") {
+        return Err(Fail::new(
+            2,
+            "--dry-run is only valid for finish, remove, reap, or prune",
+        ));
+    }
+    if args.flag("--all-repos") && args.flag("--abandoned") {
+        return Err(Fail::new(
+            2,
+            "--all-repos cannot be combined with --abandoned",
         ));
     }
     if cmd != "finish" && (args.flag("--squash") || args.flag("--rebase")) {

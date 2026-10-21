@@ -18,6 +18,7 @@ pub fn preserve(repo: &Repo, id: &str, head: &str) -> R<String> {
 /// Creates `refname` at `head`. An existing ref must already name `head`, so a
 /// retry after a failed step succeeds while a different tip is never overwritten.
 pub fn preserve_at(repo: &Repo, refname: String, head: &str, message: &str) -> R<String> {
+    deny_reference_hook(repo)?;
     let existing = git::output(
         &repo.root,
         [
@@ -31,6 +32,12 @@ pub fn preserve_at(repo: &Repo, refname: String, head: &str, message: &str) -> R
     if existing.status.success() {
         let current = String::from_utf8_lossy(&existing.stdout).trim().to_string();
         if current == head {
+            return Ok(refname);
+        }
+        // A retry after more commits moves the kept tip forward; it never
+        // replaces a tip that the new one does not contain.
+        if is_ancestor(&repo.root, &current, head)? {
+            cas_update(&repo.root, &refname, head, &current, message)?;
             return Ok(refname);
         }
         return refuse(format!("{refname} already preserves {current}, not {head}"));
@@ -128,6 +135,19 @@ pub fn cmd_restore(a: &Args) -> R<()> {
     values.insert("--task".into(), task_text.into());
     values.insert("--from".into(), refname.into());
     values.insert("--parent".into(), id.into());
+    // The restored work forked from main at the merge base, so a later default
+    // merge finish sees a base that main contains.
+    let tip = String::from_utf8_lossy(&found.stdout).trim().to_string();
+    let fork = git::output(&repo.root, ["merge-base", "refs/heads/main", &tip])?;
+    if fork.status.success() {
+        values.insert(
+            "--marker-base".into(),
+            String::from_utf8_lossy(&fork.stdout)
+                .trim()
+                .to_string()
+                .into(),
+        );
+    }
     let flags = [
         "--json",
         "--allow-repository-hooks",

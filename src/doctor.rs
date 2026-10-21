@@ -58,12 +58,25 @@ fn lock_state(dir: &Path) -> LockState {
     }
 }
 
-/// Releases `dir` with the same rename-then-delete protocol a normal release uses.
-fn release_stale(common: &Path, dir: &Path) -> std::io::Result<()> {
+/// Releases `dir` with the same rename-then-delete protocol a normal release
+/// uses. The owner is re-read after the rename: a legacy writer that took the
+/// lock over between the check and the rename gets it back untouched.
+fn release_stale(common: &Path, dir: &Path) -> Result<(), String> {
+    let judged = fs::read_to_string(dir.join("owner")).unwrap_or_default();
     let released = common.join(format!("{}.released.stale-{}", lock::LEGACY_LOCK, now()));
-    fs::rename(dir, &released)?;
+    fs::rename(dir, &released).map_err(|error| error.to_string())?;
+    let moved = fs::read_to_string(released.join("owner")).unwrap_or_default();
+    if moved != judged {
+        return match fs::rename(&released, dir) {
+            Ok(()) => Err("the lock changed owner while it was being released; left in place".into()),
+            Err(error) => Err(format!(
+                "the lock changed owner while it was being released and could not be restored from {}: {error}",
+                released.display()
+            )),
+        };
+    }
     let _ = fs::remove_file(released.join("owner"));
-    fs::remove_dir(&released)
+    fs::remove_dir(&released).map_err(|error| error.to_string())
 }
 
 pub fn cmd_doctor(a: &Args) -> R<()> {
@@ -74,6 +87,7 @@ pub fn cmd_doctor(a: &Args) -> R<()> {
             "inspect repository writers, then pass --external-writers-quiesced to release a stale lock",
         );
     }
+    let (_, main_ref) = main_ref(a, &repo.root)?;
     let mut findings = Vec::new();
     let mut fixed = Vec::new();
 
@@ -115,7 +129,7 @@ pub fn cmd_doctor(a: &Args) -> R<()> {
             )),
             LockState::Stale if can_fix => {
                 release_stale(&repo.common, &lock_dir)
-                    .map_err(|error| Fail::new(1, format!("cannot release stale lock: {error}")))?;
+                    .map_err(|error| Fail::new(4, format!("cannot release stale lock: {error}")))?;
                 fixed.push(format!("released stale {}", lock_dir.display()));
             }
             LockState::Stale => findings.push(finding(
@@ -219,7 +233,7 @@ pub fn cmd_doctor(a: &Args) -> R<()> {
             ));
         }
         if procinfo::liveness(&marker.owner) == Liveness::Dead {
-            let unintegrated = task::facts(&[&entry], "refs/heads/main")
+            let unintegrated = task::facts(&[&entry], &main_ref)
                 .ok()
                 .and_then(|facts| facts.first().and_then(|f| f.unintegrated));
             match unintegrated {

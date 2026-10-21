@@ -33,9 +33,18 @@ pub fn require_remote(repo: &Repo, name: &str) -> R<()> {
     Ok(())
 }
 
+/// Network steps must fail instead of waiting on a credential prompt.
+fn network(repo: &Repo, args: &[&str]) -> R<std::process::Output> {
+    git::command(&repo.root, args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|error| Fail::new(1, format!("cannot run git: {error}")))
+}
+
 pub fn fetch(repo: &Repo, name: &str) -> R<()> {
     require_remote(repo, name)?;
-    let out = git::output(&repo.root, ["fetch", "--quiet", "--", name])?;
+    deny_reference_hook(repo)?;
+    let out = network(repo, &["fetch", "--quiet", "--", name])?;
     if !out.status.success() {
         return Err(Fail::new(
             1,
@@ -61,7 +70,7 @@ pub fn check_push(repo: &Repo, name: &str, allow_hooks: bool) -> R<()> {
 
 pub fn push(repo: &Repo, name: &str, refname: &str) -> R<()> {
     let spec = format!("{refname}:{refname}");
-    let out = git::output(&repo.root, ["push", "--quiet", "--", name, &spec])?;
+    let out = network(repo, &["push", "--quiet", "--", name, &spec])?;
     if !out.status.success() {
         return Err(Fail::new(
             1,

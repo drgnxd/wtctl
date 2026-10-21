@@ -51,7 +51,7 @@ pub fn validate(a: &Args, strategy: Strategy) -> R<()> {
 }
 
 /// The state both strategies need before they may rewrite history.
-fn require_plain_worktree(repo: &Repo, entry: &Entry, id: &str) -> R<()> {
+pub fn require_plain_worktree(repo: &Repo, entry: &Entry, id: &str) -> R<()> {
     if repo.uses_annex()? {
         return refuse("--squash and --rebase are not supported in git-annex repositories");
     }
@@ -71,16 +71,63 @@ fn require_plain_worktree(repo: &Repo, entry: &Entry, id: &str) -> R<()> {
     }
 }
 
-pub fn rebase_onto_main(
-    repo: &Repo,
-    id: &str,
-    entry: &Entry,
-    main_ref: &str,
-    main_tip: &str,
-    task_tip: &str,
-    allow_hooks: bool,
-    allow_signing: bool,
-) -> R<String> {
+pub struct Rebase<'a> {
+    pub id: &'a str,
+    pub entry: &'a Entry,
+    pub main_ref: &'a str,
+    pub main_tip: &'a str,
+    pub task_tip: &'a str,
+    pub allow_hooks: bool,
+    pub allow_signing: bool,
+}
+
+/// Ignored files survive `git rebase` checkouts silently, so any ignored path
+/// that differs between the two tips would be overwritten.
+fn refuse_ignored_collisions(r: &Rebase<'_>) -> R<()> {
+    let ignored: Vec<Vec<u8>> = extra_status_entries(&r.entry.path)
+        .map_err(|why| Fail::new(4, why))?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    if ignored.is_empty() {
+        return Ok(());
+    }
+    let changed = git::output(
+        &r.entry.path,
+        [
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            r.task_tip,
+            r.main_tip,
+        ],
+    )?;
+    if !changed.status.success() {
+        return Err(Fail::new(1, git::stderr_of(&changed)));
+    }
+    for path in changed.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        if ignored.iter().any(|extra| paths_overlap(extra, path)) {
+            return refuse(format!(
+                "{}: ignored path overlaps {}, which the rebase would overwrite",
+                r.id,
+                String::from_utf8_lossy(path)
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn rebase_onto_main(repo: &Repo, r: Rebase<'_>) -> R<String> {
+    let Rebase {
+        id,
+        entry,
+        main_ref,
+        main_tip,
+        task_tip,
+        allow_hooks,
+        allow_signing,
+    } = r;
     require_plain_worktree(repo, entry, id)?;
     check_commit_signing(repo, allow_signing)?;
     check_hooks(
@@ -90,6 +137,17 @@ pub fn rebase_onto_main(
     ensure_ref(&repo.root, main_ref, main_tip)?;
     ensure_task_head(entry, task_tip)?;
     ensure_no_cwd_users(entry, "rebase")?;
+    ensure_no_merge_autostash(&entry.path).map_err(|why| Fail::new(4, why))?;
+    refuse_ignored_collisions(&Rebase {
+        id,
+        entry,
+        main_ref,
+        main_tip,
+        task_tip,
+        allow_hooks,
+        allow_signing,
+    })?;
+    verify_tracked_filter_safety(repo, &entry.path, &format!("{task_tip}^{{tree}}"), false)?;
     let kept = abandon::preserve_at(
         repo,
         superseded_ref(id),
@@ -98,7 +156,13 @@ pub fn rebase_onto_main(
     )?;
     let out = git::output(
         &entry.path,
-        ["rebase", "--no-autostash", "--no-stat", main_tip],
+        [
+            "rebase",
+            "--no-autostash",
+            "--no-stat",
+            "--no-update-refs",
+            main_tip,
+        ],
     )?;
     if !out.status.success() {
         return refuse(format!(

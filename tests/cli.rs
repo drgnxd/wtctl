@@ -4313,6 +4313,13 @@ fn abandon_preserves_unintegrated_work_and_restore_recovers_it() {
     let dirty = env.run(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
     assert_eq!(dirty.status.code(), Some(4));
     assert!(path.exists());
+    let still_missing = git_cmd(&env.repo, &["rev-parse", "--verify", "--quiet", &ref_name])
+        .output()
+        .unwrap();
+    assert!(
+        !still_missing.status.success(),
+        "a refused removal keeps no ref"
+    );
     fs::remove_file(path.join("dirty.txt")).unwrap();
 
     let removed: Value = serde_json::from_str(&env.ok(&[
@@ -4675,8 +4682,17 @@ fn doctor_reports_problems_and_releases_only_a_provably_stale_lock() {
 
     let lock_dir = env.repo.join(".git/main-integration.lock");
     fs::create_dir(&lock_dir).unwrap();
-    let host = String::from_utf8(Command::new("hostname").output().unwrap().stdout).unwrap();
-    let host = host.trim();
+    let host = {
+        let mut buf = [0u8; 256];
+        // SAFETY: buf is writable for its full length.
+        assert_eq!(
+            unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) },
+            0
+        );
+        let end = buf.iter().position(|b| *b == 0).unwrap();
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    };
+    let host = host.as_str();
     fs::write(
         lock_dir.join("owner"),
         format!("tok\n{}\n{host}\n", absent_pid()),
@@ -5074,4 +5090,311 @@ fn finish_push_publishes_main_and_reports_a_rejected_push_after_integrating() {
     ]);
     assert_eq!(gated.status.code(), Some(4));
     assert!(path3.exists(), "validation fails before anything changes");
+}
+
+fn git_dated(dir: &Path, args: &[&str], date: &str) -> String {
+    let out = git_cmd(dir, args)
+        .env("GIT_COMMITTER_DATE", date)
+        .env("GIT_AUTHOR_DATE", date)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn squash_and_rebase_keep_refusing_unrelated_reflog_only_commits() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    for mode in ["--squash", "--rebase"] {
+        let slug = format!("reflog-{}", mode.trim_start_matches('-'));
+        let (id, path) = env.create(&slug);
+        commit_file(&path, &format!("{slug}-a.txt"), "a\n");
+        commit_file(&path, &format!("{slug}-b.txt"), "b\n");
+        git(&path, &["reset", "--hard", "HEAD~1"]);
+        if mode == "--rebase" {
+            commit_file(&env.repo, &format!("{slug}-main.txt"), "main\n");
+        }
+        let out = env.run(&[
+            "finish",
+            "--repo",
+            &repo,
+            "--id",
+            &id,
+            mode,
+            "--integration-message",
+            "feat: x",
+            "--external-writers-quiesced",
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not in main"),
+            "{mode}"
+        );
+        assert!(
+            path.exists(),
+            "{mode}: the reflog-only commit must not be discarded"
+        );
+    }
+}
+
+#[test]
+fn squash_retry_after_a_refused_integration_does_not_squash_twice() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("squash-retry");
+    commit_file(&path, "one.txt", "1\n");
+    commit_file(&path, "two.txt", "2\n");
+    let hook = env.repo.join(".git/hooks/post-merge");
+    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let args = [
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--squash",
+        "--integration-message",
+        "feat: retry",
+        "--external-writers-quiesced",
+    ];
+    assert_eq!(env.run(&args).status.code(), Some(4));
+    assert!(path.exists());
+    fs::remove_file(&hook).unwrap();
+    env.ok(&args);
+    assert!(!path.exists());
+    assert_eq!(git(&env.repo, &["log", "-1", "--format=%s"]), "feat: retry");
+}
+
+#[test]
+fn prune_ages_kept_refs_by_when_they_were_kept_not_by_commit_date() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("old-commit");
+    fs::write(path.join("old.txt"), "old\n").unwrap();
+    git(&path, &["add", "old.txt"]);
+    git_dated(
+        &path,
+        &["commit", "-q", "-m", "old"],
+        "2020-01-01T00:00:00Z",
+    );
+    env.ok(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    let ref_name = format!("refs/wtctl/abandoned/{id}");
+    env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "7",
+        "--refs",
+        "--external-writers-quiesced",
+    ]);
+    git(&env.repo, &["rev-parse", "--verify", &ref_name]);
+}
+
+#[test]
+fn rebase_refuses_to_overwrite_an_ignored_file() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("ignored-rebase");
+    commit_file(&path, "task.txt", "task\n");
+    fs::write(path.join("local.db"), "precious\n").unwrap();
+    fs::write(env.repo.join("local.db"), "tracked upstream\n").unwrap();
+    git(&env.repo, &["add", "-f", "local.db"]);
+    git(&env.repo, &["commit", "-q", "-m", "track local.db"]);
+    let out = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--rebase",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("local.db"));
+    assert_eq!(
+        fs::read_to_string(path.join("local.db")).unwrap(),
+        "precious\n"
+    );
+}
+
+#[test]
+fn restored_task_can_finish_with_the_default_merge_after_main_moves() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("restore-merge");
+    commit_file(&path, "kept.txt", "kept\n");
+    env.ok(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    let restored: Value = serde_json::from_str(&env.ok(&[
+        "restore",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--slug",
+        "restored-merge",
+        "--session",
+        "ses_r1",
+        "--json",
+    ]))
+    .unwrap();
+    let new_id = restored["task_id"].as_str().unwrap().to_string();
+    assert_eq!(restored["session_hint"], "ses_r1");
+    commit_file(&env.repo, "advanced.txt", "main\n");
+    env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &new_id,
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(git(&env.repo, &["show", "HEAD:kept.txt"]), "kept");
+    assert_eq!(git(&env.repo, &["show", "HEAD:advanced.txt"]), "main");
+}
+
+#[test]
+fn dry_run_is_rejected_where_it_would_be_ignored() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, _) = env.create("dry-run-guard");
+    for args in [
+        vec!["integrate", "--repo", &repo, "--id", &id, "--dry-run"],
+        vec!["adopt", "--repo", &repo, "--id", &id, "--dry-run"],
+        vec![
+            "describe",
+            "--repo",
+            &repo,
+            "--id",
+            &id,
+            "--task",
+            "x",
+            "--dry-run",
+        ],
+        vec!["doctor", "--repo", &repo, "--dry-run"],
+        vec![
+            "create",
+            "--repo",
+            &repo,
+            "--slug",
+            "dry-create",
+            "--dry-run",
+        ],
+    ] {
+        assert_eq!(env.run(&args).status.code(), Some(2), "{args:?}");
+    }
+    assert_eq!(
+        env.run(&["list", "--repo", &repo, "--all-repos", "--abandoned"])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn abandon_refuses_reflog_only_commits_and_retries_after_new_commits() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("abandon-reflog");
+    commit_file(&path, "a.txt", "a\n");
+    commit_file(&path, "b.txt", "b\n");
+    git(&path, &["reset", "--hard", "HEAD~1"]);
+    let out = env.run(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(path.exists());
+
+    let (id2, path2) = env.create("abandon-retry");
+    commit_file(&path2, "c.txt", "c\n");
+    fs::write(path2.join("dirty.txt"), "x\n").unwrap();
+    assert_eq!(
+        env.run(&["remove", "--repo", &repo, "--id", &id2, "--abandon"])
+            .status
+            .code(),
+        Some(4)
+    );
+    fs::remove_file(path2.join("dirty.txt")).unwrap();
+    let newer = commit_file(&path2, "d.txt", "d\n");
+    env.ok(&["remove", "--repo", &repo, "--id", &id2, "--abandon"]);
+    assert_eq!(
+        git(
+            &env.repo,
+            &["rev-parse", &format!("refs/wtctl/abandoned/{id2}")]
+        ),
+        newer
+    );
+}
+
+#[test]
+fn a_reference_transaction_hook_blocks_the_new_ref_writers() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("hooked-refs");
+    commit_file(&path, "h.txt", "h\n");
+    let hook = env.repo.join(".git/hooks/reference-transaction");
+    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let abandon = env.run(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    assert_eq!(abandon.status.code(), Some(4));
+    assert!(path.exists());
+    let prune = env.run(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--refs",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(prune.status.code(), Some(4));
+}
+
+#[test]
+fn a_failed_push_still_reports_the_finished_result_in_json() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let bare = add_bare_remote(&env);
+    let (id, path) = env.create("push-json");
+    let tip = commit_file(&path, "pj.txt", "pj\n");
+    let other = env.tmp.join("clone");
+    git(
+        &env.tmp,
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    commit_file(&other, "remote.txt", "r\n");
+    git(&other, &["push", "-q", "origin", "main"]);
+    let out = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--push",
+        "--external-writers-quiesced",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["status"], "finished");
+    assert_eq!(report["main_tip"], tip);
+    assert!(report["push_error"]
+        .as_str()
+        .unwrap()
+        .contains("integration itself succeeded"));
+    assert!(!path.exists());
 }

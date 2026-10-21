@@ -140,7 +140,12 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
                 name: "merge-conflicts",
                 state: "blocked",
                 detail: format!(
-                    "merging {main} into the task conflicts; resolve it in the worktree"
+                    "merging {main} into the task conflicts; resolve it in the worktree{}",
+                    if integration == "rebase" {
+                        " (estimated: a rebase can also stop on an earlier commit)"
+                    } else {
+                        ""
+                    }
                 ),
                 flag: None,
             },
@@ -220,6 +225,13 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
         }
     }
 
+    if integration == "rebase" || squash {
+        checks.push(Check::from_result(
+            "rewrite-state",
+            strategy::require_plain_worktree(&repo, &entry, id),
+            "the worktree is clean and can be rewritten",
+        ));
+    }
     let facts = task::facts(&[&entry], &refname)?
         .into_iter()
         .next()
