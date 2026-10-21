@@ -6,11 +6,9 @@
   outputs =
     { self, nixpkgs }:
     let
-      # Nixpkgs 26.11 dropped x86_64-darwin.
+      # Nixpkgs 26.11 dropped x86_64-darwin; Linux is intentionally unsupported.
       systems = [
         "aarch64-darwin"
-        "x86_64-linux"
-        "aarch64-linux"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in

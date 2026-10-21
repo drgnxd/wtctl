@@ -33,5 +33,4 @@ nix flake check
 nix build .#wtctl --no-link
 ```
 
-The GitHub Actions workflow runs these checks on `aarch64-darwin`,
-`x86_64-linux`, and `aarch64-linux`.
+The GitHub Actions workflow runs these checks on `aarch64-darwin`.

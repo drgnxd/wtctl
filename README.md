@@ -17,8 +17,8 @@ nix profile install github:drgnxd/wtctl
 cargo install --path .                # from a checkout
 ```
 
-It needs `git` at run time and `lsof` (or `/proc` on Linux) for the process
-check. Supported systems: aarch64-darwin, x86_64-linux, aarch64-linux.
+It needs `git` at run time and `lsof` for the process
+check. Supported system: aarch64-darwin.
 
 ## Commands
 
@@ -250,7 +250,7 @@ refuses arbitrary filters. Verified Git-annex filters need the explicit
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for commit message conventions and
-development checks. GitHub Actions runs the checks on all supported systems.
+development checks. GitHub Actions runs the checks on aarch64-darwin.
 
 ## License
 
