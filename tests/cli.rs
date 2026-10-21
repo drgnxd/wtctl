@@ -4160,3 +4160,97 @@ fn version_and_per_command_help_do_not_need_a_repository() {
         .contains("artifact cleanup options"));
     assert_eq!(env.run(&["help", "nope"]).status.code(), Some(2));
 }
+
+#[test]
+fn explicit_session_is_recorded_shown_and_updatable() {
+    let env = Env::new();
+    let created: Value = serde_json::from_str(&env.ok(&[
+        "create",
+        "--repo",
+        &env.repo_arg(),
+        "--slug",
+        "session-task",
+        "--session",
+        "ses_abc123",
+        "--json",
+    ]))
+    .unwrap();
+    let id = created["task_id"].as_str().unwrap().to_string();
+    let path = created["worktree"].as_str().unwrap().to_string();
+    assert_eq!(created["session_hint"], "ses_abc123");
+    assert_eq!(
+        env.run(&[
+            "create",
+            "--repo",
+            &env.repo_arg(),
+            "--slug",
+            "bad-session",
+            "--session",
+            "has space",
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+
+    let whoami: Value =
+        serde_json::from_str(&env.ok(&["whoami", "--path", &path, "--json"])).unwrap();
+    assert_eq!(whoami["session"], "ses_abc123");
+    // The test binary stands in for an agent named after itself, not a known client.
+    assert!(whoami["resume_command"].is_null());
+    let row = env
+        .list("--all")
+        .into_iter()
+        .find(|r| r["id"] == id)
+        .unwrap();
+    assert_eq!(row["session"], "ses_abc123");
+
+    env.ok(&[
+        "describe",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--task",
+        "renamed task",
+        "--session",
+        "ses_def456",
+    ]);
+    let marker = env.marker(&id);
+    assert_eq!(marker["task"], "renamed task");
+    assert_eq!(marker["session_hint"], "ses_def456");
+    assert_eq!(
+        marker["history"].as_array().unwrap().last().unwrap()["event"],
+        "describe"
+    );
+    assert_eq!(
+        env.run(&["describe", "--repo", &env.repo_arg(), "--id", &id])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn show_reports_task_details_and_unintegrated_commits() {
+    let env = Env::new();
+    let (id, path) = env.create("show-task");
+    commit_file(&path, "show.txt", "shown\n");
+    let report: Value =
+        serde_json::from_str(&env.ok(&["show", "--repo", &env.repo_arg(), "--id", &id, "--json"]))
+            .unwrap();
+    assert_eq!(report["task_id"], id);
+    assert_eq!(report["task"], "example task");
+    assert_eq!(report["unintegrated"], 1);
+    assert_eq!(report["commits"].as_array().unwrap().len(), 1);
+    assert!(report["commits"][0].as_str().unwrap().ends_with("show.txt"));
+    assert!(report["diffstat"]
+        .as_str()
+        .unwrap()
+        .contains("1 file changed"));
+    assert!(report["removable"].is_string());
+    let text = env.ok(&["show", "--repo", &env.repo_arg(), "--id", &id]);
+    assert!(text.contains(&format!("task_id={id}")));
+    assert!(text.contains("commit "));
+    assert!(text.contains("unintegrated=1"));
+}

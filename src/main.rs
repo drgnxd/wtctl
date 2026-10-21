@@ -30,13 +30,15 @@ const DEFAULT_GRACE_SECS: i64 = 600;
 const USAGE: &str = "usage: wtctl <command> [options]
 
   capabilities [--json]       Report lifecycle capabilities for caller gating
-  create  --repo <path> --slug <slug> [--task <text>] [--from <commit>] [--parent <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
+  create  --repo <path> --slug <slug> [--task <text>] [--session <id>] [--from <commit>] [--parent <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
   finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
-  adopt   --repo <path> --id <task-id>
+  adopt   --repo <path> --id <task-id> [--session <id>]
+  show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
+  describe --repo <path> --id <task-id> [--task <text>] [--session <id>] [--json]
   remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
 
   artifact cleanup options: --discard-direnv-cache, --discard-generated-caches,
@@ -90,6 +92,8 @@ fn command_help(name: &str) -> R<()> {
     }
     Ok(())
 }
+
+mod show;
 
 #[derive(Debug)]
 pub struct Fail {
@@ -158,6 +162,7 @@ const VALUE_OPTS: &[&str] = &[
     "--worktrees-root",
     "--base",
     "--lock-name",
+    "--session",
 ];
 const FLAG_OPTS: &[&str] = &[
     "--mine",
@@ -681,7 +686,10 @@ fn cmd_create(a: &Args) -> R<()> {
         "opencode" => "OPENCODE_SESSION_ID",
         _ => "",
     };
-    let session_hint = std::env::var(session_var).ok().filter(|v| !v.is_empty());
+    let session_hint = match show::session_arg(a)? {
+        Some(explicit) => Some(explicit),
+        None => std::env::var(session_var).ok().filter(|v| !v.is_empty()),
+    };
     let worktree = canon(&path).to_string_lossy().into_owned();
     let marker = json!({
         "schema": task::SCHEMA,
@@ -726,6 +734,9 @@ fn cmd_create(a: &Args) -> R<()> {
             owner.client,
             owner.pid
         );
+        if let Some(session) = session_hint.as_deref() {
+            out!("session={session}");
+        }
     }
     Ok(())
 }
@@ -796,7 +807,9 @@ fn cmd_whoami(a: &Args) -> R<()> {
             "{}",
             json!({"task_id": marker.task_id, "worktree": top.to_string_lossy(),
                    "base": marker.base, "owner": owner_json(&marker.owner),
-                   "owner_state": state.as_str(), "mine": mine})
+                   "owner_state": state.as_str(), "mine": mine,
+                   "session": marker.session_hint(),
+                   "resume_command": show::resume_command(&marker)})
         );
     } else {
         out!(
@@ -808,6 +821,12 @@ fn cmd_whoami(a: &Args) -> R<()> {
             marker.owner.pid,
             state.as_str()
         );
+        if let Some(session) = marker.session_hint() {
+            out!("session={session}");
+        }
+        if let Some(command) = show::resume_command(&marker) {
+            out!("resume={command}");
+        }
     }
     Ok(())
 }
@@ -1133,6 +1152,8 @@ fn cmd_list(a: &Args) -> R<()> {
         rows.push(json!({
             "id": e.id(), "kind": kind, "path": e.path.to_string_lossy(), "head": e.head,
             "branch": e.branch_ref().and_then(|r| r.strip_prefix("refs/heads/")),
+            "task": e.marker().and_then(|m| m.raw.get("task")).and_then(Value::as_str),
+            "session": e.marker().and_then(Marker::session_hint),
             "locked": e.lock_reason.is_some(), "lock_reason": e.lock_reason, "owner": owner, "owner_state": state.as_str(), "session_idle_hours": idle_hours, "audit_state": audit_state,
             "mine": mine, "exists": e.path.is_dir(),
             "clean": f.clean.map(|c| c.is_clean()),
@@ -4125,6 +4146,9 @@ fn cmd_adopt(a: &Args) -> R<()> {
         None => raw["history"] = json!([event]),
     }
     raw["owner"] = owner_json(&current);
+    if let Some(session) = show::session_arg(a)? {
+        raw["session_hint"] = json!(session);
+    }
     task::write_marker(&entry.admin, &raw)?;
     repo.audit(json!({"at": now(), "event": "adopt", "task_id": id, "pid": current.pid}));
     out!("adopted {id}: owner={} pid={}", current.client, current.pid);
@@ -4536,6 +4560,12 @@ fn run(argv: &[OsString]) -> R<()> {
             "--parent and --worktrees-root are only valid for create",
         ));
     }
+    if !matches!(cmd, "create" | "adopt" | "describe") && args.os("--session").is_some() {
+        return Err(Fail::new(
+            2,
+            "--session is only valid for create, adopt, or describe",
+        ));
+    }
     if cmd != "remove" && args.os("--lock-name").is_some() {
         return Err(Fail::new(2, "--lock-name is only valid for remove"));
     }
@@ -4548,6 +4578,8 @@ fn run(argv: &[OsString]) -> R<()> {
         "finish" => cmd_finish(&args),
         "reap" => cmd_reap(&args),
         "adopt" => cmd_adopt(&args),
+        "show" => show::cmd_show(&args),
+        "describe" => show::cmd_describe(&args),
         "remove" => cmd_remove(&args),
         _ => Err(Fail::new(2, format!("unknown command {cmd:?}\n{USAGE}"))),
     }

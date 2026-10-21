@@ -90,6 +90,13 @@ impl Marker {
         (pid > 1 && valid_task_id(&marker.task_id) && git::is_oid(&marker.base)).then_some(marker)
     }
 
+    pub fn session_hint(&self) -> Option<&str> {
+        self.raw
+            .get("session_hint")
+            .and_then(Value::as_str)
+            .filter(|hint| !hint.is_empty())
+    }
+
     /// When ownership was last claimed: creation or the latest adopt. `None`
     /// when the record is missing or malformed, which callers treat as recent.
     pub fn claimed_at(&self) -> Option<i64> {
