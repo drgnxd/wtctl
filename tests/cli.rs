@@ -332,6 +332,25 @@ fn capabilities_reports_the_lifecycle_contract() {
     assert_eq!(output["git_annex"], true);
     assert_eq!(output["artifact_quarantine"], true);
     assert_eq!(output["quarantine_purge"], true);
+    for key in [
+        "session_hint",
+        "show",
+        "describe",
+        "finish_dry_run",
+        "abandon",
+        "restore",
+        "doctor",
+        "quarantine_list",
+        "prune",
+        "list_all_repos",
+        "remote_steps",
+    ] {
+        assert_eq!(output[key], true, "{key}");
+    }
+    assert_eq!(
+        output["finish_strategies"],
+        serde_json::json!(["merge", "squash", "rebase"])
+    );
 }
 
 /// A pid with no process right now: a reaped child's pid, confirmed by ESRCH.

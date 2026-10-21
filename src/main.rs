@@ -138,6 +138,18 @@ fn cmd_capabilities(a: &Args) -> R<()> {
         "git_annex": true,
         "artifact_quarantine": true,
         "quarantine_purge": true,
+        "session_hint": true,
+        "show": true,
+        "describe": true,
+        "finish_dry_run": true,
+        "finish_strategies": ["merge", "squash", "rebase"],
+        "abandon": true,
+        "restore": true,
+        "doctor": true,
+        "quarantine_list": true,
+        "prune": true,
+        "list_all_repos": true,
+        "remote_steps": true,
     });
     if a.flag("--json") {
         out!("{capabilities}");

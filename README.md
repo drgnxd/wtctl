@@ -32,7 +32,14 @@ check. Supported system: aarch64-darwin.
 | `finish --repo <repo> (--id <id>\|--legacy-worktree-id <id>\|--expect-branch <branch>) --external-writers-quiesced` | Integrate completed work and remove that exact worktree under one lock; supports `--keep-worktree`, `--integration-message`, `--recover-failed-merge`, filter/signing opt-ins, and artifact cleanup options. |
 | `remove --repo <repo> (--id <id>\|--legacy-worktree-id <id>\|--expect-branch <branch>) [--external-writers-quiesced] [--base <ref>]` | Remove one exact wtctl or legacy worktree owned by the caller; actual removal requires writer acknowledgement and supports dry-run, reflog opt-in, and artifact cleanup options. |
 | `reap [--dry-run] [--grace-secs <n>] [--external-writers-quiesced] [--main <branch>\|--base <ref>]` | Delete removable worktrees whose owner is dead. |
-| `adopt --repo <repo> --id <id>` | Take over a task whose owner is dead. |
+| `adopt --repo <repo> --id <id> [--session <id>]` | Take over a task whose owner is dead. |
+| `show --repo <repo> --id <id> [--json]` | Task details: owner, session and resume command, age, changes, unintegrated commits, diffstat, and why it is or is not removable. |
+| `describe --repo <repo> --id <id> [--task <text>] [--session <id>]` | Update the task text or recorded session of an owned task. |
+| `restore --repo <repo> --id <abandoned-id> --slug <slug>` | Start a new task from an abandoned task tip. |
+| `doctor --repo <repo> [--fix-stale-lock --external-writers-quiesced]` | Diagnose stale locks, broken markers, missing worktree paths, and orphaned work. |
+| `quarantine --repo <repo>` | List preserved artifact quarantines with age and size. |
+| `prune --repo <repo> --older-than-days <n> [--quarantine] [--refs] [--dry-run] --external-writers-quiesced` | Purge old quarantines and delete old kept task tips. |
+| `--version`, `help <command>`, `<command> --help` | Version and per-command usage. |
 
 Hook-sensitive commands accept `--allow-repository-hooks`. Exit codes: 0 ok,
 1 error, 2 usage, 3 `main` diverged, 4 refused by a safety check, 5 lock busy.
@@ -75,6 +82,37 @@ task worktree filter configuration, including per-worktree config overrides.
 
 After a crash or resume, `list --orphans` shows tasks whose owner is dead.
 Nothing is adopted automatically.
+
+## Inspecting, recovering, and finishing differently
+
+- `create --session <id>` records the client session (otherwise
+  `CLAUDE_CODE_SESSION_ID` or `OPENCODE_SESSION_ID` is used when set).
+  `whoami`, `show`, and `list --json` report it, and `whoami` and `show`
+  print the matching resume command for known clients
+  (`claude --resume <id>`, `opencode --session <id>`).
+- `remove --id <id> --abandon` discards unintegrated work without losing it:
+  the task tip is kept under `refs/wtctl/abandoned/<id>` (never overwritten),
+  then every normal removal check runs against that tip, so a dirty worktree or
+  reflog-only commits still refuse. `list --abandoned` shows what is kept and
+  `restore` starts a new task from it.
+- `finish --dry-run` takes no lock and changes nothing. It reports how the task
+  would integrate (already integrated, fast-forward, merge, rebase), runs the
+  checks a real run would (owner, signing, hooks, filters, merge conflicts,
+  worktree state, open processes, artifact cleanup), and lists the flags the
+  real run needs. It exits 4 unless the real run would pass with the flags
+  given.
+- `finish --squash --integration-message <text>` integrates one commit; `finish
+  --rebase` replays the task onto an advanced `main` instead of merging `main`
+  into it. Both keep the original tip under `refs/wtctl/superseded/<id>`,
+  require a clean worktree, refuse git-annex repositories, honor
+  `--allow-commit-signing` and `--allow-repository-hooks`, and leave the
+  worktree in place when a rebase conflicts. The default remains a merge.
+- `create --fetch [--remote <name>]` fetches before resolving `--from`, and
+  `finish --push [--remote <name>]` pushes the integrated `main` without
+  forcing (`pre-push` hooks need `--allow-repository-hooks`). A rejected push is
+  reported after the integration, which is already complete.
+- `list --all-repos` lists tasks from every repository under the default state
+  directory; worktrees created with a custom `--worktrees-root` are not found.
 
 ## Ownership model
 
