@@ -2134,9 +2134,15 @@ pub fn inspect_plan(
     }
 
     for entry in &status {
-        if entry.code == *b"!!" && entry.path == b"state.db" {
-            if let Some(link) = canonical_database_link(worktree, main_worktree) {
-                plan.database_link = Some(link);
+        if entry.code == *b"!!"
+            && rules
+                .main_worktree_symlinks
+                .contains(Path::new(OsStr::from_bytes(&entry.path)))
+        {
+            if let Some(link) = canonical_main_file_link(worktree, main_worktree, &entry.path) {
+                if plan.database_link.replace(link).is_some() {
+                    return Err("worktree has multiple root symlinks to main-worktree files".into());
+                }
                 continue;
             }
         }
@@ -2193,9 +2199,20 @@ pub fn verify_plan_artifacts(
         verify_signature(&artifact.path, &artifact.signature, worktree)?;
     }
     if let Some(link) = &plan.database_link {
-        if canonical_database_link(worktree, main_worktree).as_ref() != Some(link) {
+        let relative = link
+            .path
+            .strip_prefix(worktree)
+            .map_err(|_| "canonical main-worktree file symlink is outside the task worktree")?;
+        let main =
+            main_worktree.ok_or("canonical main-worktree file symlink has no main worktree")?;
+        let rules = artifact_config::load(Some(main))?;
+        if !rules.main_worktree_symlinks.contains(relative)
+            || canonical_main_file_link(worktree, Some(main), relative.as_os_str().as_bytes())
+                .as_ref()
+                != Some(link)
+        {
             return Err(format!(
-                "canonical database link changed during merge: {}",
+                "canonical main-worktree file symlink changed during merge: {}",
                 link.path.display()
             ));
         }
@@ -2298,9 +2315,18 @@ fn is_direnv_path(path: &[u8]) -> bool {
     path == b".direnv" || path == b".direnv/" || path.starts_with(b".direnv/")
 }
 
-fn canonical_database_link(worktree: &Path, main_worktree: Option<&Path>) -> Option<DatabaseLink> {
+fn canonical_main_file_link(
+    worktree: &Path,
+    main_worktree: Option<&Path>,
+    relative: &[u8],
+) -> Option<DatabaseLink> {
     let main = main_worktree?;
-    let canonical = main.join("state.db");
+    let relative = Path::new(OsStr::from_bytes(relative));
+    let mut components = relative.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return None;
+    }
+    let canonical = main.join(relative);
     let metadata = fs::symlink_metadata(&canonical).ok()?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return None;
@@ -2309,7 +2335,7 @@ fn canonical_database_link(worktree: &Path, main_worktree: Option<&Path>) -> Opt
     if target != canonical || target == worktree || target.starts_with(worktree) {
         return None;
     }
-    let link = worktree.join("state.db");
+    let link = worktree.join(relative);
     if !fs::symlink_metadata(&link).ok()?.file_type().is_symlink()
         || fs::canonicalize(&link).ok()? != target
     {
@@ -3331,7 +3357,7 @@ mod tests {
     #[test]
     fn root_file_signature_detects_same_inode_same_size_rewrite_with_restored_mtime() {
         let worktree = temp("root-file-signature");
-        let path = worktree.join("ranked_report.md");
+        let path = worktree.join("report.md");
         fs::write(&path, b"original").unwrap();
         let original = fs::metadata(&path).unwrap();
         let signature = sign_configured_artifact(&path, &worktree).unwrap();
@@ -3449,7 +3475,7 @@ mod tests {
         let task = repo.join("fake-task");
         let common = repo.join(".git");
         let admin = common.join("worktrees/fake-task");
-        let artifact_path = task.join("ranked_report.md");
+        let artifact_path = task.join("report.md");
         let repo_name = format!("wtctl-policy-test-{}", std::process::id());
 
         let git = |arguments: &[&str]| {
@@ -3472,7 +3498,7 @@ mod tests {
         git(&["config", "user.email", "wtctl-test@example.invalid"]);
         fs::write(
             repo.join(artifact_config::REPO_CONFIG),
-            br#"{"schema_version":1,"generated_artifacts":["ranked_report.md"]}"#,
+            br#"{"schema_version":1,"generated_artifacts":["report.md"]}"#,
         )
         .unwrap();
         git(&["add", artifact_config::REPO_CONFIG]);
@@ -3481,7 +3507,7 @@ mod tests {
         assert!(artifact_config::load(Some(&repo))
             .unwrap()
             .generated_artifacts
-            .contains(Path::new("ranked_report.md")));
+            .contains(Path::new("report.md")));
 
         fs::create_dir_all(&admin).unwrap();
         fs::create_dir_all(&task).unwrap();
@@ -3549,7 +3575,7 @@ mod tests {
             dry_run: false,
         })
         .unwrap();
-        assert_eq!(purged, vec!["ranked_report.md"]);
+        assert_eq!(purged, vec!["report.md"]);
         let _ = fs::remove_dir_all(fixture);
     }
 

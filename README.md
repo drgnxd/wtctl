@@ -154,16 +154,21 @@ file:
   "schema_version": 1,
   "generated_artifacts": [
     "output.csv",
-    "ranked_report.md"
-  ]
+    "report.md"
+  ],
+  "main_worktree_symlinks": ["state.db"]
 }
 ```
 
-The list contains exact repository-root regular-file paths, not globs or
-directories. WTCTL reads the configuration from the committed `HEAD` of the
-main worktree; an untracked configuration file is an error and task-worktree
-edits cannot authorize their own cleanup. Configured artifacts follow the same
-quarantine policy as built-in artifacts: default `finish` discards them, while
+`generated_artifacts` contains exact repository-root regular-file paths, not
+globs or directories. Optional `main_worktree_symlinks` lists exact root file
+names for ignored task-worktree symlinks that point to same-named regular files
+in `main`. WTCTL verifies the symlink and target, unlinks only the task-local
+link, and restores it if removal fails; multiple matching links fail closed.
+WTCTL reads this configuration from the committed `HEAD` of the main worktree;
+an untracked configuration file is an error and task-worktree edits cannot
+authorize their own cleanup. Configured artifacts follow the same quarantine
+policy as built-in artifacts: default `finish` discards them, while
 `--preserve-generated-artifacts` retains them in quarantine. The JSON schema is
 validated strictly and rejects traversal, absolute paths, reserved roots, and
 unknown fields; each configured output must exist as a regular non-symlink file
@@ -185,11 +190,11 @@ unverified `.direnv` purge additionally requires
 `--discard-unverified-direnv`. Purging verifies saved signatures and journals
 per-entry progress so an interrupted purge can resume safely.
 
-A root `state.db` symlink is unlinked only when it resolves to the regular
-database in the registered `main` worktree. The database target is never
-modified; the link is restored if removal fails. `--allow-unreferenced-reflog`
-explicitly permits discarding commits held only by the target worktree's HEAD
-reflog, but never permits an unintegrated HEAD.
+An ignored root symlink to a regular file of the same name in the registered
+`main` worktree is unlinked only after its target and link text are verified.
+The target is never modified; the link is restored if removal fails.
+`--allow-unreferenced-reflog` explicitly permits discarding commits held only
+by the target worktree's HEAD reflog, but never permits an unintegrated HEAD.
 
 When a finish operation must create an integration merge commit, filters are
 refused unless they are verified Git-annex filters and

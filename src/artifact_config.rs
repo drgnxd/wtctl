@@ -16,6 +16,7 @@ pub struct Rules {
     pub build_output_roots: BTreeSet<PathBuf>,
     pub generated_config_roots: BTreeSet<PathBuf>,
     pub generated_artifacts: BTreeSet<PathBuf>,
+    pub main_worktree_symlinks: BTreeSet<PathBuf>,
 }
 
 pub fn load(main_worktree: Option<&Path>) -> Result<Rules, String> {
@@ -68,7 +69,7 @@ pub fn load(main_worktree: Option<&Path>) -> Result<Rules, String> {
         ));
     }
     let configured = parse_repo_config(&committed.stdout)?;
-    if configured.iter().any(|path| {
+    if configured.generated_artifacts.iter().any(|path| {
         rules.cache_roots.contains(path)
             || rules.build_output_roots.contains(path)
             || rules.generated_config_roots.contains(path)
@@ -82,7 +83,28 @@ pub fn load(main_worktree: Option<&Path>) -> Result<Rules, String> {
             "{REPO_CONFIG} generated_artifacts cannot duplicate built-in artifact roots"
         ));
     }
-    rules.generated_artifacts.extend(configured);
+    if configured.main_worktree_symlinks.iter().any(|path| {
+        rules.cache_roots.contains(path)
+            || rules.build_output_roots.contains(path)
+            || rules.generated_config_roots.contains(path)
+            || rules.generated_artifacts.contains(path)
+            || configured.generated_artifacts.contains(path)
+            || path.file_name().is_some_and(|name| {
+                rules
+                    .cache_directory_names
+                    .contains(&name.to_string_lossy().into_owned())
+            })
+    }) {
+        return Err(format!(
+            "{REPO_CONFIG} main_worktree_symlinks cannot duplicate artifact roots"
+        ));
+    }
+    rules
+        .generated_artifacts
+        .extend(configured.generated_artifacts);
+    rules
+        .main_worktree_symlinks
+        .extend(configured.main_worktree_symlinks);
     Ok(rules)
 }
 
@@ -124,12 +146,16 @@ fn parse_defaults(bytes: &[u8]) -> Result<Rules, String> {
     })
 }
 
-fn parse_repo_config(bytes: &[u8]) -> Result<BTreeSet<PathBuf>, String> {
+fn parse_repo_config(bytes: &[u8]) -> Result<Rules, String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("{REPO_CONFIG} is invalid JSON: {error}"))?;
     let object = object_with_keys(
         &value,
-        &["schema_version", "generated_artifacts"],
+        &[
+            "schema_version",
+            "generated_artifacts",
+            "main_worktree_symlinks",
+        ],
         REPO_CONFIG,
     )?;
     if object.get("schema_version").and_then(Value::as_u64) != Some(1) {
@@ -144,7 +170,25 @@ fn parse_repo_config(bytes: &[u8]) -> Result<BTreeSet<PathBuf>, String> {
             "{REPO_CONFIG} generated_artifacts entries must be repository-root regular-file paths"
         ));
     }
-    Ok(paths)
+    let main_worktree_symlinks = if object.contains_key("main_worktree_symlinks") {
+        path_set(object, "main_worktree_symlinks")?
+    } else {
+        BTreeSet::new()
+    };
+    if main_worktree_symlinks.iter().any(|path| {
+        path.components().count() != 1
+            || path == Path::new(".pre-commit-config.yaml")
+            || paths.contains(path)
+    }) {
+        return Err(format!(
+            "{REPO_CONFIG} main_worktree_symlinks entries must be distinct repository-root paths"
+        ));
+    }
+    Ok(Rules {
+        generated_artifacts: paths,
+        main_worktree_symlinks,
+        ..Rules::default()
+    })
 }
 
 fn object_with_keys<'a>(
@@ -306,15 +350,21 @@ mod tests {
     #[test]
     fn repository_policy_adds_safe_exact_paths_to_defaults() {
         let mut rules = parse_defaults(DEFAULTS.as_bytes()).unwrap();
-        rules.generated_artifacts.extend(parse_repo_config(
-            br#"{"schema_version":1,"generated_artifacts":["output.csv","monthly_report.md"]}"#,
-        ).unwrap());
-        assert!(rules
+        let configured = parse_repo_config(
+            br#"{"schema_version":1,"generated_artifacts":["output.csv","monthly_report.md"],"main_worktree_symlinks":["state.db"]}"#,
+        )
+        .unwrap();
+        rules
             .generated_artifacts
-            .contains(Path::new("output.csv")));
+            .extend(configured.generated_artifacts.iter().cloned());
+        rules
+            .main_worktree_symlinks
+            .extend(configured.main_worktree_symlinks.iter().cloned());
+        assert!(rules.generated_artifacts.contains(Path::new("output.csv")));
         assert!(rules
             .generated_artifacts
             .contains(Path::new("monthly_report.md")));
+        assert!(rules.main_worktree_symlinks.contains(Path::new("state.db")));
         assert!(rules.cache_roots.contains(Path::new(".pytest_cache")));
         assert!(rules.build_output_roots.contains(Path::new("rust/target")));
     }
@@ -336,6 +386,23 @@ mod tests {
                 "accepted {path:?}"
             );
         }
+    }
+
+    #[test]
+    fn main_worktree_symlinks_require_distinct_root_paths() {
+        for path in ["../outside.db", "/tmp/state.db", "nested/state.db"] {
+            let bytes = format!(
+                r#"{{"schema_version":1,"generated_artifacts":[],"main_worktree_symlinks":[{path:?}]}}"#
+            );
+            assert!(
+                parse_repo_config(bytes.as_bytes()).is_err(),
+                "accepted {path:?}"
+            );
+        }
+        assert!(parse_repo_config(
+            br#"{"schema_version":1,"generated_artifacts":["state.db"],"main_worktree_symlinks":["state.db"]}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -378,29 +445,29 @@ mod tests {
         let config = root.join(REPO_CONFIG);
         fs::write(
             &config,
-            br#"{"schema_version":1,"generated_artifacts":["output.csv"]}"#,
+            br#"{"schema_version":1,"generated_artifacts":["output.csv"],"main_worktree_symlinks":["state.db"]}"#,
         )
         .unwrap();
         git(&root, &["add", REPO_CONFIG]);
         git(&root, &["commit", "-q", "-m", "add artifact policy"]);
 
         let rules = load(Some(&root)).unwrap();
-        assert!(rules
-            .generated_artifacts
-            .contains(Path::new("output.csv")));
+        assert!(rules.generated_artifacts.contains(Path::new("output.csv")));
+        assert!(rules.main_worktree_symlinks.contains(Path::new("state.db")));
 
         fs::write(
             &config,
-            br#"{"schema_version":1,"generated_artifacts":["different.csv"]}"#,
+            br#"{"schema_version":1,"generated_artifacts":["different.csv"],"main_worktree_symlinks":["different.db"]}"#,
         )
         .unwrap();
         let rules = load(Some(&root)).unwrap();
-        assert!(rules
-            .generated_artifacts
-            .contains(Path::new("output.csv")));
+        assert!(rules.generated_artifacts.contains(Path::new("output.csv")));
         assert!(!rules
             .generated_artifacts
             .contains(Path::new("different.csv")));
+        assert!(!rules
+            .main_worktree_symlinks
+            .contains(Path::new("different.db")));
         let _ = fs::remove_dir_all(root);
     }
 

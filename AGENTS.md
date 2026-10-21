@@ -23,4 +23,7 @@ small, standard-library first, and fail closed.
 
 - Commits follow the Conventional Commits subject format in English; see
   `CONTRIBUTING.md`. CI checks subject syntax.
+- This repository is public. Keep documentation, examples, and test fixtures
+  consumer-neutral: use synthetic values and generic filenames; never copy a
+  consumer repository's paths, filenames, labels, or data.
 - Comments explain why, never what.
