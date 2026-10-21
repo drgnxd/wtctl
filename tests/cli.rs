@@ -4140,3 +4140,23 @@ fn non_ascii_cwds_are_judged_by_their_real_path() {
     }
     assert!(!path.exists());
 }
+
+#[test]
+fn version_and_per_command_help_do_not_need_a_repository() {
+    let env = Env::new();
+    let version = env.ok(&["--version"]);
+    assert_eq!(
+        version.trim(),
+        format!("wtctl {}", env!("CARGO_PKG_VERSION"))
+    );
+    for command in ["create", "finish", "remove", "list"] {
+        let via_flag = env.ok(&[command, "--help"]);
+        let via_help = env.ok(&["help", command]);
+        assert_eq!(via_flag, via_help);
+        assert!(via_flag.starts_with(&format!("usage: wtctl {command} ")));
+    }
+    assert!(env
+        .ok(&["remove", "-h"])
+        .contains("artifact cleanup options"));
+    assert_eq!(env.run(&["help", "nope"]).status.code(), Some(2));
+}

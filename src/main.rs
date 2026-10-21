@@ -53,6 +53,44 @@ macro_rules! out {
     }};
 }
 
+/// The usage block for one command: its line plus indented continuation lines.
+fn command_help(name: &str) -> R<()> {
+    let mut block: Vec<&str> = Vec::new();
+    for line in USAGE.lines() {
+        let command_line = line.starts_with("  ") && !line.starts_with("   ");
+        if block.is_empty() {
+            if command_line && line.split_whitespace().next() == Some(name) {
+                block.push(line);
+            }
+        } else if line.starts_with("    ") && !command_line {
+            block.push(line);
+        } else {
+            break;
+        }
+    }
+    let Some((first, rest)) = block.split_first() else {
+        return Err(Fail::new(2, format!("unknown command {name:?}\n{USAGE}")));
+    };
+    out!(
+        "usage: wtctl {}",
+        first.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    for line in rest {
+        out!("{line}");
+    }
+    if matches!(name, "finish" | "remove") {
+        let options = USAGE
+            .lines()
+            .skip_while(|line| !line.starts_with("  artifact cleanup options"))
+            .take_while(|line| !line.is_empty());
+        out!("");
+        for line in options {
+            out!("{line}");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Fail {
     pub code: i32,
@@ -4420,9 +4458,26 @@ fn run(argv: &[OsString]) -> R<()> {
         return Err(Fail::new(2, USAGE));
     };
     let cmd = cmd.to_str().unwrap_or("");
-    if matches!(cmd, "-h" | "--help" | "help") {
+    if matches!(cmd, "-V" | "--version" | "version") {
+        out!("wtctl {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if matches!(cmd, "-h" | "--help") || (cmd == "help" && rest.is_empty()) {
         out!("{USAGE}");
         return Ok(());
+    }
+    let help_target = if cmd == "help" {
+        rest.first().and_then(|name| name.to_str())
+    } else if rest
+        .iter()
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+    {
+        Some(cmd)
+    } else {
+        None
+    };
+    if let Some(name) = help_target {
+        return command_help(name);
     }
     let args = Args::parse(rest)?;
     let cleanup_flags = [
