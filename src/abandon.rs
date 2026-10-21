@@ -10,11 +10,14 @@ pub fn ref_name(id: &str) -> String {
     format!("{PREFIX}{id}")
 }
 
-/// Records `head` under the abandoned namespace. An existing ref for the same
-/// task must already name `head`, so a retry after a failed removal succeeds
-/// while a different tip is never overwritten.
+/// Records `head` under the abandoned namespace.
 pub fn preserve(repo: &Repo, id: &str, head: &str) -> R<String> {
-    let refname = ref_name(id);
+    preserve_at(repo, ref_name(id), head, &format!("wtctl: abandon {id}"))
+}
+
+/// Creates `refname` at `head`. An existing ref must already name `head`, so a
+/// retry after a failed step succeeds while a different tip is never overwritten.
+pub fn preserve_at(repo: &Repo, refname: String, head: &str, message: &str) -> R<String> {
     let existing = git::output(
         &repo.root,
         [
@@ -32,13 +35,7 @@ pub fn preserve(repo: &Repo, id: &str, head: &str) -> R<String> {
         }
         return refuse(format!("{refname} already preserves {current}, not {head}"));
     }
-    cas_update(
-        &repo.root,
-        &refname,
-        head,
-        ZERO_OID,
-        &format!("wtctl: abandon {id}"),
-    )?;
+    cas_update(&repo.root, &refname, head, ZERO_OID, message)?;
     Ok(refname)
 }
 

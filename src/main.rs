@@ -34,7 +34,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy | --abandoned] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
-  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--squash | --rebase] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id> [--session <id>]
   show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
@@ -97,6 +97,7 @@ fn command_help(name: &str) -> R<()> {
 mod abandon;
 mod finish_plan;
 mod show;
+mod strategy;
 
 #[derive(Debug)]
 pub struct Fail {
@@ -187,6 +188,8 @@ const FLAG_OPTS: &[&str] = &[
     "--allow-unreferenced-reflog",
     "--keep-worktree",
     "--abandon",
+    "--squash",
+    "--rebase",
     "--abandoned",
     "--allow-annex-filter",
     "--allow-commit-signing",
@@ -3054,6 +3057,8 @@ fn cmd_finish(a: &Args) -> R<()> {
         return finish_plan::cmd_finish_preflight(a);
     }
     let repo = a.repo(true)?;
+    let strategy = strategy::parse(a)?;
+    strategy::validate(a, strategy)?;
     let id = a.get("--id")?;
     let legacy_id = a.get("--legacy-worktree-id")?;
     let branch = a.get("--expect-branch")?;
@@ -3111,7 +3116,7 @@ fn cmd_finish(a: &Args) -> R<()> {
             "inspect scheduled and non-cooperating writers, then pass --external-writers-quiesced",
         );
     }
-    let cleanup = if keep_worktree {
+    let mut cleanup = if keep_worktree {
         artifact::Options::default()
     } else {
         artifact_options(a, true)?
@@ -3207,9 +3212,33 @@ fn cmd_finish(a: &Args) -> R<()> {
             .trim()
             .to_string();
     }
-    if !is_ancestor(&repo.root, &main_tip, &task_tip)?
-        && !is_ancestor(&repo.root, &task_tip, &main_tip)?
-    {
+    let diverged = !is_ancestor(&repo.root, &main_tip, &task_tip)?
+        && !is_ancestor(&repo.root, &task_tip, &main_tip)?;
+    if diverged && strategy == strategy::Strategy::Rebase {
+        let rebased = strategy::rebase_onto_main(
+            &repo,
+            &display_id,
+            &entry,
+            &refname,
+            &main_tip,
+            &task_tip,
+            a.flag("--allow-repository-hooks"),
+            a.flag("--allow-commit-signing"),
+        )?;
+        entry = Entry::load(entry.admin.clone()).ok_or_else(|| {
+            Fail::new(
+                4,
+                format!("{display_id} registration disappeared after rebase"),
+            )
+        })?;
+        if entry.current_oid().as_deref() != Some(rebased.as_str()) {
+            return refuse(format!("{display_id} HEAD changed after rebase"));
+        }
+        verify_removal_authority(&repo, &entry, &removal)?;
+        // The pre-rebase commits live only in the reflog, which this opt-in
+        // accepts now that HEAD is based on main; the tip is kept in a ref.
+        cleanup.allow_unreferenced_reflog = true;
+    } else if diverged {
         let merged_tip = merge_main_into_task(
             &repo,
             &display_id,
@@ -3241,6 +3270,33 @@ fn cmd_finish(a: &Args) -> R<()> {
         verify_removal_authority(&repo, &entry, &removal)?;
         if let Some(marker) = &marker {
             require_owner(marker)?;
+        }
+    }
+    if strategy == strategy::Strategy::Squash {
+        let current = entry
+            .current_oid()
+            .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before squash"))?;
+        if current != main_tip && !is_ancestor(&repo.root, &current, &main_tip)? {
+            let squashed = strategy::squash_onto_main(
+                &repo,
+                &display_id,
+                &entry,
+                &main_tip,
+                &current,
+                integration_message,
+                a.flag("--allow-commit-signing"),
+            )?;
+            entry = Entry::load(entry.admin.clone()).ok_or_else(|| {
+                Fail::new(
+                    4,
+                    format!("{display_id} registration disappeared after squash"),
+                )
+            })?;
+            if entry.current_oid().as_deref() != Some(squashed.as_str()) {
+                return refuse(format!("{display_id} HEAD changed after squash"));
+            }
+            verify_removal_authority(&repo, &entry, &removal)?;
+            cleanup.allow_unreferenced_reflog = true;
         }
     }
     let finish_head = entry
@@ -4622,6 +4678,12 @@ fn run(argv: &[OsString]) -> R<()> {
         return Err(Fail::new(
             2,
             "--session is only valid for create, adopt, or describe",
+        ));
+    }
+    if cmd != "finish" && (args.flag("--squash") || args.flag("--rebase")) {
+        return Err(Fail::new(
+            2,
+            "--squash and --rebase are only valid for finish",
         ));
     }
     if cmd != "remove" && args.flag("--abandon") {

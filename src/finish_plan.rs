@@ -69,6 +69,8 @@ fn commit_count(repo: &Repo, range: &str) -> Option<u64> {
 
 pub fn cmd_finish_preflight(a: &Args) -> R<()> {
     let repo = a.repo(true)?;
+    let strategy = strategy::parse(a)?;
+    strategy::validate(a, strategy)?;
     if a.os("--legacy-worktree-id").is_some() || a.os("--expect-branch").is_some() {
         return Err(Fail::new(2, "finish --dry-run supports only --id"));
     }
@@ -103,20 +105,25 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
         "already-integrated"
     } else if task_ahead {
         "fast-forward"
+    } else if strategy == strategy::Strategy::Rebase {
+        "rebase"
     } else {
         "merge"
     };
+    let squash = strategy == strategy::Strategy::Squash && integration != "already-integrated";
     let new_commits = commit_count(&repo, &format!("{main_tip}..{task_tip}"));
     let behind = commit_count(&repo, &format!("{task_tip}..{main_tip}"));
 
-    if integration == "merge" {
+    if integration == "merge" || integration == "rebase" || squash {
         checks.push(Check::gated(
             "commit-signing",
             "--allow-commit-signing",
             allow_signing,
             |allow| check_commit_signing(&repo, allow),
-            "the integration merge is not configured to sign",
+            "the integration commit is not configured to sign",
         ));
+    }
+    if integration == "merge" || integration == "rebase" {
         let preview = git::output(
             &repo.root,
             [
@@ -152,19 +159,23 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
                 check_hooks(
                     &active_hooks(
                         &entry.path,
-                        &[
-                            "pre-merge-commit",
-                            "commit-msg",
-                            "post-merge",
-                            "reference-transaction",
-                        ],
+                        if integration == "rebase" {
+                            strategy::REBASE_HOOKS
+                        } else {
+                            &[
+                                "pre-merge-commit",
+                                "commit-msg",
+                                "post-merge",
+                                "reference-transaction",
+                            ]
+                        },
                         None,
                         None,
                     )?,
                     allow,
                 )
             },
-            "no repository hook would run during the merge",
+            "no repository hook would run while rewriting or merging",
         ));
         let tree = format!("{task_tip}^{{tree}}");
         checks.push(Check::gated(
@@ -286,6 +297,11 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
                 "task_tip": task_tip,
                 "new_commits": new_commits,
                 "main_ahead_commits": behind,
+                "strategy": match strategy {
+                    strategy::Strategy::Merge => "merge",
+                    strategy::Strategy::Squash => "squash",
+                    strategy::Strategy::Rebase => "rebase",
+                },
                 "required_flags": required,
                 "checks": checks.iter().map(|check| json!({
                     "name": check.name,

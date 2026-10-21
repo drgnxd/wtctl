@@ -4470,3 +4470,177 @@ fn finish_reports_the_main_movement_and_removed_path() {
         "{text}"
     );
 }
+
+#[test]
+fn finish_rebase_replays_task_commits_onto_an_advanced_main() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("rebase-task");
+    let original = commit_file(&path, "task.txt", "task\n");
+    let advanced = commit_file(&env.repo, "main.txt", "main\n");
+
+    env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--rebase",
+        "--external-writers-quiesced",
+    ]);
+    assert!(!path.exists());
+    let tip = env.main_oid();
+    assert_ne!(tip, original);
+    assert_eq!(git(&env.repo, &["rev-parse", "HEAD~1"]), advanced);
+    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task");
+    assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main");
+    assert_eq!(
+        git(
+            &env.repo,
+            &["rev-parse", &format!("refs/wtctl/superseded/{id}")]
+        ),
+        original
+    );
+}
+
+#[test]
+fn finish_rebase_conflict_leaves_the_worktree_and_the_original_tip() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("rebase-conflict");
+    let original = commit_file(&path, "f.txt", "task side\n");
+    commit_file(&env.repo, "f.txt", "main side\n");
+    let main_before = env.main_oid();
+
+    let out = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--rebase",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(path.exists());
+    assert_eq!(env.main_oid(), main_before);
+    assert_eq!(
+        git(
+            &env.repo,
+            &["rev-parse", &format!("refs/wtctl/superseded/{id}")]
+        ),
+        original
+    );
+    assert!(env.admin(&id).join("rebase-merge").exists());
+}
+
+#[test]
+fn finish_squash_integrates_one_commit_with_the_given_message() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("squash-task");
+    commit_file(&path, "one.txt", "1\n");
+    let last = commit_file(&path, "two.txt", "2\n");
+    let before = env.main_oid();
+
+    let missing = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--squash",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(path.exists());
+
+    env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--squash",
+        "--integration-message",
+        "feat: squashed task",
+        "--external-writers-quiesced",
+    ]);
+    assert!(!path.exists());
+    assert_eq!(git(&env.repo, &["rev-parse", "HEAD~1"]), before);
+    assert_eq!(
+        git(&env.repo, &["log", "-1", "--format=%s"]),
+        "feat: squashed task"
+    );
+    assert_eq!(git(&env.repo, &["show", "HEAD:one.txt"]), "1");
+    assert_eq!(git(&env.repo, &["show", "HEAD:two.txt"]), "2");
+    assert_eq!(
+        git(
+            &env.repo,
+            &["rev-parse", &format!("refs/wtctl/superseded/{id}")]
+        ),
+        last
+    );
+    let both = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--squash",
+        "--rebase",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(both.status.code(), Some(2));
+}
+
+#[test]
+fn finish_dry_run_understands_rebase_and_squash() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("strategy-plan");
+    commit_file(&path, "plan.txt", "plan\n");
+    commit_file(&env.repo, "main.txt", "main\n");
+    let rebase: Value = serde_json::from_str(&env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--rebase",
+        "--dry-run",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(rebase["integration"], "rebase");
+    assert_eq!(rebase["strategy"], "rebase");
+    let squash: Value = serde_json::from_str(&env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--squash",
+        "--integration-message",
+        "feat: plan",
+        "--dry-run",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(squash["strategy"], "squash");
+    assert_eq!(
+        env.run(&[
+            "finish",
+            "--repo",
+            &repo,
+            "--id",
+            &id,
+            "--squash",
+            "--dry-run"
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+    assert!(path.exists());
+}
