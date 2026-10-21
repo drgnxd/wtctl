@@ -4906,3 +4906,153 @@ fn list_all_repos_groups_task_worktrees_from_every_repository() {
         Some(2)
     );
 }
+
+fn add_bare_remote(env: &Env) -> PathBuf {
+    let bare = env.tmp.join("remote.git");
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare", "-b", "main"]);
+    git(
+        &env.repo,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    git(&env.repo, &["push", "-q", "origin", "main"]);
+    bare
+}
+
+#[test]
+fn create_fetch_resolves_a_remote_tracking_base_after_fetching() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let bare = add_bare_remote(&env);
+    let other = env.tmp.join("clone");
+    git(
+        &env.tmp,
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    let upstream = commit_file(&other, "up.txt", "upstream\n");
+    git(&other, &["push", "-q", "origin", "main"]);
+
+    let stale = env.run(&[
+        "create",
+        "--repo",
+        &repo,
+        "--slug",
+        "fetch-task",
+        "--from",
+        &upstream,
+    ]);
+    assert!(
+        !stale.status.success(),
+        "the commit is unknown before the fetch"
+    );
+    let created: Value = serde_json::from_str(&env.ok(&[
+        "create",
+        "--repo",
+        &repo,
+        "--slug",
+        "fetch-task",
+        "--fetch",
+        "--from",
+        "origin/main",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(created["base"], upstream);
+    assert_eq!(
+        env.run(&[
+            "create",
+            "--repo",
+            &repo,
+            "--slug",
+            "bad-remote",
+            "--fetch",
+            "--remote",
+            "nope"
+        ])
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        env.run(&[
+            "create",
+            "--repo",
+            &repo,
+            "--slug",
+            "bad-remote",
+            "--remote",
+            "origin"
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn finish_push_publishes_main_and_reports_a_rejected_push_after_integrating() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let bare = add_bare_remote(&env);
+    let (id, path) = env.create("push-task");
+    let tip = commit_file(&path, "pushed.txt", "pushed\n");
+    env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--push",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), tip);
+
+    let (id2, path2) = env.create("rejected-push");
+    commit_file(&path2, "second.txt", "second\n");
+    let other = env.tmp.join("clone");
+    git(
+        &env.tmp,
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    commit_file(&other, "remote-only.txt", "r\n");
+    git(&other, &["push", "-q", "origin", "main"]);
+    let rejected = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id2,
+        "--push",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("integration itself succeeded"));
+    assert!(!path2.exists());
+
+    let (id3, path3) = env.create("hooked-push");
+    commit_file(&path3, "third.txt", "third\n");
+    let hook = env.repo.join(".git/hooks/pre-push");
+    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let gated = env.run(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id3,
+        "--push",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(gated.status.code(), Some(4));
+    assert!(path3.exists(), "validation fails before anything changes");
+}

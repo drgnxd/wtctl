@@ -263,6 +263,15 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
             "generated artifacts can be cleaned up",
         ));
     }
+    if a.flag("--push") {
+        checks.push(Check::gated(
+            "push",
+            "--allow-repository-hooks",
+            allow_hooks,
+            |allow| remote::check_push(&repo, &remote::remote_arg(a)?, allow),
+            "the remote exists and no push hook would run",
+        ));
+    }
     if repo.uses_annex()? && !a.flag("--external-writers-quiesced") {
         checks.push(Check {
             name: "annex-writers",

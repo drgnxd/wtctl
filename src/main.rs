@@ -30,11 +30,11 @@ const DEFAULT_GRACE_SECS: i64 = 600;
 const USAGE: &str = "usage: wtctl <command> [options]
 
   capabilities [--json]       Report lifecycle capabilities for caller gating
-  create  --repo <path> --slug <slug> [--task <text>] [--session <id>] [--from <commit>] [--parent <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
+  create  --repo <path> --slug <slug> [--task <text>] [--session <id>] [--from <commit>] [--fetch] [--remote <name>] [--parent <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy | --abandoned] [--all-repos] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
-  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--squash | --rebase] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--squash | --rebase] [--push] [--remote <name>] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id> [--session <id>]
   show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
@@ -101,6 +101,7 @@ mod abandon;
 mod doctor;
 mod finish_plan;
 mod housekeeping;
+mod remote;
 mod show;
 mod strategy;
 
@@ -173,6 +174,7 @@ const VALUE_OPTS: &[&str] = &[
     "--lock-name",
     "--session",
     "--older-than-days",
+    "--remote",
 ];
 const FLAG_OPTS: &[&str] = &[
     "--mine",
@@ -195,6 +197,8 @@ const FLAG_OPTS: &[&str] = &[
     "--keep-worktree",
     "--abandon",
     "--squash",
+    "--fetch",
+    "--push",
     "--all-repos",
     "--quarantine",
     "--refs",
@@ -621,6 +625,10 @@ fn cmd_create(a: &Args) -> R<()> {
     // Resolve the owner first so a failed lookup never leaves an unowned worktree.
     let owner = me()?;
     let root = canon(Path::new(a.need_os("--repo")?));
+    // Fetch first so a remote-tracking --from resolves to what was just fetched.
+    if a.flag("--fetch") {
+        remote::fetch(&Repo::open(&root)?, &remote::remote_arg(a)?)?;
+    }
     // One call resolves the common dir, hook dir, and source commit.
     let out = git::output(
         &root,
@@ -3188,6 +3196,13 @@ fn cmd_finish(a: &Args) -> R<()> {
         artifact_options(a, true)?
     };
     let (main, refname) = main_ref(a, &repo.root)?;
+    let push_remote = if a.flag("--push") {
+        let name = remote::remote_arg(a)?;
+        remote::check_push(&repo, &name, a.flag("--allow-repository-hooks"))?;
+        Some(name)
+    } else {
+        None
+    };
     let annex = repo.require_annex_ready(true)?;
     let _lock = repo.lock()?;
     let (mut entry, task_base, marker, removal, display_id, caller) = if let Some(id) = id {
@@ -3421,10 +3436,18 @@ fn cmd_finish(a: &Args) -> R<()> {
             "already_integrated": already,
             "pid": caller.pid,
         }));
+        let pushed = match &push_remote {
+            Some(name) => {
+                remote::push(&repo, name, &refname)?;
+                Some(name.as_str())
+            }
+            None => None,
+        };
         if a.flag("--json") {
             out!(
                 "{}",
                 json!({
+                    "pushed": pushed,
                     "status": "integrated-kept",
                     "repo": repo.root,
                     "main_tip": tip,
@@ -3437,6 +3460,9 @@ fn cmd_finish(a: &Args) -> R<()> {
             );
         } else {
             out!("integrated {display_id}: {main} (worktree kept)");
+            if let Some(name) = pushed {
+                out!("  pushed {main} to {name}");
+            }
             if already {
                 out!("  already integrated; {main} stays at {tip}");
             } else {
@@ -3484,10 +3510,18 @@ fn cmd_finish(a: &Args) -> R<()> {
         "already_integrated": already,
         "pid": caller.pid,
     }));
+    let pushed = match &push_remote {
+        Some(name) => {
+            remote::push(&repo, name, &refname)?;
+            Some(name.as_str())
+        }
+        None => None,
+    };
     if a.flag("--json") {
         out!(
             "{}",
             json!({
+                "pushed": pushed,
                 "status": "finished",
                 "repo": repo.root,
                 "main_tip": tip,
@@ -3507,6 +3541,9 @@ fn cmd_finish(a: &Args) -> R<()> {
             out!("  {main}: {main_before} -> {tip}");
         }
         out!("  removed {}", fresh.path.display());
+        if let Some(name) = pushed {
+            out!("  pushed {main} to {name}");
+        }
     }
     Ok(())
 }
@@ -4761,6 +4798,21 @@ fn run(argv: &[OsString]) -> R<()> {
             2,
             "--quarantine, --refs, and --older-than-days are only valid for prune",
         ));
+    }
+    if cmd != "create" && args.flag("--fetch") {
+        return Err(Fail::new(2, "--fetch is only valid for create"));
+    }
+    if cmd != "finish" && args.flag("--push") {
+        return Err(Fail::new(2, "--push is only valid for finish"));
+    }
+    if !matches!(cmd, "create" | "finish") && args.os("--remote").is_some() {
+        return Err(Fail::new(2, "--remote is only valid for create or finish"));
+    }
+    if cmd == "create" && args.os("--remote").is_some() && !args.flag("--fetch") {
+        return Err(Fail::new(2, "--remote needs --fetch"));
+    }
+    if cmd == "finish" && args.os("--remote").is_some() && !args.flag("--push") {
+        return Err(Fail::new(2, "--remote needs --push"));
     }
     if cmd != "doctor" && args.flag("--fix-stale-lock") {
         return Err(Fail::new(2, "--fix-stale-lock is only valid for doctor"));
