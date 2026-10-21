@@ -32,7 +32,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
   capabilities [--json]       Report lifecycle capabilities for caller gating
   create  --repo <path> --slug <slug> [--task <text>] [--session <id>] [--from <commit>] [--parent <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
   whoami  [--path <path>] [--json]
-  list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy | --abandoned] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
+  list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy | --abandoned] [--all-repos] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
   finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--squash | --rebase] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
@@ -195,6 +195,7 @@ const FLAG_OPTS: &[&str] = &[
     "--keep-worktree",
     "--abandon",
     "--squash",
+    "--all-repos",
     "--quarantine",
     "--refs",
     "--fix-stale-lock",
@@ -1003,11 +1004,7 @@ fn legacy_audit_state(
     }
 }
 
-fn cmd_list(a: &Args) -> R<()> {
-    let repo = a.repo(false)?;
-    if a.flag("--abandoned") {
-        return abandon::list(a, &repo);
-    }
+fn list_rows(a: &Args, repo: &Repo) -> R<Vec<Value>> {
     let (_, main_ref) = base_ref(a, &repo.root)?;
     let modes: Vec<&str> = ["--mine", "--orphans", "--all", "--wtctl", "--legacy"]
         .into_iter()
@@ -1184,21 +1181,82 @@ fn cmd_list(a: &Args) -> R<()> {
             "suggested_remove": suggested_remove,
         }));
     }
+    Ok(rows)
+}
+
+fn cmd_list(a: &Args) -> R<()> {
+    if a.flag("--all-repos") {
+        return list_all_repos(a);
+    }
+    let repo = a.repo(false)?;
+    if a.flag("--abandoned") {
+        return abandon::list(a, &repo);
+    }
+    let rows = list_rows(a, &repo)?;
+    print_rows(a, &rows, false);
+    Ok(())
+}
+
+/// Task worktrees under the default state directory, grouped by repository.
+/// Worktrees created with a custom `--worktrees-root` are not found.
+fn list_all_repos(a: &Args) -> R<()> {
+    if a.os("--repo").is_some() {
+        return Err(Fail::new(2, "--all-repos cannot be combined with --repo"));
+    }
+    let mut repos: BTreeMap<PathBuf, Repo> = BTreeMap::new();
+    for repo_dir in fs::read_dir(state_home()?).into_iter().flatten().flatten() {
+        let worktrees = repo_dir.path().join("worktrees");
+        for task_dir in fs::read_dir(&worktrees).into_iter().flatten().flatten() {
+            if task_dir.file_name().to_string_lossy().starts_with('.') || !task_dir.path().is_dir()
+            {
+                continue;
+            }
+            let Ok(found) = Repo::open(&task_dir.path()) else {
+                continue;
+            };
+            let root = if found.common.file_name() == Some(".git".as_ref()) {
+                found.common.parent().map(Path::to_path_buf)
+            } else {
+                Some(found.common.clone())
+            };
+            let Some(root) = root else { continue };
+            if let Ok(repo) = Repo::open(&root) {
+                repos.entry(repo.common.clone()).or_insert(repo);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for repo in repos.values() {
+        for mut row in list_rows(a, repo)? {
+            row["repo"] = json!(repo.root.to_string_lossy());
+            rows.push(row);
+        }
+    }
+    print_rows(a, &rows, true);
+    Ok(())
+}
+
+fn print_rows(a: &Args, rows: &[Value], with_repo: bool) {
     if a.flag("--json") {
-        out!("{}", Value::Array(rows));
-        return Ok(());
+        out!("{}", Value::Array(rows.to_vec()));
+        return;
     }
     let yn = |v: &Value| match v.as_bool() {
         Some(true) => "yes",
         Some(false) => "no",
         None => "?",
     };
-    for r in &rows {
+    for r in rows {
         let idle = r["session_idle_hours"]
             .as_f64()
             .map_or_else(|| "?".into(), |hours| format!("{hours:.1}h"));
+        let repo_column = if with_repo {
+            format!("{}\t", r["repo"].as_str().unwrap_or(""))
+        } else {
+            String::new()
+        };
         out!(
-            "{}\t{}\towner={} {}{} session_idle={} audit={}\tintegrated={} unintegrated={}\tclean={}\tlocked={}\t{}",
+            "{repo_column}{}\t{}\towner={} {}{} session_idle={} audit={}\tintegrated={} unintegrated={}\tclean={}\tlocked={}\t{}",
             r["id"].as_str().unwrap_or(""),
             r["kind"].as_str().unwrap_or(""),
             r["owner"].as_str().unwrap_or(""),
@@ -1219,7 +1277,6 @@ fn cmd_list(a: &Args) -> R<()> {
             r["path"].as_str().unwrap_or(""),
         );
     }
-    Ok(())
 }
 
 fn require_owner(marker: &Marker) -> R<Owner> {
@@ -4711,8 +4768,11 @@ fn run(argv: &[OsString]) -> R<()> {
     if cmd != "remove" && args.flag("--abandon") {
         return Err(Fail::new(2, "--abandon is only valid for remove"));
     }
-    if cmd != "list" && args.flag("--abandoned") {
-        return Err(Fail::new(2, "--abandoned is only valid for list"));
+    if cmd != "list" && (args.flag("--abandoned") || args.flag("--all-repos")) {
+        return Err(Fail::new(
+            2,
+            "--abandoned and --all-repos are only valid for list",
+        ));
     }
     if cmd != "remove" && args.os("--lock-name").is_some() {
         return Err(Fail::new(2, "--lock-name is only valid for remove"));

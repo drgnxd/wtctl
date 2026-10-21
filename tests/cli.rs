@@ -4864,3 +4864,45 @@ fn prune_deletes_kept_task_tips_only_when_asked_and_old_enough() {
         .unwrap();
     assert!(!gone.status.success());
 }
+
+#[test]
+fn list_all_repos_groups_task_worktrees_from_every_repository() {
+    let env = Env::new();
+    let (first, _) = env.create("first-repo-task");
+    let other = env.tmp.join("other");
+    fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    commit_file(&other, "o.txt", "other\n");
+    let other = fs::canonicalize(&other).unwrap();
+    let created: Value = serde_json::from_str(&env.ok(&[
+        "create",
+        "--repo",
+        other.to_str().unwrap(),
+        "--slug",
+        "second-repo-task",
+        "--json",
+    ]))
+    .unwrap();
+    let second = created["task_id"].as_str().unwrap().to_string();
+
+    let rows: Value = serde_json::from_str(&env.ok(&["list", "--all-repos", "--json"])).unwrap();
+    let rows = rows.as_array().unwrap();
+    let repo_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .map(|row| row["repo"].as_str().unwrap().to_string())
+    };
+    assert_eq!(repo_of(&first), Some(env.repo_arg()));
+    assert_eq!(repo_of(&second), Some(other.to_string_lossy().into_owned()));
+    let text = env.ok(&["list", "--all-repos"]);
+    assert!(
+        text.contains(&format!("{}\t{first}", env.repo_arg())),
+        "{text}"
+    );
+    assert_eq!(
+        env.run(&["list", "--all-repos", "--repo", &env.repo_arg()])
+            .status
+            .code(),
+        Some(2)
+    );
+}
