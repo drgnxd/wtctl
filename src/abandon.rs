@@ -35,7 +35,22 @@ pub fn preserve_at(repo: &Repo, refname: String, head: &str, message: &str) -> R
         }
         return refuse(format!("{refname} already preserves {current}, not {head}"));
     }
-    cas_update(&repo.root, &refname, head, ZERO_OID, message)?;
+    // The reflog entry records when the tip was kept, which `prune` ages by.
+    let out = git::output(
+        &repo.root,
+        [
+            "update-ref",
+            "--create-reflog",
+            "-m",
+            message,
+            &refname,
+            head,
+            ZERO_OID,
+        ],
+    )?;
+    if !out.status.success() {
+        return refuse(format!("cannot create {refname}: {}", git::stderr_of(&out)));
+    }
     Ok(refname)
 }
 

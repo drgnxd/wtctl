@@ -39,6 +39,8 @@ const USAGE: &str = "usage: wtctl <command> [options]
   adopt   --repo <path> --id <task-id> [--session <id>]
   show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
   describe --repo <path> --id <task-id> [--task <text>] [--session <id>] [--json]
+  quarantine --repo <path> [--json]
+  prune   --repo <path> --older-than-days <n> [--quarantine] [--refs] [--dry-run] [--main <branch>] [--json] [--external-writers-quiesced]
   doctor  --repo <path> [--fix-stale-lock --external-writers-quiesced] [--json]
   restore --repo <path> --id <abandoned-task-id> --slug <slug> [--task <text>] [--session <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
   remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--abandon] [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
@@ -98,6 +100,7 @@ fn command_help(name: &str) -> R<()> {
 mod abandon;
 mod doctor;
 mod finish_plan;
+mod housekeeping;
 mod show;
 mod strategy;
 
@@ -169,6 +172,7 @@ const VALUE_OPTS: &[&str] = &[
     "--base",
     "--lock-name",
     "--session",
+    "--older-than-days",
 ];
 const FLAG_OPTS: &[&str] = &[
     "--mine",
@@ -191,6 +195,8 @@ const FLAG_OPTS: &[&str] = &[
     "--keep-worktree",
     "--abandon",
     "--squash",
+    "--quarantine",
+    "--refs",
     "--fix-stale-lock",
     "--rebase",
     "--abandoned",
@@ -4689,6 +4695,16 @@ fn run(argv: &[OsString]) -> R<()> {
             "--squash and --rebase are only valid for finish",
         ));
     }
+    if cmd != "prune"
+        && (args.flag("--quarantine")
+            || args.flag("--refs")
+            || args.os("--older-than-days").is_some())
+    {
+        return Err(Fail::new(
+            2,
+            "--quarantine, --refs, and --older-than-days are only valid for prune",
+        ));
+    }
     if cmd != "doctor" && args.flag("--fix-stale-lock") {
         return Err(Fail::new(2, "--fix-stale-lock is only valid for doctor"));
     }
@@ -4712,6 +4728,8 @@ fn run(argv: &[OsString]) -> R<()> {
         "adopt" => cmd_adopt(&args),
         "restore" => abandon::cmd_restore(&args),
         "doctor" => doctor::cmd_doctor(&args),
+        "quarantine" => housekeeping::cmd_quarantine(&args),
+        "prune" => housekeeping::cmd_prune(&args),
         "show" => show::cmd_show(&args),
         "describe" => show::cmd_describe(&args),
         "remove" => cmd_remove(&args),

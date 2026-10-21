@@ -4731,3 +4731,136 @@ fn doctor_reports_problems_and_releases_only_a_provably_stale_lock() {
         .unwrap()
         .contains(&id));
 }
+
+#[test]
+fn quarantine_lists_operations_and_prune_purges_them_by_age() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("prune-cache");
+    env.exclude("/.ruff_cache/");
+    fs::create_dir_all(path.join(".ruff_cache")).unwrap();
+    fs::write(path.join(".ruff_cache/state"), b"cache state").unwrap();
+    env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--preserve-generated-artifacts",
+    ]);
+
+    let listed: Value =
+        serde_json::from_str(&env.ok(&["quarantine", "--repo", &repo, "--json"])).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["preserved_items"], 1);
+    assert_eq!(listed[0]["age_days"], 0);
+    let operation = listed[0]["operation_id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        env.run(&[
+            "prune",
+            "--repo",
+            &repo,
+            "--older-than-days",
+            "1",
+            "--quarantine"
+        ])
+        .status
+        .code(),
+        Some(4)
+    );
+    assert_eq!(
+        env.run(&["prune", "--repo", &repo, "--older-than-days", "1"])
+            .status
+            .code(),
+        Some(2)
+    );
+    let young = env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "1",
+        "--quarantine",
+        "--external-writers-quiesced",
+    ]);
+    assert!(young.contains("nothing older"));
+    assert!(env.quarantine_root().join(&operation).exists());
+
+    let dry = env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--quarantine",
+        "--dry-run",
+    ]);
+    assert!(dry.contains("would-purge"), "{dry}");
+    assert!(env.quarantine_root().join(&operation).exists());
+    env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--quarantine",
+        "--external-writers-quiesced",
+    ]);
+    assert!(!env.quarantine_root().join(&operation).exists());
+}
+
+#[test]
+fn prune_deletes_kept_task_tips_only_when_asked_and_old_enough() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("prune-refs");
+    let tip = commit_file(&path, "kept.txt", "kept\n");
+    env.ok(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    let ref_name = format!("refs/wtctl/abandoned/{id}");
+
+    env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--quarantine",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(git(&env.repo, &["rev-parse", &ref_name]), tip);
+    env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "1",
+        "--refs",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(git(&env.repo, &["rev-parse", &ref_name]), tip);
+    let dry = env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--refs",
+        "--dry-run",
+    ]);
+    assert!(dry.contains("would-delete"));
+    assert_eq!(git(&env.repo, &["rev-parse", &ref_name]), tip);
+    env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--refs",
+        "--external-writers-quiesced",
+    ]);
+    let gone = git_cmd(&env.repo, &["rev-parse", "--verify", "--quiet", &ref_name])
+        .output()
+        .unwrap();
+    assert!(!gone.status.success());
+}
