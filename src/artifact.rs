@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use crate::git::{self, StatusEntry};
 use serde_json::{json, Value};
 
+#[path = "artifact_config.rs"]
+mod artifact_config;
+
 const PRECOMMIT_CONFIG: &str = ".pre-commit-config.yaml";
 const MAX_PRECOMMIT_BYTES: u64 = 16 * 1024 * 1024;
 const PURGE_BATCH_ENTRIES: usize = 256;
@@ -85,6 +88,27 @@ pub struct Transaction {
     pub database_link: Option<DatabaseLink>,
 }
 
+struct BeginTransactionContext<'a> {
+    repo_name: &'a str,
+    state_home: &'a Path,
+    common: &'a Path,
+    worktree: &'a Path,
+    admin: &'a Path,
+    head: &'a str,
+    branch: Option<&'a str>,
+}
+
+struct PurgeContext<'a> {
+    state_home: &'a Path,
+    repo_root: &'a Path,
+    repo_name: &'a str,
+    common: &'a Path,
+    main_ref: &'a str,
+    operation_id: &'a str,
+    discard_unverified_direnv: bool,
+    dry_run: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FinishReport {
     pub preserved: Vec<PathBuf>,
@@ -102,14 +126,41 @@ pub fn begin_transaction(
     head: &str,
     branch: Option<&str>,
 ) -> Result<Option<Transaction>, String> {
-    if plan.generated.is_empty() && plan.direnv.is_none() && plan.database_link.is_none() {
-        return Ok(None);
-    }
     let state_home = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
         });
+    begin_transaction_in_state(
+        plan,
+        BeginTransactionContext {
+            repo_name,
+            state_home: &state_home,
+            common,
+            worktree,
+            admin,
+            head,
+            branch,
+        },
+    )
+}
+
+fn begin_transaction_in_state(
+    plan: &Plan,
+    context: BeginTransactionContext<'_>,
+) -> Result<Option<Transaction>, String> {
+    let BeginTransactionContext {
+        repo_name,
+        state_home,
+        common,
+        worktree,
+        admin,
+        head,
+        branch,
+    } = context;
+    if plan.generated.is_empty() && plan.direnv.is_none() && plan.database_link.is_none() {
+        return Ok(None);
+    }
     if !state_home.is_absolute() {
         return Err("XDG_STATE_HOME must be an absolute path for worktree quarantine".into());
     }
@@ -429,6 +480,34 @@ pub fn purge_preserved(
     discard_unverified_direnv: bool,
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        });
+    purge_preserved_in_state(PurgeContext {
+        state_home: &state_home,
+        repo_root,
+        repo_name,
+        common,
+        main_ref,
+        operation_id,
+        discard_unverified_direnv,
+        dry_run,
+    })
+}
+
+fn purge_preserved_in_state(context: PurgeContext<'_>) -> Result<Vec<String>, String> {
+    let PurgeContext {
+        state_home,
+        repo_root,
+        repo_name,
+        common,
+        main_ref,
+        operation_id,
+        discard_unverified_direnv,
+        dry_run,
+    } = context;
     if operation_id.len() != 32
         || !operation_id
             .bytes()
@@ -436,11 +515,6 @@ pub fn purge_preserved(
     {
         return Err("quarantine operation ID must be 32 lowercase hexadecimal characters".into());
     }
-    let state_home = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-        });
     if !state_home.is_absolute() {
         return Err("XDG_STATE_HOME must be absolute for quarantine cleanup".into());
     }
@@ -550,7 +624,7 @@ pub fn purge_preserved(
         let relative = record["path"]
             .as_str()
             .ok_or_else(|| "generated artifact path is malformed".to_string())?;
-        if !known_generated_path(relative) {
+        if !artifact_config::valid_quarantine_path(relative) {
             return Err(format!(
                 "unrecognized generated-artifact path in manifest: {relative}"
             ));
@@ -578,7 +652,9 @@ pub fn purge_preserved(
         let archive = operation.join(&name);
         let signature = parse_signature(&record["signature"])?;
         verify_artifact_progress(&archive, &signature, record, &operation.join(&journal_name))?;
-        allowed.insert(name);
+        if fs::symlink_metadata(&archive).is_ok() {
+            allowed.insert(name);
+        }
         labels.push(relative.to_string());
         transaction.moved.push(MovedArtifact {
             original: worktree.join(relative),
@@ -705,7 +781,6 @@ fn parse_signature(value: &Value) -> Result<Vec<TreeEntry>, String> {
             .ok_or_else(|| "signature path is invalid".to_string())?;
         if relative != "."
             && (relative.starts_with('/')
-                || relative.contains('\\')
                 || relative
                     .split('/')
                     .any(|part| matches!(part, "" | "." | "..")))
@@ -832,7 +907,7 @@ fn verify_artifact_progress(
         } else {
             purge_order(signature)
         };
-        let states = read_purge_journal(journal, &ordered)?;
+        let states = read_purge_journal(journal, &ordered, false)?;
         verify_journal_progress(root, &ordered, &states)
     } else {
         verify_purge_progress(root, signature, record)
@@ -865,36 +940,6 @@ fn legacy_purge_order(signature: &[TreeEntry]) -> Vec<TreeEntry> {
             .then_with(|| b.relative.cmp(&a.relative))
     });
     ordered
-}
-
-fn known_generated_path(path: &str) -> bool {
-    let path = Path::new(path);
-    if path.is_absolute()
-        || path.to_string_lossy().contains('\\')
-        || path
-            .to_string_lossy()
-            .split('/')
-            .any(|part| matches!(part, "" | "." | ".."))
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        || path
-            .components()
-            .any(|component| component == Component::Normal(OsStr::new(".direnv")))
-    {
-        return false;
-    }
-    matches!(
-        path.to_str(),
-        Some(
-            ".pre-commit-config.yaml"
-                | ".pytest_cache"
-                | ".ruff_cache"
-                | "target"
-                | "rust/target"
-                | "result"
-        )
-    ) || path.file_name() == Some(OsStr::new("__pycache__"))
 }
 
 fn transaction_record_mut<'a>(
@@ -964,7 +1009,7 @@ fn purge_tree(transaction: &mut Transaction, moved: &MovedArtifact) -> Result<()
     let legacy_progress =
         record.get("purge_cursor").is_some() || record.get("purge_pending").is_some();
     let mut states = if journal_meta.is_ok() && !legacy_progress {
-        read_purge_journal(&moved.journal, &ordered)?
+        read_purge_journal(&moved.journal, &ordered, true)?
     } else {
         let mut states = Vec::new();
         if legacy_progress {
@@ -1186,6 +1231,7 @@ fn append_purge_journal(
 fn read_purge_journal(
     path: &Path,
     ordered: &[TreeEntry],
+    repair_incomplete_tail: bool,
 ) -> Result<Vec<Option<PurgeJournalState>>, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect artifact purge journal: {error}"))?;
@@ -1204,14 +1250,16 @@ fn read_purge_journal(
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |index| index + 1);
-        let journal = fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|error| format!("cannot repair artifact purge journal tail: {error}"))?;
-        journal
-            .set_len(valid_len as u64)
-            .and_then(|()| journal.sync_all())
-            .map_err(|error| format!("cannot repair artifact purge journal tail: {error}"))?;
+        if repair_incomplete_tail {
+            let journal = fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|error| format!("cannot repair artifact purge journal tail: {error}"))?;
+            journal
+                .set_len(valid_len as u64)
+                .and_then(|()| journal.sync_all())
+                .map_err(|error| format!("cannot repair artifact purge journal tail: {error}"))?;
+        }
         bytes.truncate(valid_len);
     }
     for line in bytes
@@ -1372,8 +1420,7 @@ fn verify_one(path: &Path, entry: &TreeEntry) -> Result<(), String> {
         ));
     }
     if entry.kind == "file" && !entry.link_or_digest.is_empty() {
-        let bytes = read_regular_nofollow(path, &metadata)?;
-        let digest = format!("sha256:{}", hex(&Sha256::digest(bytes)));
+        let digest = hash_regular_file_nofollow(path, &metadata)?;
         if digest != entry.link_or_digest {
             return Err(format!(
                 "signed file changed before purge: {}",
@@ -1492,7 +1539,9 @@ fn verify_signature(root: &Path, signature: &[TreeEntry], _worktree: &Path) -> R
         if kind != root_entry.kind {
             return Err(format!("artifact root type changed: {}", root.display()));
         }
-        if kind == "symlink"
+        if kind == "file" && !root_entry.link_or_digest.is_empty() {
+            verify_one(root, root_entry)?;
+        } else if kind == "symlink"
             && fs::read_link(root)
                 .ok()
                 .and_then(|target| target.to_str().map(str::to_string))
@@ -1979,7 +2028,16 @@ pub fn inspect_plan(
     let build_outputs =
         options.discard_build_outputs || options.discard_all || options.preserve_generated;
     let include_config = options.discard_all || options.preserve_generated;
-    let roots = generated_roots(&status, caches, build_outputs, include_config)?;
+    let rules = artifact_config::load(main_worktree)?;
+    let include_configured = options.discard_all || options.preserve_generated;
+    let roots = generated_roots(
+        &status,
+        caches,
+        build_outputs,
+        include_config,
+        include_configured,
+        &rules,
+    )?;
     let mut generated = Vec::new();
     for relative in &roots {
         let root_bytes = relative.as_os_str().as_bytes();
@@ -2016,7 +2074,11 @@ pub fn inspect_plan(
         let path = worktree.join(relative);
         let allow_symlink =
             relative == Path::new("result") || relative == Path::new(PRECOMMIT_CONFIG);
-        let signature = sign_tree(&path, worktree, allow_symlink, false, false)?;
+        let signature = if rules.generated_artifacts.contains(relative) {
+            sign_configured_artifact(&path, worktree)?
+        } else {
+            sign_tree(&path, worktree, allow_symlink, false, false)?
+        };
         let is_build = matches!(relative.to_str(), Some("result" | "target" | "rust/target"));
         generated.push(SignedArtifact {
             path,
@@ -2257,14 +2319,12 @@ pub fn generated_roots(
     caches: bool,
     build_outputs: bool,
     generated_config: bool,
+    include_configured: bool,
+    rules: &artifact_config::Rules,
 ) -> Result<Vec<PathBuf>, String> {
     let mut candidates = BTreeSet::new();
     for entry in status {
         if entry.code != *b"!!" && entry.code != *b"??" {
-            continue;
-        }
-        if generated_config && entry.path == PRECOMMIT_CONFIG.as_bytes() {
-            candidates.insert(PathBuf::from(PRECOMMIT_CONFIG));
             continue;
         }
         let path = std::str::from_utf8(&entry.path)
@@ -2273,26 +2333,49 @@ pub fn generated_roots(
         if parts.is_empty() || parts[0] == ".direnv" {
             continue;
         }
-        if caches && matches!(parts[0], ".pytest_cache" | ".ruff_cache") {
-            candidates.insert(PathBuf::from(parts[0]));
-            continue;
-        }
-        if build_outputs
-            && (parts[0] == "result"
-                || parts[0] == "target"
-                || parts.get(..2) == Some(["rust", "target"].as_slice()))
-        {
-            candidates.insert(match parts[0] {
-                "result" => PathBuf::from("result"),
-                "target" => PathBuf::from("target"),
-                _ => PathBuf::from("rust/target"),
-            });
-            continue;
+        if caches {
+            candidates.extend(
+                rules
+                    .cache_roots
+                    .iter()
+                    .filter(|root| configured_path_contains(path, root))
+                    .cloned(),
+            );
         }
         if caches {
-            if let Some(index) = parts.iter().position(|part| *part == "__pycache__") {
+            if let Some(index) = parts
+                .iter()
+                .position(|part| rules.cache_directory_names.contains(*part))
+            {
                 candidates.insert(parts[..=index].iter().collect::<PathBuf>());
             }
+        }
+        if build_outputs {
+            candidates.extend(
+                rules
+                    .build_output_roots
+                    .iter()
+                    .filter(|root| configured_path_contains(path, root))
+                    .cloned(),
+            );
+        }
+        if generated_config {
+            candidates.extend(
+                rules
+                    .generated_config_roots
+                    .iter()
+                    .filter(|root| configured_path_contains(path, root))
+                    .cloned(),
+            );
+        }
+        if include_configured {
+            candidates.extend(
+                rules
+                    .generated_artifacts
+                    .iter()
+                    .filter(|root| configured_path_contains(path, root))
+                    .cloned(),
+            );
         }
     }
 
@@ -2314,6 +2397,14 @@ pub fn generated_roots(
     Ok(roots)
 }
 
+fn configured_path_contains(path: &str, root: &Path) -> bool {
+    let root = root.to_string_lossy();
+    path == root.as_ref()
+        || path
+            .strip_prefix(root.as_ref())
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub fn sign_tree(
     root: &Path,
     worktree: &Path,
@@ -2329,6 +2420,44 @@ pub fn sign_tree(
         allow_nested_symlinks,
         Path::new("/nix/store"),
     )
+}
+
+fn sign_configured_artifact(path: &Path, worktree: &Path) -> Result<Vec<TreeEntry>, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect configured generated artifact {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "configured generated artifact must be a regular file: {}",
+            path.display()
+        ));
+    }
+    let mut signature = sign_tree(path, worktree, false, false, false)?;
+    if signature.len() != 1 {
+        return Err(format!(
+            "configured generated artifact is not a single file: {}",
+            path.display()
+        ));
+    }
+    let entry = &mut signature[0];
+    if entry.kind != "file"
+        || entry.device != metadata.dev()
+        || entry.inode != metadata.ino()
+        || entry.mode != metadata.mode()
+        || entry.size != metadata.size()
+        || entry.mtime_ns
+            != metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128
+    {
+        return Err(format!(
+            "configured generated artifact changed while signing: {}",
+            path.display()
+        ));
+    }
+    entry.link_or_digest = hash_regular_file_nofollow(path, &metadata)?;
+    Ok(signature)
 }
 
 fn sign_tree_with_store(
@@ -2642,6 +2771,60 @@ fn read_regular_nofollow(path: &Path, expected: &fs::Metadata) -> Result<Vec<u8>
         ));
     }
     Ok(bytes)
+}
+
+fn hash_regular_file_nofollow(path: &Path, expected: &fs::Metadata) -> Result<String, String> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("cannot safely open {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect open file {}: {error}", path.display()))?;
+    if !opened.is_file()
+        || opened.dev() != expected.dev()
+        || opened.ino() != expected.ino()
+        || opened.mode() != expected.mode()
+        || opened.size() != expected.size()
+        || opened.mtime() != expected.mtime()
+        || opened.mtime_nsec() != expected.mtime_nsec()
+    {
+        return Err(format!(
+            "generated artifact changed while opening: {}",
+            path.display()
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| {
+            format!("cannot hash generated artifact {}: {error}", path.display())
+        })?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(|error| {
+        format!(
+            "cannot re-check generated artifact {}: {error}",
+            path.display()
+        )
+    })?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.mode() != opened.mode()
+        || after.size() != opened.size()
+        || after.mtime() != opened.mtime()
+        || after.mtime_nsec() != opened.mtime_nsec()
+    {
+        return Err(format!(
+            "generated artifact changed while hashing: {}",
+            path.display()
+        ));
+    }
+    Ok(format!("sha256:{}", hex(&digest.finalize())))
 }
 
 fn mount_points() -> Result<BTreeSet<PathBuf>, String> {
@@ -2971,6 +3154,8 @@ pub fn status(worktree: &Path) -> Result<Vec<StatusEntry>, String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::process::Command;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn temp(name: &str) -> PathBuf {
         let path =
@@ -2980,8 +3165,25 @@ mod tests {
         path
     }
 
+    fn git(root: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     #[test]
     fn selects_only_explicit_generated_roots_and_collapses_nested_roots() {
+        let rules = artifact_config::load(None).unwrap();
         let status = [
             StatusEntry {
                 code: *b"!!",
@@ -3001,12 +3203,318 @@ mod tests {
             },
         ];
         assert_eq!(
-            generated_roots(&status, true, true, false).unwrap(),
+            generated_roots(&status, true, true, false, false, &rules).unwrap(),
             vec![PathBuf::from("target"), PathBuf::from("src/__pycache__")]
         );
-        assert!(generated_roots(&status, false, false, false)
+        assert!(generated_roots(&status, false, false, false, false, &rules)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn selects_repository_configured_artifacts_only_when_cleanup_was_requested() {
+        let mut rules = artifact_config::load(None).unwrap();
+        rules
+            .generated_artifacts
+            .insert(PathBuf::from("output.csv"));
+        let status = [
+            StatusEntry {
+                code: *b"!!",
+                path: b"output.csv".to_vec(),
+            },
+            StatusEntry {
+                code: *b"??",
+                path: b"unlisted.csv".to_vec(),
+            },
+        ];
+        assert!(generated_roots(&status, false, false, false, false, &rules)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            generated_roots(&status, false, false, false, true, &rules).unwrap(),
+            vec![PathBuf::from("output.csv")]
+        );
+    }
+
+    #[test]
+    fn inspect_plan_uses_committed_repository_artifact_configuration() {
+        let root = temp("repo-configured-artifact");
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                arguments,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "wtctl test"]);
+        git(&["config", "user.email", "wtctl-test@example.invalid"]);
+        fs::write(root.join(".gitignore"), "output.csv\n").unwrap();
+        fs::write(
+            root.join(artifact_config::REPO_CONFIG),
+            br#"{"schema_version":1,"generated_artifacts":["output.csv"]}"#,
+        )
+        .unwrap();
+        git(&["add", ".gitignore", artifact_config::REPO_CONFIG]);
+        git(&["commit", "-q", "-m", "artifact config"]);
+        fs::write(root.join("output.csv"), "synthetic output\n").unwrap();
+
+        let plan = inspect_plan(
+            &root,
+            Some(&root),
+            Options {
+                discard_all: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.generated.len(), 1);
+        assert_eq!(plan.generated[0].path, root.join("output.csv"));
+        fs::remove_file(root.join("output.csv")).unwrap();
+        fs::create_dir(root.join("output.csv")).unwrap();
+        assert!(inspect_plan(
+            &root,
+            Some(&root),
+            Options {
+                discard_all: true,
+                ..Options::default()
+            },
+        )
+        .unwrap_err()
+        .contains("must be a regular file"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_file_signature_detects_same_inode_same_size_rewrite_with_restored_mtime() {
+        let worktree = temp("root-file-signature");
+        let path = worktree.join("ranked_report.md");
+        fs::write(&path, b"original").unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let signature = sign_configured_artifact(&path, &worktree).unwrap();
+
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all(b"modified").unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(
+            UNIX_EPOCH + Duration::new(original.mtime() as u64, original.mtime_nsec() as u32),
+        ))
+        .unwrap();
+
+        let changed = fs::metadata(&path).unwrap();
+        assert_eq!(changed.ino(), original.ino());
+        assert_eq!(changed.size(), original.size());
+        assert_eq!(changed.mtime(), original.mtime());
+        assert_eq!(changed.mtime_nsec(), original.mtime_nsec());
+        assert!(verify_signature(&path, &signature, &worktree).is_err());
+        let _ = fs::remove_dir_all(worktree);
+    }
+
+    #[test]
+    fn preserved_cache_with_special_ancestor_components_can_be_purged() {
+        let fixture = temp("configured-cache-quarantine");
+        let repo = fixture.join("repo");
+        let state_home = fixture.join("state");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&state_home).unwrap();
+        let task = repo.join("fake-task");
+        let common = repo.join(".git");
+        let admin = common.join("worktrees/fake-task");
+        let artifact_paths = [
+            task.join("experiments[1]/__pycache__"),
+            task.join("experiments\\1/__pycache__"),
+            task.join("subproject/.direnv/__pycache__"),
+        ];
+        let repo_name = format!("wtctl-test-{}", std::process::id());
+        let state_namespace = state_home.join(&repo_name);
+
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "wtctl test"]);
+        git(
+            &repo,
+            &["config", "user.email", "wtctl-test@example.invalid"],
+        );
+        fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-q", "-m", "fixture"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        fs::create_dir_all(&admin).unwrap();
+        for path in &artifact_paths {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("cache.pyc"), b"cache bytes").unwrap();
+        }
+
+        let plan = Plan {
+            generated: artifact_paths
+                .iter()
+                .map(|path| SignedArtifact {
+                    path: path.clone(),
+                    signature: sign_tree(path, &task, false, false, false).unwrap(),
+                    preserve: true,
+                })
+                .collect(),
+            ..Plan::default()
+        };
+        let mut transaction = begin_transaction_in_state(
+            &plan,
+            BeginTransactionContext {
+                repo_name: &repo_name,
+                state_home: &state_home,
+                common: &common,
+                worktree: &task,
+                admin: &admin,
+                head: &head,
+                branch: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quarantine(&mut transaction, &plan, &task).unwrap();
+        let report = finish_transaction(&mut transaction).unwrap();
+        let operation = report.operation.unwrap();
+        fs::remove_dir_all(&task).unwrap();
+
+        let purged = purge_preserved_in_state(PurgeContext {
+            state_home: &state_home,
+            repo_root: &repo,
+            repo_name: &repo_name,
+            common: &common,
+            main_ref: "refs/heads/main",
+            operation_id: operation.file_name().unwrap().to_str().unwrap(),
+            discard_unverified_direnv: false,
+            dry_run: false,
+        })
+        .unwrap();
+        assert_eq!(
+            purged,
+            vec![
+                "experiments[1]/__pycache__",
+                "experiments\\1/__pycache__",
+                "subproject/.direnv/__pycache__"
+            ]
+        );
+        let _ = fs::remove_dir_all(state_namespace);
+        let _ = fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn preserved_custom_artifact_can_be_purged_after_repository_policy_changes() {
+        let fixture = temp("custom-artifact-policy-purge");
+        let repo = fixture.join("repo");
+        let state_home = fixture.join("state");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&state_home).unwrap();
+        let task = repo.join("fake-task");
+        let common = repo.join(".git");
+        let admin = common.join("worktrees/fake-task");
+        let artifact_path = task.join("ranked_report.md");
+        let repo_name = format!("wtctl-policy-test-{}", std::process::id());
+
+        let git = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                arguments,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "wtctl test"]);
+        git(&["config", "user.email", "wtctl-test@example.invalid"]);
+        fs::write(
+            repo.join(artifact_config::REPO_CONFIG),
+            br#"{"schema_version":1,"generated_artifacts":["ranked_report.md"]}"#,
+        )
+        .unwrap();
+        git(&["add", artifact_config::REPO_CONFIG]);
+        git(&["commit", "-q", "-m", "add artifact policy"]);
+        let original_head = git(&["rev-parse", "HEAD"]);
+        assert!(artifact_config::load(Some(&repo))
+            .unwrap()
+            .generated_artifacts
+            .contains(Path::new("ranked_report.md")));
+
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(&task).unwrap();
+        fs::write(&artifact_path, "preserved report\n").unwrap();
+        let plan = Plan {
+            generated: vec![SignedArtifact {
+                path: artifact_path.clone(),
+                signature: sign_configured_artifact(&artifact_path, &task).unwrap(),
+                preserve: true,
+            }],
+            ..Plan::default()
+        };
+        let mut transaction = begin_transaction_in_state(
+            &plan,
+            BeginTransactionContext {
+                repo_name: &repo_name,
+                state_home: &state_home,
+                common: &common,
+                worktree: &task,
+                admin: &admin,
+                head: &original_head,
+                branch: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quarantine(&mut transaction, &plan, &task).unwrap();
+        let report = finish_transaction(&mut transaction).unwrap();
+        let operation = report.operation.unwrap();
+        fs::remove_dir_all(&task).unwrap();
+
+        fs::write(
+            repo.join(artifact_config::REPO_CONFIG),
+            br#"{"schema_version":1,"generated_artifacts":[]}"#,
+        )
+        .unwrap();
+        git(&["add", artifact_config::REPO_CONFIG]);
+        git(&["commit", "-q", "-m", "remove artifact policy"]);
+        assert!(artifact_config::load(Some(&repo))
+            .unwrap()
+            .generated_artifacts
+            .is_empty());
+
+        let moved = transaction.moved[0].clone();
+        let ordered = purge_order(&moved.signature);
+        let mut journal = create_purge_journal(&moved.journal).unwrap();
+        append_purge_journal(&mut journal, 0, &ordered[0], "pending").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        transaction.manifest["generated_caches"][0]["purge_state"] =
+            Value::String("purging".into());
+        transaction.manifest["generated_caches"][0]["purge_journal"] =
+            Value::String("purge-generated-cache-000.jsonl".into());
+        write_manifest(&transaction, "purging_preserved", false).unwrap();
+        fs::remove_file(&moved.quarantine).unwrap();
+
+        let purged = purge_preserved_in_state(PurgeContext {
+            state_home: &state_home,
+            repo_root: &repo,
+            repo_name: &repo_name,
+            common: &common,
+            main_ref: "refs/heads/main",
+            operation_id: operation.file_name().unwrap().to_str().unwrap(),
+            discard_unverified_direnv: false,
+            dry_run: false,
+        })
+        .unwrap();
+        assert_eq!(purged, vec!["ranked_report.md"]);
+        let _ = fs::remove_dir_all(fixture);
     }
 
     #[test]
@@ -3139,18 +3647,18 @@ mod tests {
             append_purge_journal(&mut journal, index, entry, "pending").unwrap();
         }
         journal.sync_all().unwrap();
-        let pending = read_purge_journal(&journal_path, &ordered).unwrap();
+        let pending = read_purge_journal(&journal_path, &ordered, false).unwrap();
         verify_journal_progress(&artifact, &ordered, &pending).unwrap();
         fs::remove_file(artifact.join("entry")).unwrap();
         verify_journal_progress(
             &artifact,
             &ordered,
-            &read_purge_journal(&journal_path, &ordered).unwrap(),
+            &read_purge_journal(&journal_path, &ordered, false).unwrap(),
         )
         .unwrap();
         append_purge_journal(&mut journal, 0, &ordered[0], "deleted").unwrap();
         journal.sync_all().unwrap();
-        let states = read_purge_journal(&journal_path, &ordered).unwrap();
+        let states = read_purge_journal(&journal_path, &ordered, false).unwrap();
         assert_eq!(
             states,
             [
@@ -3165,6 +3673,33 @@ mod tests {
         verify_journal_progress(&artifact, &ordered, &states).unwrap();
         fs::write(artifact.join("unexpected"), b"not signed").unwrap();
         assert!(verify_journal_progress(&artifact, &ordered, &states).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dry_run_journal_read_does_not_repair_an_incomplete_tail() {
+        let root = temp("purge-journal-dry-run");
+        let artifact = root.join("artifact");
+        fs::create_dir(&artifact).unwrap();
+        fs::write(artifact.join("entry"), b"selected output").unwrap();
+        let signature = sign_tree(&artifact, &root, false, false, false).unwrap();
+        let ordered = purge_order(&signature);
+        let journal_path = root.join("purge.jsonl");
+        let mut journal = create_purge_journal(&journal_path).unwrap();
+        append_purge_journal(&mut journal, 0, &ordered[0], "pending").unwrap();
+        journal.sync_all().unwrap();
+        journal.write_all(b"{\"index\":1").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        let before = fs::read(&journal_path).unwrap();
+
+        let states = read_purge_journal(&journal_path, &ordered, false).unwrap();
+        assert_eq!(states, [Some(PurgeJournalState::Pending)]);
+        assert_eq!(fs::read(&journal_path).unwrap(), before);
+
+        let repaired = read_purge_journal(&journal_path, &ordered, true).unwrap();
+        assert_eq!(repaired, [Some(PurgeJournalState::Pending)]);
+        assert!(fs::read(&journal_path).unwrap().ends_with(b"\n"));
         fs::remove_dir_all(root).unwrap();
     }
 

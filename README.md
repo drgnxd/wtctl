@@ -118,15 +118,40 @@ Hooks: an executable `reference-transaction` hook always blocks; a
 
 ## Generated artifacts and quarantine
 
-`finish` discards recognized generated artifacts by default: `.pytest_cache`,
+The built-in artifact roots live in `src/artifact_defaults.json`: `.pytest_cache`,
 `.ruff_cache`, `__pycache__`, root `target`, `rust/target`, the root `result`
-symlink, a marked `git-hooks.nix` `.pre-commit-config.yaml`, and a verified
-Nix-direnv `.direnv` cache, including stale caches whose correctly formed direct
-`/nix/store` links have been garbage-collected. The full supported layout must
-still match; unknown `.direnv` layouts are retained. Direct
+symlink, and the marked `git-hooks.nix` `.pre-commit-config.yaml`. A verified
+Nix-direnv `.direnv` cache has separate validation, including stale caches whose
+correctly formed direct `/nix/store` links have been garbage-collected. The full
+supported layout must still match; unknown `.direnv` layouts are retained. Direct
 `remove` keeps generated artifact handling opt-in through
 `--discard-generated-caches`, `--discard-generated-build-outputs`,
 `--discard-direnv-cache`, or `--discard-generated-artifacts`.
+
+Repository-specific generated files are declared in a tracked root `.wtctl.json`
+file:
+
+```json
+{
+  "schema_version": 1,
+  "generated_artifacts": [
+    "output.csv",
+    "ranked_report.md"
+  ]
+}
+```
+
+The list contains exact repository-root regular-file paths, not globs or
+directories. WTCTL reads the configuration from the committed `HEAD` of the
+main worktree; an untracked configuration file is an error and task-worktree
+edits cannot authorize their own cleanup. Configured artifacts follow the same
+quarantine policy as built-in artifacts: default `finish` discards them, while
+`--preserve-generated-artifacts` retains them in quarantine. The JSON schema is
+validated strictly and rejects traversal, absolute paths, reserved roots, and
+unknown fields; each configured output must exist as a regular non-symlink file
+when selected for cleanup. Purge validates the saved manifest path and signature
+independently of the current repository configuration, so a later policy
+change does not strand a retained artifact.
 
 `reap` also selects only disposable Python caches (`.pytest_cache`,
 `.ruff_cache`, and `__pycache__`) for cleanup. Other ignored or untracked data

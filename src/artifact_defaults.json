@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "cache_roots": [
+    ".pytest_cache",
+    ".ruff_cache"
+  ],
+  "cache_directory_names": [
+    "__pycache__"
+  ],
+  "build_output_roots": [
+    "target",
+    "rust/target",
+    "result"
+  ],
+  "generated_config_roots": [
+    ".pre-commit-config.yaml"
+  ]
+}
