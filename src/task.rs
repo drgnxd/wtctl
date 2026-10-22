@@ -517,6 +517,15 @@ fn settle(e: &Entry, probe: Option<Probe>) -> (Facts, Option<Vec<String>>) {
 
 /// Status, index flags, and integration for several worktrees, a bounded batch at a time.
 pub fn facts(entries: &[&Entry], main_ref: &str) -> Result<Vec<Facts>, Fail> {
+    facts_excluding(entries, main_ref, &[])
+}
+
+/// Counts commits reachable from retained refs as preserved alongside `main_ref`.
+pub fn facts_excluding(
+    entries: &[&Entry],
+    main_ref: &str,
+    kept: &[String],
+) -> Result<Vec<Facts>, Fail> {
     let mut out = Vec::with_capacity(entries.len());
     for chunk in entries.chunks(PARALLEL_WORKTREES) {
         let mut probes = Vec::with_capacity(chunk.len());
@@ -535,6 +544,9 @@ pub fn facts(entries: &[&Entry], main_ref: &str) -> Result<Vec<Facts>, Fail> {
                     let mut child = git::spawn(&e.path, &["rev-list", "--count", "--stdin"], true)?;
                     let mut input = revs.join("\n");
                     input.push_str(&format!("\n^{main_ref}\n"));
+                    for oid in kept {
+                        input.push_str(&format!("^{oid}\n"));
+                    }
                     if let Some(mut stdin) = child.stdin.take() {
                         let _ = stdin.write_all(input.as_bytes());
                     }

@@ -1,4 +1,4 @@
-//! Listing and age-based cleanup of preserved quarantines and abandoned task tips.
+//! Listing and age-based cleanup of preserved quarantines and kept task tips.
 
 use super::*;
 
@@ -107,7 +107,7 @@ pub fn cmd_quarantine(a: &Args) -> R<()> {
     Ok(())
 }
 
-/// Seconds since an abandoned ref was created, from its oldest reflog entry. The
+/// Seconds since a kept ref was created, from its oldest reflog entry. The
 /// entry's own time is used (`%gd`), not the date of the commit it names.
 fn ref_age_secs(repo: &Repo, refname: &str) -> Option<i64> {
     let text = git::run(
@@ -180,37 +180,35 @@ pub fn cmd_prune(a: &Args) -> R<()> {
         if !dry_run {
             deny_reference_hook(&repo)?;
         }
-        let listing = git::run(
-            &repo.root,
-            [
-                "for-each-ref",
-                "--format=%(refname) %(objectname)",
-                abandon::PREFIX,
-            ],
-        )?;
-        for line in listing.lines() {
-            let Some((refname, oid)) = line.split_once(' ') else {
-                continue;
-            };
-            let Some(age) = ref_age_secs(&repo, refname) else {
-                actions.push(json!({"kind": "ref", "id": refname, "state": "skipped", "reason": "no creation time in the reflog"}));
-                continue;
-            };
-            if age < cutoff {
-                continue;
+        for prefix in [abandon::PREFIX, "refs/wtctl/superseded/"] {
+            let listing = git::run(
+                &repo.root,
+                ["for-each-ref", "--format=%(refname) %(objectname)", prefix],
+            )?;
+            for line in listing.lines() {
+                let Some((refname, oid)) = line.split_once(' ') else {
+                    continue;
+                };
+                let Some(age) = ref_age_secs(&repo, refname) else {
+                    actions.push(json!({"kind": "ref", "id": refname, "state": "skipped", "reason": "no creation time in the reflog"}));
+                    continue;
+                };
+                if age < cutoff {
+                    continue;
+                }
+                if dry_run {
+                    actions.push(
+                        json!({"kind": "ref", "id": refname, "state": "would-delete", "head": oid}),
+                    );
+                    continue;
+                }
+                let deleted = git::output(&repo.root, ["update-ref", "-d", refname, oid])?;
+                actions.push(if deleted.status.success() {
+                    json!({"kind": "ref", "id": refname, "state": "deleted", "head": oid})
+                } else {
+                    json!({"kind": "ref", "id": refname, "state": "skipped", "reason": git::stderr_of(&deleted)})
+                });
             }
-            if dry_run {
-                actions.push(
-                    json!({"kind": "ref", "id": refname, "state": "would-delete", "head": oid}),
-                );
-                continue;
-            }
-            let deleted = git::output(&repo.root, ["update-ref", "-d", refname, oid])?;
-            actions.push(if deleted.status.success() {
-                json!({"kind": "ref", "id": refname, "state": "deleted", "head": oid})
-            } else {
-                json!({"kind": "ref", "id": refname, "state": "skipped", "reason": git::stderr_of(&deleted)})
-            });
         }
     }
     if !dry_run && !actions.is_empty() {

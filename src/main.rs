@@ -112,6 +112,7 @@ mod finish_plan;
 mod housekeeping;
 mod remote;
 mod show;
+mod superseded;
 
 #[derive(Debug)]
 pub struct Fail {
@@ -150,6 +151,7 @@ fn cmd_capabilities(a: &Args) -> R<()> {
         "show": true,
         "describe": true,
         "finish_dry_run": true,
+        "finish_strategies": ["merge"],
         "abandon": true,
         "restore": true,
         "doctor": true,
@@ -3348,6 +3350,7 @@ fn cmd_finish(a: &Args) -> R<()> {
             require_owner(marker)?;
         }
     }
+    let kept = superseded::kept_tips(&repo, &display_id);
     let finish_head = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before integration"))?;
@@ -3383,7 +3386,7 @@ fn cmd_finish(a: &Args) -> R<()> {
     if let Some(marker) = &marker {
         require_owner(marker)?;
     }
-    let post_integration_facts = task::facts(&[&fresh], &refname)?;
+    let post_integration_facts = task::facts_excluding(&[&fresh], &refname, &kept)?;
     post_integration_facts
         .first()
         .cloned()
@@ -3444,6 +3447,7 @@ fn cmd_finish(a: &Args) -> R<()> {
         &removal,
         RemovalContext {
             main_ref: &refname,
+            kept: &kept,
             cwds: &procinfo::scan_cwds(),
             annex,
             cleanup,
@@ -3873,6 +3877,7 @@ fn verify_removal_authority(repo: &Repo, entry: &Entry, authority: &RemovalAutho
 
 struct RemovalContext<'a> {
     main_ref: &'a str,
+    kept: &'a [String],
     cwds: &'a procinfo::CwdScan,
     annex: bool,
     cleanup: artifact::Options,
@@ -3887,6 +3892,7 @@ fn remove_worktree(
 ) -> R<()> {
     let RemovalContext {
         main_ref,
+        kept,
         cwds,
         annex,
         cleanup,
@@ -3940,7 +3946,7 @@ fn remove_worktree(
     }
     let expected_tree = format!("{expected_head}^{{tree}}");
     verify_tracked_filter_safety(repo, &entry.path, &expected_tree, annex)?;
-    let facts = task::facts(&[entry], main_ref)?;
+    let facts = task::facts_excluding(&[entry], main_ref, kept)?;
     facts
         .first()
         .cloned()
@@ -3990,7 +3996,7 @@ fn remove_worktree(
             return refuse(format!("{id} changed during git annex restage"));
         }
         verify_removal_authority(repo, &refreshed, authority)?;
-        let facts = task::facts(&[&refreshed], main_ref)?;
+        let facts = task::facts_excluding(&[&refreshed], main_ref, kept)?;
         facts
             .first()
             .cloned()
@@ -4034,7 +4040,7 @@ fn remove_worktree(
                 Fail::new(4, format!("cannot quarantine worktree artifacts: {why}"))
             })?;
         }
-        let facts = task::facts(&[entry], main_ref)?;
+        let facts = task::facts_excluding(&[entry], main_ref, kept)?;
         facts
             .first()
             .cloned()
@@ -4275,6 +4281,7 @@ fn cmd_reap(a: &Args) -> R<()> {
                     &removal,
                     RemovalContext {
                         main_ref: &main_ref,
+                        kept: &[],
                         cwds: &cwds,
                         annex,
                         cleanup: artifact::Options {
@@ -4568,7 +4575,12 @@ fn cmd_remove(a: &Args) -> R<()> {
         main_ref = tip;
         abandoned_ref = Some(abandon::ref_name(&authority.worktree_id));
     }
-    let facts = task::facts(&[&entry], &main_ref)?;
+    let kept = if id.is_some() {
+        superseded::kept_tips(&repo, &authority.worktree_id)
+    } else {
+        Vec::new()
+    };
+    let facts = task::facts_excluding(&[&entry], &main_ref, &kept)?;
     let f = facts.first().cloned().unwrap_or_default();
     f.removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
         .or_else(|why| refuse(format!("{}: {why}", authority.worktree_id)))?;
@@ -4662,6 +4674,7 @@ fn cmd_remove(a: &Args) -> R<()> {
         &authority,
         RemovalContext {
             main_ref: &main_ref,
+            kept: &kept,
             cwds: &procinfo::scan_cwds(),
             annex,
             cleanup,

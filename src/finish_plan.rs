@@ -81,6 +81,7 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
     };
     let (main, refname) = main_ref(a, &repo.root)?;
     let (entry, marker) = repo.find_task(id)?;
+    let kept = superseded::kept_tips(&repo, id);
     let allow_hooks = a.flag("--allow-repository-hooks");
     let allow_filter = a.flag("--allow-annex-filter");
     let allow_signing = a.flag("--allow-commit-signing");
@@ -196,7 +197,7 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
         }
     }
 
-    let facts = task::facts(&[&entry], &refname)?
+    let facts = task::facts_excluding(&[&entry], &refname, &kept)?
         .into_iter()
         .next()
         .unwrap_or_default();
@@ -282,6 +283,7 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
                 "task_tip": task_tip,
                 "new_commits": new_commits,
                 "main_ahead_commits": behind,
+                "strategy": "merge",
                 "required_flags": required,
                 "checks": checks.iter().map(|check| json!({
                     "name": check.name,

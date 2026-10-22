@@ -347,6 +347,7 @@ fn capabilities_reports_the_lifecycle_contract() {
     ] {
         assert_eq!(output[key], true, "{key}");
     }
+    assert_eq!(output["finish_strategies"], serde_json::json!(["merge"]));
 }
 
 /// A pid with no process right now: a reaped child's pid, confirmed by ESRCH.
@@ -4390,6 +4391,7 @@ fn finish_dry_run_reports_requirements_without_changing_anything() {
     .unwrap();
     assert_eq!(report["status"], "ok");
     assert_eq!(report["integration"], "fast-forward");
+    assert_eq!(report["strategy"], "merge");
     assert_eq!(report["new_commits"], 1);
     assert_eq!(report["task_tip"], tip);
     assert!(report["required_flags"]
@@ -4970,6 +4972,76 @@ fn prune_ages_abandoned_refs_by_reflog_time_not_commit_date() {
     // Neither deleted nor skipped: the age was read, and it is new.
     assert_eq!(report["actions"].as_array().unwrap().len(), 0, "{report}");
     git(&env.repo, &["rev-parse", "--verify", &ref_name]);
+}
+
+#[test]
+fn legacy_superseded_refs_remain_visible_and_preserved_for_cleanup() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("legacy-superseded");
+    let old_tip = commit_file(&path, "legacy.txt", "kept\n");
+    let base = env.main_oid();
+    let tree = git(&path, &["rev-parse", &format!("{old_tip}^{{tree}}")]);
+    let squashed = git(
+        &env.repo,
+        &["commit-tree", &tree, "-p", &base, "-m", "legacy squash"],
+    );
+    git(&env.repo, &["reset", "--hard", &squashed]);
+    git(&path, &["reset", "--hard", &squashed]);
+    let legacy_ref = format!("refs/wtctl/superseded/{id}.1");
+    git(
+        &env.repo,
+        &[
+            "update-ref",
+            "--create-reflog",
+            "-m",
+            "legacy rewrite",
+            &legacy_ref,
+            &old_tip,
+        ],
+    );
+
+    let doctor: Value =
+        serde_json::from_str(&env.ok(&["doctor", "--repo", &repo, "--json"])).unwrap();
+    assert!(doctor.to_string().contains("superseded"));
+    let prune: Value = serde_json::from_str(&env.ok(&[
+        "prune",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--refs",
+        "--dry-run",
+        "--json",
+    ]))
+    .unwrap();
+    assert!(prune["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| { action["id"] == legacy_ref && action["state"] == "would-delete" }));
+
+    let preflight: Value = serde_json::from_str(&env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--dry-run",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(preflight["status"], "ok");
+    env.ok(&[
+        "finish",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert!(!path.exists());
+    assert_eq!(git(&env.repo, &["rev-parse", &legacy_ref]), old_tip);
 }
 
 #[test]

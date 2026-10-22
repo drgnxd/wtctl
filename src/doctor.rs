@@ -251,21 +251,20 @@ pub fn cmd_doctor(a: &Args) -> R<()> {
         }
     }
 
-    let count = git::run(
-        &repo.root,
-        ["for-each-ref", "--format=%(refname)", abandon::PREFIX],
-    )
-    .map(|text| text.lines().count())
-    .unwrap_or(0);
-    if count > 0 {
-        findings.push(finding(
-            "info",
-            "kept-refs",
-            format!(
-                "{count} abandoned task tip(s) are kept under {}",
-                abandon::PREFIX
-            ),
-        ));
+    for (prefix, label) in [
+        (abandon::PREFIX, "abandoned"),
+        ("refs/wtctl/superseded/", "superseded"),
+    ] {
+        let count = git::run(&repo.root, ["for-each-ref", "--format=%(refname)", prefix])
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
+        if count > 0 {
+            findings.push(finding(
+                "info",
+                "kept-refs",
+                format!("{count} {label} task tip(s) are kept under {prefix}"),
+            ));
+        }
     }
 
     let errors = findings.iter().filter(|f| f.severity == "error").count();

@@ -38,7 +38,7 @@ check. Supported system: aarch64-darwin.
 | `restore --repo <repo> --id <abandoned-id> --slug <slug>` | Start a new task from an abandoned task tip. |
 | `doctor --repo <repo> [--fix-stale-lock --external-writers-quiesced]` | Diagnose stale locks, broken markers, missing worktree paths, and orphaned work. |
 | `quarantine --repo <repo>` | List preserved artifact quarantines with age and size. |
-| `prune --repo <repo> --older-than-days <n> [--quarantine] [--refs] [--dry-run] --external-writers-quiesced` | Purge old quarantines and delete old kept task tips. |
+| `prune --repo <repo> --older-than-days <n> [--quarantine] [--refs] [--dry-run] --external-writers-quiesced` | Purge old quarantines and delete old abandoned or legacy superseded task tips. |
 | `--version`, `help <command>`, `<command> --help` | Version and per-command usage. |
 
 Hook-sensitive commands accept `--allow-repository-hooks`. Exit codes: 0 ok,
@@ -83,7 +83,7 @@ task worktree filter configuration, including per-worktree config overrides.
 After a crash or resume, `list --orphans` shows tasks whose owner is dead.
 Nothing is adopted automatically.
 
-## Inspecting, recovering, and finishing differently
+## Inspecting and recovering tasks
 
 - `create --session <id>` records the client session (otherwise
   `CLAUDE_CODE_SESSION_ID` or `OPENCODE_SESSION_ID` is used when set).
@@ -96,6 +96,8 @@ Nothing is adopted automatically.
   then every normal removal check runs against that tip, so a dirty worktree or
   reflog-only commits still refuse. `list --abandoned` shows what is kept and
   `restore` starts a new task from it.
+- `prune --refs` also handles legacy `refs/wtctl/superseded/` tips created by
+  earlier versions. Current versions no longer create these refs.
 - `finish --dry-run` takes no lock and changes nothing. It reports how the task
   would integrate (already integrated, fast-forward, or merge), runs the
   checks a real run would (owner, signing, hooks, filters, merge conflicts,
