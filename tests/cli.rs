@@ -1193,6 +1193,12 @@ fn finish_uses_the_supplied_integration_commit_message() {
     let (id, path) = env.create("finish-merge-message");
     commit_file(&path, "task.txt", "task\n");
     commit_file(&env.repo, "main.txt", "main\n");
+    let integration_message =
+        "chore: integrate main advance\n\nPreserve the full repository-specific message.";
+    write_commit_msg_hook(
+        &env,
+        "grep -q 'Preserve the full repository-specific message.' \"$1\"",
+    );
     let output = env.run(&[
         "finish",
         "--repo",
@@ -1200,8 +1206,9 @@ fn finish_uses_the_supplied_integration_commit_message() {
         "--id",
         &id,
         "--external-writers-quiesced",
+        "--allow-repository-hooks",
         "--integration-message",
-        "chore: integrate main advance",
+        integration_message,
     ]);
     assert!(
         output.status.success(),
@@ -1211,6 +1218,10 @@ fn finish_uses_the_supplied_integration_commit_message() {
     assert_eq!(
         git(&env.repo, &["log", "-1", "--format=%s", "main"]),
         "chore: integrate main advance"
+    );
+    assert_eq!(
+        git(&env.repo, &["log", "-1", "--format=%B", "main"]).trim_end(),
+        integration_message
     );
 }
 

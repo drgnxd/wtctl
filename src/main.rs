@@ -3184,14 +3184,8 @@ fn cmd_finish(a: &Args) -> R<()> {
         ));
     }
     let integration_message = integration_message_arg.unwrap_or("chore: integrate task worktree");
-    if integration_message.trim().is_empty()
-        || integration_message.contains('\n')
-        || integration_message.contains('\r')
-    {
-        return Err(Fail::new(
-            2,
-            "--integration-message must be a non-empty single line",
-        ));
+    if integration_message.trim().is_empty() {
+        return Err(Fail::new(2, "--integration-message must not be empty"));
     }
     if keep_worktree
         && (a.flag("--delete-branch")

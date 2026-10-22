@@ -234,8 +234,9 @@ by the target worktree's HEAD reflog, but never permits an unintegrated HEAD.
 When a finish operation must create an integration merge commit, filters are
 refused unless they are verified Git-annex filters and
 `--allow-annex-filter` is passed. A configured commit signer requires the
-separate `--allow-commit-signing` opt-in. `--integration-message` selects a
-repository-conforming merge subject.
+separate `--allow-commit-signing` opt-in. `--integration-message` supplies the
+complete repository-conforming commit message; embedded newlines can separate
+the subject and body.
 
 ## Legacy worktrees and Git-annex
 
