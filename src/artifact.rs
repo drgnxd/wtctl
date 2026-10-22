@@ -1,12 +1,12 @@
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString, OsStr};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -34,7 +34,7 @@ pub struct TreeEntry {
     pub link_or_digest: String,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Options {
     pub discard_direnv: bool,
     pub discard_caches: bool,
@@ -42,6 +42,7 @@ pub struct Options {
     pub discard_all: bool,
     pub preserve_generated: bool,
     pub allow_unreferenced_reflog: bool,
+    pub discard_artifact_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +50,7 @@ pub struct SignedArtifact {
     pub path: PathBuf,
     pub signature: Vec<TreeEntry>,
     pub preserve: bool,
+    pub one_off: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +71,17 @@ pub struct Plan {
     pub database_link: Option<DatabaseLink>,
 }
 
+pub struct KeptOneOffRecovery<'a> {
+    pub operation_id: &'a str,
+    pub repo_name: &'a str,
+    pub common: &'a Path,
+    pub worktree: &'a Path,
+    pub admin: &'a Path,
+    pub head: &'a str,
+    pub branch: Option<&'a str>,
+    pub relative: &'a Path,
+}
+
 #[derive(Clone, Debug)]
 pub struct MovedArtifact {
     pub original: PathBuf,
@@ -77,6 +90,7 @@ pub struct MovedArtifact {
     pub signature: Vec<TreeEntry>,
     pub preserve: bool,
     pub direnv: bool,
+    pub one_off: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +262,7 @@ fn begin_transaction_in_state(
                 "quarantine_path": operation.join(format!("generated-cache-{index:03}")),
                 "purge_journal": format!("purge-generated-cache-{index:03}.jsonl"),
                 "preserve": item.preserve,
+                "one_off": item.one_off,
                 "purge_state": "planned",
             })
         })
@@ -381,10 +396,19 @@ fn move_artifact(
         signature: artifact.signature.clone(),
         preserve: artifact.preserve,
         direnv,
+        one_off: artifact.one_off,
     });
     write_manifest(transaction, "artifact_move_started", false)?;
-    rename_noreplace(&artifact.path, &destination)?;
-    sync_dir(artifact.path.parent().unwrap_or(worktree))?;
+    if artifact.one_off {
+        let relative = artifact
+            .path
+            .strip_prefix(worktree)
+            .map_err(|_| "one-off artifact is outside the task worktree".to_string())?;
+        rename_one_off_from_worktree(worktree, relative, &destination, &artifact.signature)?;
+    } else {
+        rename_noreplace(&artifact.path, &destination)?;
+        sync_dir(artifact.path.parent().unwrap_or(worktree))?;
+    }
     sync_dir(&transaction.operation)?;
     verify_signature(&destination, &artifact.signature, worktree)?;
     write_manifest(transaction, "artifact_quarantined", false)
@@ -408,15 +432,32 @@ pub fn restore(
             verify_signature(&moved.original, &moved.signature, worktree)?;
             continue;
         }
-        if fs::symlink_metadata(&moved.original).is_ok() {
+        let original_exists = if moved.one_off {
+            let relative = moved
+                .original
+                .strip_prefix(worktree)
+                .map_err(|_| "one-off artifact is outside the task worktree".to_string())?;
+            one_off_path_exists(worktree, relative)?
+        } else {
+            fs::symlink_metadata(&moved.original).is_ok()
+        };
+        if original_exists {
             return Err(format!(
                 "artifact restore path is occupied: {}",
                 moved.original.display()
             ));
         }
         verify_signature(&moved.quarantine, &moved.signature, worktree)?;
-        rename_noreplace(&moved.quarantine, &moved.original)?;
-        sync_dir(moved.original.parent().unwrap_or(worktree))?;
+        if moved.one_off {
+            let relative = moved
+                .original
+                .strip_prefix(worktree)
+                .map_err(|_| "one-off artifact is outside the task worktree".to_string())?;
+            rename_one_off_to_worktree(&moved.quarantine, worktree, relative, &moved.signature)?;
+        } else {
+            rename_noreplace(&moved.quarantine, &moved.original)?;
+            sync_dir(moved.original.parent().unwrap_or(worktree))?;
+        }
     }
     write_manifest(transaction, "rollback_completed", false)?;
     remove_transaction_dir(transaction)
@@ -624,7 +665,10 @@ fn purge_preserved_in_state(context: PurgeContext<'_>) -> Result<Vec<String>, St
         let relative = record["path"]
             .as_str()
             .ok_or_else(|| "generated artifact path is malformed".to_string())?;
-        if !artifact_config::valid_quarantine_path(relative) {
+        if !artifact_config::valid_quarantine_path(relative)
+            && (record["one_off"] != true
+                || validate_one_off_artifact_path(Path::new(relative)).is_err())
+        {
             return Err(format!(
                 "unrecognized generated-artifact path in manifest: {relative}"
             ));
@@ -651,6 +695,10 @@ fn purge_preserved_in_state(context: PurgeContext<'_>) -> Result<Vec<String>, St
         }
         let archive = operation.join(&name);
         let signature = parse_signature(&record["signature"])?;
+        let one_off = record["one_off"] == true;
+        if one_off && !is_one_off_file_signature(&signature) {
+            return Err("one-off artifact quarantine must contain one signed regular file".into());
+        }
         verify_artifact_progress(&archive, &signature, record, &operation.join(&journal_name))?;
         if fs::symlink_metadata(&archive).is_ok() {
             allowed.insert(name);
@@ -663,6 +711,7 @@ fn purge_preserved_in_state(context: PurgeContext<'_>) -> Result<Vec<String>, St
             signature,
             preserve: false,
             direnv: false,
+            one_off,
         });
     }
     if transaction.manifest["direnv"].is_object() {
@@ -724,6 +773,7 @@ fn purge_preserved_in_state(context: PurgeContext<'_>) -> Result<Vec<String>, St
                 signature,
                 preserve: false,
                 direnv: true,
+                one_off: false,
             });
         }
     }
@@ -914,6 +964,328 @@ fn verify_artifact_progress(
     }
 }
 
+pub fn discard_one_off_for_kept_worktree(
+    plan: &Plan,
+    repo_name: &str,
+    common: &Path,
+    worktree: &Path,
+    admin: &Path,
+    head: &str,
+    branch: Option<&str>,
+) -> Result<FinishReport, String> {
+    let selected: Vec<_> = plan
+        .generated
+        .iter()
+        .filter(|artifact| artifact.one_off)
+        .cloned()
+        .collect();
+    if selected.len() != 1 || plan.generated.len() != 1 {
+        return Err("kept-worktree cleanup requires exactly one selected artifact".into());
+    }
+    let relative = selected[0]
+        .path
+        .strip_prefix(worktree)
+        .map_err(|_| "one-off artifact is outside the task worktree".to_string())?
+        .to_path_buf();
+    let one_off_plan = Plan {
+        generated: selected,
+        ..Plan::default()
+    };
+    let mut transaction = begin_transaction(
+        &one_off_plan,
+        repo_name,
+        common,
+        worktree,
+        admin,
+        head,
+        branch,
+    )?
+    .ok_or_else(|| "one-off artifact cleanup produced no transaction".to_string())?;
+    if let Err(error) = quarantine(&mut transaction, &one_off_plan, worktree) {
+        return match restore(&mut transaction, worktree, admin, head) {
+            Ok(()) => Err(format!(
+                "one-off cleanup rolled back; the selected file was restored: {error}"
+            )),
+            Err(restore_error) => Err(format!(
+                "one-off cleanup failed and rollback is pending in {}: {error}; {restore_error}",
+                transaction.operation.display()
+            )),
+        };
+    }
+    let operation = transaction.operation.clone();
+    let report = finish_transaction(&mut transaction).map_err(|error| {
+        format!(
+            "one-off quarantine transaction needs inspection at {}: {error}",
+            operation.display()
+        )
+    })?;
+    if !report.preserved.is_empty() || !report.warnings.is_empty() {
+        let preserved = report
+            .preserved
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "one-off artifact is retained in quarantine at {} ({}): {}",
+            report
+                .operation
+                .as_deref()
+                .unwrap_or_else(|| Path::new("unknown operation"))
+                .display(),
+            preserved,
+            report.warnings.join("; ")
+        ));
+    }
+    verify_kept_one_off_parent(worktree, &relative).map_err(|error| {
+        format!("one-off file was purged, but its parent postcondition failed: {error}")
+    })?;
+    Ok(report)
+}
+
+pub fn resume_one_off_for_kept_worktree(
+    recovery: KeptOneOffRecovery<'_>,
+) -> Result<FinishReport, String> {
+    let KeptOneOffRecovery {
+        operation_id,
+        repo_name,
+        common,
+        worktree,
+        admin,
+        head,
+        branch,
+        relative,
+    } = recovery;
+    if operation_id.len() != 32
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("quarantine operation ID must be 32 lowercase hexadecimal characters".into());
+    }
+    validate_one_off_artifact_path(relative)?;
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        });
+    if !state_home.is_absolute() {
+        return Err("XDG_STATE_HOME must be absolute for quarantine recovery".into());
+    }
+    let root = state_home
+        .join(repo_name)
+        .join("worktrees/.removal-quarantine");
+    let operation = root.join(operation_id);
+    let root_meta = fs::symlink_metadata(&root)
+        .map_err(|error| format!("quarantine root does not exist: {error}"))?;
+    let operation_meta = fs::symlink_metadata(&operation)
+        .map_err(|error| format!("one-off quarantine transaction not found: {error}"))?;
+    if !private_dir(&root_meta)
+        || !private_dir(&operation_meta)
+        || root_meta.dev() != operation_meta.dev()
+    {
+        return Err(
+            "quarantine root or operation is not a private directory owned by the current user"
+                .into(),
+        );
+    }
+    let manifest_path = operation.join("manifest.json");
+    let manifest_meta = fs::symlink_metadata(&manifest_path)
+        .map_err(|error| format!("cannot inspect quarantine manifest: {error}"))?;
+    if !manifest_meta.is_file()
+        || manifest_meta.file_type().is_symlink()
+        || manifest_meta.uid() != unsafe { libc::getuid() }
+        || manifest_meta.mode() & 0o077 != 0
+        || manifest_meta.size() > 64 * 1024 * 1024
+    {
+        return Err("quarantine manifest is not a private regular file".into());
+    }
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|error| format!("cannot read quarantine manifest: {error}"))?,
+    )
+    .map_err(|error| format!("quarantine manifest is invalid: {error}"))?;
+    if manifest["schema_version"] != 1
+        || manifest["operation_id"] != operation_id
+        || manifest["common_dir"] != common.to_string_lossy().as_ref()
+        || manifest["worktree"] != worktree.to_string_lossy().as_ref()
+        || manifest["admin_dir"] != admin.to_string_lossy().as_ref()
+        || manifest["head"] != head
+        || manifest["branch_ref"] != json!(branch)
+        || !matches!(
+            manifest["phase"].as_str(),
+            Some("completed_preserved" | "purging_preserved")
+        )
+        || !manifest["database_link"].is_null()
+        || !manifest["direnv"].is_null()
+    {
+        return Err("quarantine manifest does not identify this kept one-off cleanup".into());
+    }
+    let worktree_meta = fs::symlink_metadata(worktree)
+        .map_err(|error| format!("cannot inspect kept worktree: {error}"))?;
+    let admin_meta = fs::symlink_metadata(admin)
+        .map_err(|error| format!("cannot inspect kept worktree admin directory: {error}"))?;
+    if !worktree_meta.is_dir()
+        || worktree_meta.file_type().is_symlink()
+        || !admin_meta.is_dir()
+        || admin_meta.file_type().is_symlink()
+        || manifest["worktree_identity"] != json!([worktree_meta.dev(), worktree_meta.ino()])
+        || manifest["admin_identity"] != json!([admin_meta.dev(), admin_meta.ino()])
+    {
+        return Err("kept worktree or admin identity changed since quarantine".into());
+    }
+    let current_head = git::run(worktree, ["rev-parse", "HEAD"])
+        .map_err(|error| format!("cannot verify kept worktree HEAD: {}", error.msg))?;
+    if current_head.trim() != head {
+        return Err("kept worktree HEAD changed since quarantine".into());
+    }
+    if one_off_path_exists(worktree, relative)? {
+        return Err(
+            "selected one-off artifact was recreated; quarantine was left untouched".into(),
+        );
+    }
+    verify_kept_one_off_parent(worktree, relative)?;
+
+    let records = manifest["generated_caches"]
+        .as_array()
+        .ok_or_else(|| "quarantine manifest has no generated-cache records".to_string())?;
+    if records.len() != 1 {
+        return Err("kept-worktree recovery requires one quarantined artifact".into());
+    }
+    let record = &records[0];
+    let relative_text = relative
+        .to_str()
+        .ok_or_else(|| "one-off artifact path must be valid UTF-8".to_string())?;
+    if record["one_off"] != true
+        || record["preserve"] != false
+        || record["path"] != relative_text
+        || record["purge_state"] != "purging"
+        || record["purge_journal"] != "purge-generated-cache-000.jsonl"
+        || record["quarantine_path"]
+            != operation
+                .join("generated-cache-000")
+                .to_string_lossy()
+                .as_ref()
+    {
+        return Err("quarantine does not contain the requested one-off artifact".into());
+    }
+    let signature = parse_signature(&record["signature"])?;
+    if !is_one_off_file_signature(&signature) {
+        return Err("one-off quarantine must contain one signed regular file".into());
+    }
+    let quarantine = operation.join("generated-cache-000");
+    verify_signature(&quarantine, &signature, worktree)?;
+    let journal = operation.join("purge-generated-cache-000.jsonl");
+    let mut allowed = BTreeSet::from([
+        "manifest.json".to_string(),
+        "generated-cache-000".to_string(),
+    ]);
+    if fs::symlink_metadata(&journal).is_ok() {
+        allowed.insert("purge-generated-cache-000.jsonl".into());
+    }
+    let actual: BTreeSet<String> = fs::read_dir(&operation)
+        .map_err(|error| format!("cannot inspect quarantine contents: {error}"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("cannot read quarantine entry: {error}"))?;
+    if actual != allowed {
+        return Err("one-off quarantine contains unrecognized or missing entries".into());
+    }
+
+    let moved = MovedArtifact {
+        original: worktree.join(relative),
+        quarantine,
+        journal,
+        signature,
+        preserve: false,
+        direnv: false,
+        one_off: true,
+    };
+    let mut transaction = Transaction {
+        operation,
+        manifest_path,
+        manifest,
+        moved: vec![moved],
+        database_link: None,
+    };
+    let operation = transaction.operation.clone();
+    let report = finish_transaction(&mut transaction).map_err(|error| {
+        format!(
+            "kept-worktree one-off quarantine needs inspection at {}: {error}",
+            operation.display()
+        )
+    })?;
+    if !report.preserved.is_empty() || !report.warnings.is_empty() {
+        return Err(format!(
+            "kept-worktree one-off quarantine remains at {}: {}",
+            operation.display(),
+            report.warnings.join("; ")
+        ));
+    }
+    verify_kept_one_off_parent(worktree, relative).map_err(|error| {
+        format!("one-off file was purged, but its parent postcondition failed: {error}")
+    })?;
+    Ok(report)
+}
+
+fn verify_kept_one_off_parent(worktree: &Path, relative: &Path) -> Result<(), String> {
+    if one_off_path_exists(worktree, relative)? {
+        return Err(format!(
+            "selected one-off artifact still exists: {}",
+            relative.display()
+        ));
+    }
+    let parent = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "one-off artifact has no parent directory".to_string())?;
+    let (parent_handle, _) = open_one_off_parent(worktree, relative)?;
+    let before = parent_handle
+        .metadata()
+        .map_err(|error| format!("cannot inspect kept parent directory: {error}"))?;
+    if !before.is_dir() {
+        return Err("one-off artifact parent is not a directory".into());
+    }
+    let parent_path = worktree.join(parent);
+    let named_before = fs::symlink_metadata(&parent_path).map_err(|error| {
+        format!(
+            "cannot inspect kept parent {}: {error}",
+            parent_path.display()
+        )
+    })?;
+    if named_before.file_type().is_symlink()
+        || named_before.dev() != before.dev()
+        || named_before.ino() != before.ino()
+    {
+        return Err("one-off artifact parent changed after cleanup".into());
+    }
+    let mut entries = fs::read_dir(&parent_path).map_err(|error| {
+        format!(
+            "cannot inspect kept parent {}: {error}",
+            parent_path.display()
+        )
+    })?;
+    if entries.next().is_some() {
+        return Err(format!(
+            "one-off artifact parent contains unexpected entries: {}",
+            parent_path.display()
+        ));
+    }
+    let named_after = fs::symlink_metadata(&parent_path).map_err(|error| {
+        format!(
+            "cannot recheck kept parent {}: {error}",
+            parent_path.display()
+        )
+    })?;
+    if named_after.file_type().is_symlink()
+        || named_after.dev() != before.dev()
+        || named_after.ino() != before.ino()
+    {
+        return Err("one-off artifact parent changed while being verified".into());
+    }
+    Ok(())
+}
+
 fn purge_order(signature: &[TreeEntry]) -> Vec<TreeEntry> {
     let mut ordered = signature.to_vec();
     ordered.sort_by(|a, b| match (a.relative == ".", b.relative == ".") {
@@ -940,6 +1312,13 @@ fn legacy_purge_order(signature: &[TreeEntry]) -> Vec<TreeEntry> {
             .then_with(|| b.relative.cmp(&a.relative))
     });
     ordered
+}
+
+fn is_one_off_file_signature(signature: &[TreeEntry]) -> bool {
+    signature.len() == 1
+        && signature[0].relative == "."
+        && signature[0].kind == "file"
+        && signature[0].link_or_digest.starts_with("sha256:")
 }
 
 fn transaction_record_mut<'a>(
@@ -1522,7 +1901,7 @@ fn signature_json(signature: &[TreeEntry]) -> Value {
     )
 }
 
-fn verify_signature(root: &Path, signature: &[TreeEntry], _worktree: &Path) -> Result<(), String> {
+fn verify_signature(root: &Path, signature: &[TreeEntry], worktree: &Path) -> Result<(), String> {
     let expected: BTreeSet<String> = signature
         .iter()
         .map(|entry| entry.relative.clone())
@@ -1535,6 +1914,17 @@ fn verify_signature(root: &Path, signature: &[TreeEntry], _worktree: &Path) -> R
         .map_err(|error| format!("cannot inspect signed artifact {}: {error}", root.display()))?;
     if root_meta.dev() != root_entry.device || root_meta.ino() != root_entry.inode {
         return Err(format!("artifact identity changed: {}", root.display()));
+    }
+    if root_entry.kind == "file" && root_entry.link_or_digest.starts_with("sha256:") {
+        let observed = if let Ok(relative) = root.strip_prefix(worktree) {
+            sign_one_off_file(worktree, relative)?
+        } else {
+            sign_one_off_absolute_file(root)?
+        };
+        if &observed != root_entry {
+            return Err(format!("signed artifact file changed: {}", root.display()));
+        }
+        return Ok(());
     }
     if signature.len() == 1 {
         let kind = if root_meta.file_type().is_symlink() {
@@ -1928,20 +2318,33 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("destination has no parent: {}", destination.display()))?;
     let source_parent = open_directory_nofollow(source_parent)?;
     let destination_parent = open_directory_nofollow(destination_parent)?;
-    let source_name = std::ffi::CString::new(
-        source
-            .file_name()
-            .ok_or_else(|| format!("source has no file name: {}", source.display()))?
-            .as_bytes(),
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| format!("source has no file name: {}", source.display()))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| format!("destination has no file name: {}", destination.display()))?;
+    let source_name = CString::new(source_name.as_bytes()).map_err(|error| error.to_string())?;
+    let destination_name =
+        CString::new(destination_name.as_bytes()).map_err(|error| error.to_string())?;
+    rename_noreplace_at(
+        &source_parent,
+        &source_name,
+        &destination_parent,
+        &destination_name,
+        source,
+        destination,
     )
-    .map_err(|error| error.to_string())?;
-    let destination_name = std::ffi::CString::new(
-        destination
-            .file_name()
-            .ok_or_else(|| format!("destination has no file name: {}", destination.display()))?
-            .as_bytes(),
-    )
-    .map_err(|error| error.to_string())?;
+}
+
+fn rename_noreplace_at(
+    source_parent: &File,
+    source_name: &CStr,
+    destination_parent: &File,
+    destination_name: &CStr,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let result = unsafe {
         renameatx_np(
@@ -1973,6 +2376,91 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn rename_one_off_from_worktree(
+    worktree: &Path,
+    relative: &Path,
+    destination: &Path,
+    signature: &[TreeEntry],
+) -> Result<(), String> {
+    let (source_parent, source_name) = open_one_off_parent(worktree, relative)?;
+    let root_signature = signature
+        .first()
+        .ok_or_else(|| "one-off artifact signature is empty".to_string())?;
+    if signature.len() != 1
+        || &sign_file_from_parent(&source_parent, &source_name, relative)? != root_signature
+    {
+        return Err(format!(
+            "one-off artifact changed before quarantine: {}",
+            relative.display()
+        ));
+    }
+    let destination_parent_path = destination
+        .parent()
+        .ok_or_else(|| format!("destination has no parent: {}", destination.display()))?;
+    let destination_parent = open_directory_nofollow(destination_parent_path)?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| format!("destination has no file name: {}", destination.display()))?;
+    let destination_name =
+        CString::new(destination_name.as_bytes()).map_err(|error| error.to_string())?;
+    rename_noreplace_at(
+        &source_parent,
+        &source_name,
+        &destination_parent,
+        &destination_name,
+        &worktree.join(relative),
+        destination,
+    )?;
+    source_parent
+        .sync_all()
+        .map_err(|error| format!("cannot sync one-off artifact parent: {error}"))?;
+    destination_parent
+        .sync_all()
+        .map_err(|error| format!("cannot sync quarantine parent: {error}"))
+}
+
+fn rename_one_off_to_worktree(
+    source: &Path,
+    worktree: &Path,
+    relative: &Path,
+    signature: &[TreeEntry],
+) -> Result<(), String> {
+    let source_parent_path = source
+        .parent()
+        .ok_or_else(|| format!("source has no parent: {}", source.display()))?;
+    let source_parent = open_directory_nofollow(source_parent_path)?;
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| format!("source has no file name: {}", source.display()))?;
+    let source_name = CString::new(source_name.as_bytes()).map_err(|error| error.to_string())?;
+    let root_signature = signature
+        .first()
+        .ok_or_else(|| "one-off artifact signature is empty".to_string())?;
+    if signature.len() != 1
+        || &sign_file_from_parent(&source_parent, &source_name, source)? != root_signature
+    {
+        return Err(format!(
+            "one-off artifact changed before restore: {}",
+            source.display()
+        ));
+    }
+    let (destination_parent, destination_name) = open_one_off_parent(worktree, relative)?;
+    rename_noreplace_at(
+        &source_parent,
+        &source_name,
+        &destination_parent,
+        &destination_name,
+        source,
+        &worktree.join(relative),
+    )?;
+    source_parent
+        .sync_all()
+        .map_err(|error| format!("cannot sync quarantine parent: {error}"))?;
+    destination_parent
+        .sync_all()
+        .map_err(|error| format!("cannot sync restored artifact parent: {error}"))
 }
 
 fn open_directory_nofollow(path: &Path) -> Result<fs::File, String> {
@@ -2017,6 +2505,273 @@ fn open_directory_nofollow(path: &Path) -> Result<fs::File, String> {
     Ok(file)
 }
 
+pub fn validate_one_off_artifact_path(path: &Path) -> Result<(), String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "one-off artifact path must be valid UTF-8".to_string())?;
+    if text.is_empty()
+        || text.contains('\\')
+        || text.contains('\0')
+        || text
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+        || text
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".." | ".git" | ".direnv" | ".wtctl.json"))
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("unsafe one-off artifact path: {text:?}"));
+    }
+    Ok(())
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> Result<File, String> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|error| format!("directory component contains NUL: {error}"))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot safely open artifact directory component: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let directory = unsafe { File::from_raw_fd(fd) };
+    if !directory
+        .metadata()
+        .map_err(|error| format!("cannot inspect artifact directory component: {error}"))?
+        .is_dir()
+    {
+        return Err("one-off artifact path has a non-directory parent".into());
+    }
+    Ok(directory)
+}
+
+fn open_one_off_parent(worktree: &Path, relative: &Path) -> Result<(File, CString), String> {
+    validate_one_off_artifact_path(relative)?;
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err("unsafe one-off artifact path component".to_string()),
+        })
+        .collect::<Result<_, _>>()?;
+    let (leaf, parents) = components
+        .split_last()
+        .ok_or_else(|| "one-off artifact path is empty".to_string())?;
+    let named_root = fs::symlink_metadata(worktree)
+        .map_err(|error| format!("cannot inspect task worktree: {error}"))?;
+    if !named_root.is_dir() || named_root.file_type().is_symlink() {
+        return Err("task worktree root is not a real directory".into());
+    }
+    let root = fs::canonicalize(worktree)
+        .map_err(|error| format!("cannot resolve task worktree: {error}"))?;
+    let canonical_root = fs::symlink_metadata(&root)
+        .map_err(|error| format!("cannot inspect canonical task worktree: {error}"))?;
+    if !canonical_root.is_dir() || canonical_root.file_type().is_symlink() {
+        return Err("canonical task worktree root is not a real directory".into());
+    }
+    let root_file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&root)
+        .map_err(|error| format!("cannot safely open task worktree root: {error}"))?;
+    let opened_root = root_file
+        .metadata()
+        .map_err(|error| format!("cannot inspect open task worktree root: {error}"))?;
+    if opened_root.dev() != canonical_root.dev() || opened_root.ino() != canonical_root.ino() {
+        return Err("task worktree root changed while opening".into());
+    }
+    let mut parent = root_file;
+    for component in parents {
+        parent = open_directory_at(&parent, component)?;
+    }
+    let leaf = CString::new(leaf.as_bytes())
+        .map_err(|error| format!("artifact filename contains NUL: {error}"))?;
+    Ok((parent, leaf))
+}
+
+fn one_off_entry_stat(parent: &File, name: &CString) -> Result<Option<libc::stat>, String> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(Some(stat));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(None)
+    } else {
+        Err(format!(
+            "cannot inspect one-off artifact directory entry: {error}"
+        ))
+    }
+}
+
+fn verify_one_off_entry(
+    parent: &File,
+    name: &CString,
+    expected: &fs::Metadata,
+) -> Result<(), String> {
+    let entry = one_off_entry_stat(parent, name)?
+        .ok_or_else(|| "one-off artifact path disappeared".to_string())?;
+    if entry.st_mode as u32 != expected.mode()
+        || entry.st_dev as u64 != expected.dev()
+        || entry.st_ino != expected.ino()
+    {
+        return Err("one-off artifact directory entry changed while opening".into());
+    }
+    Ok(())
+}
+
+fn one_off_path_exists(worktree: &Path, relative: &Path) -> Result<bool, String> {
+    let (parent, name) = open_one_off_parent(worktree, relative)?;
+    Ok(one_off_entry_stat(&parent, &name)?.is_some())
+}
+
+fn sign_file_from_parent(
+    parent: &File,
+    name: &CString,
+    display_path: &Path,
+) -> Result<TreeEntry, String> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot safely open one-off artifact {}: {}",
+            display_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let before = file.metadata().map_err(|error| {
+        format!(
+            "cannot inspect one-off artifact {}: {error}",
+            display_path.display()
+        )
+    })?;
+    if !before.is_file() {
+        return Err(format!(
+            "one-off artifact is not a regular file: {}",
+            display_path.display()
+        ));
+    }
+    verify_one_off_entry(parent, name, &before)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            format!(
+                "cannot read one-off artifact {}: {error}",
+                display_path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let after = file.metadata().map_err(|error| {
+        format!(
+            "cannot recheck one-off artifact {}: {error}",
+            display_path.display()
+        )
+    })?;
+    if !after.is_file()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.mode() != after.mode()
+        || before.size() != after.size()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+    {
+        return Err(format!(
+            "one-off artifact changed while reading: {}",
+            display_path.display()
+        ));
+    }
+    verify_one_off_entry(parent, name, &after)?;
+    Ok(TreeEntry {
+        relative: ".".into(),
+        kind: "file".into(),
+        device: after.dev(),
+        inode: after.ino(),
+        mode: after.mode(),
+        size: after.size(),
+        mtime_ns: after.mtime() as i128 * 1_000_000_000 + after.mtime_nsec() as i128,
+        link_or_digest: format!("sha256:{}", hex(&digest.finalize())),
+    })
+}
+
+fn sign_one_off_file(worktree: &Path, relative: &Path) -> Result<TreeEntry, String> {
+    let (parent, name) = open_one_off_parent(worktree, relative)?;
+    sign_file_from_parent(&parent, &name, relative)
+}
+
+fn sign_one_off_absolute_file(path: &Path) -> Result<TreeEntry, String> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| format!("one-off artifact has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("one-off artifact has no filename: {}", path.display()))?;
+    let parent = open_directory_nofollow(parent_path)?;
+    let name = CString::new(name.as_bytes())
+        .map_err(|error| format!("artifact filename contains NUL: {error}"))?;
+    sign_file_from_parent(&parent, &name, path)
+}
+
+fn one_off_status(worktree: &Path, scope: &Path) -> Result<Vec<StatusEntry>, String> {
+    let output = git::output(
+        worktree,
+        [
+            OsStr::new("--literal-pathspecs"),
+            OsStr::new("status"),
+            OsStr::new("--porcelain=v1"),
+            OsStr::new("-z"),
+            OsStr::new("--untracked-files=all"),
+            OsStr::new("--ignored=traditional"),
+            OsStr::new("--"),
+            scope.as_os_str(),
+        ],
+    )
+    .map_err(|error| format!("cannot inspect one-off artifact status: {}", error.msg))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot inspect one-off artifact status: {}",
+            git::stderr_of(&output)
+        ));
+    }
+    git::parse_status_entries(&output.stdout)
+}
+
+fn status_is_explicit_artifact_parent(status_path: &[u8], relative: &Path) -> bool {
+    let status_path = status_path.strip_suffix(b"/").unwrap_or(status_path);
+    let relative = relative.as_os_str().as_bytes();
+    relative.starts_with(status_path)
+        && relative.len() > status_path.len()
+        && relative.get(status_path.len()) == Some(&b'/')
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn renameatx_np(
@@ -2031,7 +2786,7 @@ unsafe extern "C" {
 pub fn inspect_plan(
     worktree: &Path,
     main_worktree: Option<&Path>,
-    options: Options,
+    options: &Options,
 ) -> Result<Plan, String> {
     let status = status(worktree)?;
     let caches = options.discard_caches || options.discard_all || options.preserve_generated;
@@ -2040,7 +2795,7 @@ pub fn inspect_plan(
     let include_config = options.discard_all || options.preserve_generated;
     let rules = artifact_config::load(main_worktree)?;
     let include_configured = options.discard_all || options.preserve_generated;
-    let roots = generated_roots(
+    let mut roots = generated_roots(
         &status,
         caches,
         build_outputs,
@@ -2048,13 +2803,87 @@ pub fn inspect_plan(
         include_configured,
         &rules,
     )?;
+    let explicit_status = if let Some(path) = &options.discard_artifact_path {
+        validate_one_off_artifact_path(path)?;
+        if roots
+            .iter()
+            .any(|root| path.starts_with(root) || root.starts_with(path))
+        {
+            return Err(format!(
+                "one-off artifact overlaps a broader generated root: {}",
+                path.display()
+            ));
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty() && *parent != Path::new("."))
+            .unwrap_or(path);
+        let mut scopes = BTreeSet::from([parent.to_path_buf()]);
+        for entry in &status {
+            if (entry.code == *b"!!" || entry.code == *b"??")
+                && status_is_explicit_artifact_parent(&entry.path, path)
+            {
+                let scope = entry.path.strip_suffix(b"/").unwrap_or(&entry.path);
+                scopes.insert(PathBuf::from(OsStr::from_bytes(scope)));
+            }
+        }
+        let mut scoped_status = BTreeMap::new();
+        for scope in scopes {
+            let entries = one_off_status(worktree, &scope)?;
+            for entry in entries {
+                scoped_status.insert(entry.path.clone(), entry);
+            }
+            if scope != Path::new(".") {
+                let tracked = git::output(
+                    worktree,
+                    [
+                        OsStr::new("--literal-pathspecs"),
+                        OsStr::new("ls-files"),
+                        OsStr::new("--stage"),
+                        OsStr::new("--"),
+                        scope.as_os_str(),
+                    ],
+                )
+                .map_err(|error| format!("cannot inspect one-off artifact scope: {}", error.msg))?;
+                if !tracked.status.success() || !tracked.stdout.is_empty() {
+                    return Err(format!(
+                        "one-off artifact scope contains tracked files: {}",
+                        scope.display()
+                    ));
+                }
+            }
+        }
+        let scoped_status: Vec<_> = scoped_status.into_values().collect();
+        if scoped_status.len() != 1
+            || scoped_status[0].path.as_slice() != path.as_os_str().as_bytes()
+            || (scoped_status[0].code != *b"!!" && scoped_status[0].code != *b"??")
+        {
+            return Err(format!(
+                "one-off path must identify the only ignored or untracked file in its parent: {}",
+                path.display()
+            ));
+        }
+        roots.push(path.clone());
+        Some(scoped_status)
+    } else {
+        None
+    };
     let mut generated = Vec::new();
     for relative in &roots {
         let root_bytes = relative.as_os_str().as_bytes();
-        let matching: Vec<_> = status
-            .iter()
-            .filter(|entry| under_root(&entry.path, root_bytes))
-            .collect();
+        let one_off = options.discard_artifact_path.as_ref() == Some(relative);
+        let matching: Vec<&StatusEntry> = if one_off {
+            explicit_status
+                .as_ref()
+                .ok_or_else(|| "one-off artifact status was not captured".to_string())?
+                .iter()
+                .collect()
+        } else {
+            status
+                .iter()
+                .filter(|entry| under_root(&entry.path, root_bytes))
+                .collect()
+        };
         if matching.is_empty()
             || matching
                 .iter()
@@ -2068,6 +2897,7 @@ pub fn inspect_plan(
         let tracked = git::output(
             worktree,
             [
+                OsStr::new("--literal-pathspecs"),
                 OsStr::new("ls-files"),
                 OsStr::new("--stage"),
                 OsStr::new("--"),
@@ -2084,7 +2914,12 @@ pub fn inspect_plan(
         let path = worktree.join(relative);
         let allow_symlink =
             relative == Path::new("result") || relative == Path::new(PRECOMMIT_CONFIG);
-        let signature = if rules.generated_artifacts.contains(relative) {
+        let signature = if one_off {
+            vec![sign_one_off_file(
+                worktree,
+                options.discard_artifact_path.as_ref().unwrap(),
+            )?]
+        } else if rules.generated_artifacts.contains(relative) {
             sign_configured_artifact(&path, worktree)?
         } else {
             sign_tree(&path, worktree, allow_symlink, false, false)?
@@ -2093,8 +2928,10 @@ pub fn inspect_plan(
         generated.push(SignedArtifact {
             path,
             signature,
-            preserve: options.preserve_generated
+            preserve: !one_off
+                && options.preserve_generated
                 && !(options.discard_all || (options.discard_build_outputs && is_build)),
+            one_off,
         });
     }
 
@@ -2130,6 +2967,7 @@ pub fn inspect_plan(
             path,
             signature,
             preserve: !plan.discard_direnv || !plan.direnv_discardable,
+            one_off: false,
         });
     }
 
@@ -2157,6 +2995,11 @@ pub fn inspect_plan(
                     .as_bytes(),
             )
         }) || is_direnv_path(&entry.path)
+            || ((entry.code == *b"!!" || entry.code == *b"??")
+                && options
+                    .discard_artifact_path
+                    .as_ref()
+                    .is_some_and(|path| status_is_explicit_artifact_parent(&entry.path, path)))
         {
             continue;
         }
@@ -3331,7 +4174,7 @@ mod tests {
         let plan = inspect_plan(
             &root,
             Some(&root),
-            Options {
+            &Options {
                 discard_all: true,
                 ..Options::default()
             },
@@ -3344,7 +4187,7 @@ mod tests {
         assert!(inspect_plan(
             &root,
             Some(&root),
-            Options {
+            &Options {
                 discard_all: true,
                 ..Options::default()
             },
@@ -3397,6 +4240,10 @@ mod tests {
         let state_namespace = state_home.join(&repo_name);
 
         git(&repo, &["init", "-q", "-b", "main"]);
+        // Detached post-commit maintenance can prune the fake admin directory
+        // (no gitdir file) after the test creates it.
+        git(&repo, &["config", "maintenance.auto", "false"]);
+        git(&repo, &["config", "gc.auto", "0"]);
         git(&repo, &["config", "user.name", "wtctl test"]);
         git(
             &repo,
@@ -3419,6 +4266,7 @@ mod tests {
                     path: path.clone(),
                     signature: sign_tree(path, &task, false, false, false).unwrap(),
                     preserve: true,
+                    one_off: false,
                 })
                 .collect(),
             ..Plan::default()
@@ -3494,6 +4342,8 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim().to_owned()
         };
         git(&["init", "-q", "-b", "main"]);
+        git(&["config", "maintenance.auto", "false"]);
+        git(&["config", "gc.auto", "0"]);
         git(&["config", "user.name", "wtctl test"]);
         git(&["config", "user.email", "wtctl-test@example.invalid"]);
         fs::write(
@@ -3517,6 +4367,7 @@ mod tests {
                 path: artifact_path.clone(),
                 signature: sign_configured_artifact(&artifact_path, &task).unwrap(),
                 preserve: true,
+                one_off: false,
             }],
             ..Plan::default()
         };
@@ -3785,5 +4636,84 @@ mod tests {
             legacy_purge_order(&signature).first().unwrap().relative,
             "."
         );
+    }
+
+    #[test]
+    fn one_off_artifact_paths_are_exact_safe_relative_files() {
+        for path in [
+            "",
+            "/tmp/snapshot.jsonl",
+            "../snapshot.jsonl",
+            ".cache/../snapshot.jsonl",
+            ".cache//snapshot.jsonl",
+            ".git/config",
+            "nested/.direnv/cache",
+            ".wtctl.json",
+            ".cache/*.jsonl",
+        ] {
+            assert!(
+                validate_one_off_artifact_path(Path::new(path)).is_err(),
+                "accepted unsafe path {path:?}"
+            );
+        }
+        assert!(validate_one_off_artifact_path(Path::new(".cache/snapshot-check.jsonl")).is_ok());
+    }
+
+    #[test]
+    fn one_off_artifact_signature_hashes_file_contents_and_rejects_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("one-off-signature");
+        let worktree = root.join("worktree");
+        let outside = root.join("outside");
+        fs::create_dir_all(worktree.join(".cache")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let relative = Path::new(".cache/snapshot-check.jsonl");
+        let path = worktree.join(relative);
+        fs::write(&path, b"approved snapshot copy").unwrap();
+
+        let signature = vec![sign_one_off_file(&worktree, relative).unwrap()];
+        assert!(is_one_off_file_signature(&signature));
+        verify_signature(&path, &signature, &worktree).unwrap();
+
+        fs::write(&path, b"replaced snapshot copy").unwrap();
+        assert!(verify_signature(&path, &signature, &worktree).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(outside.join("snapshot-check.jsonl"), b"outside data").unwrap();
+        fs::remove_dir(worktree.join(".cache")).unwrap();
+        symlink(&outside, worktree.join(".cache")).unwrap();
+        assert!(sign_one_off_file(&worktree, relative).is_err());
+        fs::remove_file(worktree.join(".cache")).unwrap();
+        fs::create_dir(worktree.join(".cache")).unwrap();
+        symlink(
+            outside.join("snapshot-check.jsonl"),
+            worktree.join(relative),
+        )
+        .unwrap();
+        assert!(sign_one_off_file(&worktree, relative).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_off_restore_does_not_overwrite_a_recreated_destination() {
+        let root = temp("one-off-restore-collision");
+        let worktree = root.join("worktree");
+        let quarantine = root.join("quarantine");
+        let relative = Path::new(".cache/snapshot-check.jsonl");
+        let selected = worktree.join(relative);
+        let moved = quarantine.join("snapshot-check.jsonl");
+        fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::write(&selected, b"original snapshot").unwrap();
+        let signature = vec![sign_one_off_file(&worktree, relative).unwrap()];
+
+        rename_one_off_from_worktree(&worktree, relative, &moved, &signature).unwrap();
+        fs::write(&selected, b"concurrent replacement").unwrap();
+        assert!(rename_one_off_to_worktree(&moved, &worktree, relative, &signature).is_err());
+        assert_eq!(fs::read(&selected).unwrap(), b"concurrent replacement");
+        assert_eq!(fs::read(&moved).unwrap(), b"original snapshot");
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

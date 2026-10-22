@@ -26,4 +26,7 @@ small, standard-library first, and fail closed.
 - This repository is public. Keep documentation, examples, and test fixtures
   consumer-neutral: use synthetic values and generic filenames; never copy a
   consumer repository's paths, filenames, labels, or data.
+- Keep built-in artifact roots limited to broadly disposable outputs. Handle
+  exceptional files only through an explicit, exact-path, per-invocation
+  selector; do not broaden default cleanup roots for a single consumer case.
 - Comments explain why, never what.

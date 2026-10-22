@@ -233,7 +233,7 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
             "artifact-cleanup",
             artifact::check_pending_transaction(&repo.name(), &entry.path)
                 .and_then(|()| {
-                    artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+                    artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
                 })
                 .map(|_| ())
                 .map_err(|why| Fail::new(4, why)),
