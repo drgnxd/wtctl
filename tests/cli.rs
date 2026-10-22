@@ -347,10 +347,6 @@ fn capabilities_reports_the_lifecycle_contract() {
     ] {
         assert_eq!(output[key], true, "{key}");
     }
-    assert_eq!(
-        output["finish_strategies"],
-        serde_json::json!(["merge", "squash", "rebase"])
-    );
 }
 
 /// A pid with no process right now: a reaped child's pid, confirmed by ESRCH.
@@ -4476,6 +4472,20 @@ fn finish_dry_run_reports_merge_conflicts_as_blocked() {
 }
 
 #[test]
+fn finish_rejects_removed_history_rewrite_options() {
+    let env = Env::new();
+    let repo = env.repo_arg();
+    let (id, path) = env.create("removed-rewrite-options");
+
+    for option in ["--squash", "--rebase"] {
+        let out = env.run(&["finish", "--repo", &repo, "--id", &id, option]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unknown argument"));
+        assert!(path.exists());
+    }
+}
+
+#[test]
 fn finish_reports_the_main_movement_and_removed_path() {
     let env = Env::new();
     let repo = env.repo_arg();
@@ -4495,187 +4505,6 @@ fn finish_reports_the_main_movement_and_removed_path() {
         text.contains(&format!("removed {}", path.display())),
         "{text}"
     );
-}
-
-#[test]
-fn finish_rebase_replays_task_commits_onto_an_advanced_main() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    let (id, path) = env.create("rebase-task");
-    let original = commit_file(&path, "task.txt", "task\n");
-    let advanced = commit_file(&env.repo, "main.txt", "main\n");
-
-    env.ok(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--rebase",
-        "--external-writers-quiesced",
-    ]);
-    assert!(!path.exists());
-    let tip = env.main_oid();
-    assert_ne!(tip, original);
-    assert_eq!(git(&env.repo, &["rev-parse", "HEAD~1"]), advanced);
-    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task");
-    assert_eq!(git(&env.repo, &["show", "HEAD:main.txt"]), "main");
-    assert_eq!(
-        git(
-            &env.repo,
-            &["rev-parse", &format!("refs/wtctl/superseded/{id}.1")]
-        ),
-        original
-    );
-}
-
-#[test]
-fn finish_rebase_conflict_leaves_the_worktree_and_the_original_tip() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    let (id, path) = env.create("rebase-conflict");
-    let original = commit_file(&path, "f.txt", "task side\n");
-    commit_file(&env.repo, "f.txt", "main side\n");
-    let main_before = env.main_oid();
-
-    let out = env.run(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--rebase",
-        "--external-writers-quiesced",
-    ]);
-    assert_eq!(out.status.code(), Some(4));
-    assert!(path.exists());
-    assert_eq!(env.main_oid(), main_before);
-    assert_eq!(
-        git(
-            &env.repo,
-            &["rev-parse", &format!("refs/wtctl/superseded/{id}.1")]
-        ),
-        original
-    );
-    assert!(env.admin(&id).join("rebase-merge").exists());
-}
-
-#[test]
-fn finish_squash_integrates_one_commit_with_the_given_message() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    let (id, path) = env.create("squash-task");
-    commit_file(&path, "one.txt", "1\n");
-    let last = commit_file(&path, "two.txt", "2\n");
-    let before = env.main_oid();
-
-    let missing = env.run(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--squash",
-        "--external-writers-quiesced",
-    ]);
-    assert_eq!(missing.status.code(), Some(2));
-    assert!(path.exists());
-
-    env.ok(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--squash",
-        "--integration-message",
-        "feat: squashed task",
-        "--external-writers-quiesced",
-    ]);
-    assert!(!path.exists());
-    assert_eq!(git(&env.repo, &["rev-parse", "HEAD~1"]), before);
-    assert_eq!(
-        git(
-            &env.repo,
-            &["rev-list", "--count", &format!("{before}..HEAD")]
-        ),
-        "1"
-    );
-    assert_eq!(
-        git(&env.repo, &["log", "-1", "--format=%s"]),
-        "feat: squashed task"
-    );
-    assert_eq!(git(&env.repo, &["show", "HEAD:one.txt"]), "1");
-    assert_eq!(git(&env.repo, &["show", "HEAD:two.txt"]), "2");
-    assert_eq!(
-        git(
-            &env.repo,
-            &["rev-parse", &format!("refs/wtctl/superseded/{id}.1")]
-        ),
-        last
-    );
-    let both = env.run(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--squash",
-        "--rebase",
-        "--external-writers-quiesced",
-    ]);
-    assert_eq!(both.status.code(), Some(2));
-}
-
-#[test]
-fn finish_dry_run_understands_rebase_and_squash() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    let (id, path) = env.create("strategy-plan");
-    commit_file(&path, "plan.txt", "plan\n");
-    commit_file(&env.repo, "main.txt", "main\n");
-    let rebase: Value = serde_json::from_str(&env.ok(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--rebase",
-        "--dry-run",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(rebase["integration"], "rebase");
-    assert_eq!(rebase["strategy"], "rebase");
-    let squash: Value = serde_json::from_str(&env.ok(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--squash",
-        "--integration-message",
-        "feat: plan",
-        "--dry-run",
-        "--json",
-    ]))
-    .unwrap();
-    assert_eq!(squash["strategy"], "squash");
-    assert_eq!(
-        env.run(&[
-            "finish",
-            "--repo",
-            &repo,
-            "--id",
-            &id,
-            "--squash",
-            "--dry-run"
-        ])
-        .status
-        .code(),
-        Some(2)
-    );
-    assert!(path.exists());
 }
 
 #[test]
@@ -5114,78 +4943,7 @@ fn git_dated(dir: &Path, args: &[&str], date: &str) -> String {
 }
 
 #[test]
-fn squash_and_rebase_keep_refusing_unrelated_reflog_only_commits() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    for mode in ["--squash", "--rebase"] {
-        let slug = format!("reflog-{}", mode.trim_start_matches('-'));
-        let (id, path) = env.create(&slug);
-        commit_file(&path, &format!("{slug}-a.txt"), "a\n");
-        commit_file(&path, &format!("{slug}-b.txt"), "b\n");
-        commit_file(&path, &format!("{slug}-c.txt"), "c\n");
-        git(&path, &["reset", "--hard", "HEAD~1"]);
-        if mode == "--rebase" {
-            commit_file(&env.repo, &format!("{slug}-main.txt"), "main\n");
-        }
-        let out = env.run(&[
-            "finish",
-            "--repo",
-            &repo,
-            "--id",
-            &id,
-            mode,
-            "--integration-message",
-            "feat: x",
-            "--external-writers-quiesced",
-        ]);
-        assert_eq!(
-            out.status.code(),
-            Some(4),
-            "{mode}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("not in main"),
-            "{mode}"
-        );
-        assert!(
-            path.exists(),
-            "{mode}: the reflog-only commit must not be discarded"
-        );
-    }
-}
-
-#[test]
-fn squash_retry_after_a_refused_integration_does_not_squash_twice() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    let (id, path) = env.create("squash-retry");
-    commit_file(&path, "one.txt", "1\n");
-    commit_file(&path, "two.txt", "2\n");
-    let hook = env.repo.join(".git/hooks/post-merge");
-    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-    let args = [
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--squash",
-        "--integration-message",
-        "feat: retry",
-        "--external-writers-quiesced",
-    ];
-    assert_eq!(env.run(&args).status.code(), Some(4));
-    assert!(path.exists());
-    fs::remove_file(&hook).unwrap();
-    env.ok(&args);
-    assert!(!path.exists());
-    assert_eq!(git(&env.repo, &["log", "-1", "--format=%s"]), "feat: retry");
-}
-
-#[test]
-fn prune_ages_kept_refs_by_when_they_were_kept_not_by_commit_date() {
+fn prune_ages_abandoned_refs_by_reflog_time_not_commit_date() {
     let env = Env::new();
     let repo = env.repo_arg();
     let (id, path) = env.create("old-commit");
@@ -5212,33 +4970,6 @@ fn prune_ages_kept_refs_by_when_they_were_kept_not_by_commit_date() {
     // Neither deleted nor skipped: the age was read, and it is new.
     assert_eq!(report["actions"].as_array().unwrap().len(), 0, "{report}");
     git(&env.repo, &["rev-parse", "--verify", &ref_name]);
-}
-
-#[test]
-fn rebase_refuses_to_overwrite_an_ignored_file() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    let (id, path) = env.create("ignored-rebase");
-    commit_file(&path, "task.txt", "task\n");
-    fs::write(path.join("local.db"), "precious\n").unwrap();
-    fs::write(env.repo.join("local.db"), "tracked upstream\n").unwrap();
-    git(&env.repo, &["add", "-f", "local.db"]);
-    git(&env.repo, &["commit", "-q", "-m", "track local.db"]);
-    let out = env.run(&[
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--rebase",
-        "--external-writers-quiesced",
-    ]);
-    assert_eq!(out.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("local.db"));
-    assert_eq!(
-        fs::read_to_string(path.join("local.db")).unwrap(),
-        "precious\n"
-    );
 }
 
 #[test]
@@ -5426,32 +5157,4 @@ fn abandon_never_overwrites_a_kept_tip_that_the_new_tip_does_not_contain() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("already preserves"));
     assert_eq!(git(&env.repo, &["rev-parse", &ref_name]), unrelated);
     assert!(path.exists());
-}
-
-#[test]
-fn rebase_retry_after_main_moves_keeps_each_attempt_and_finishes() {
-    let env = Env::new();
-    let repo = env.repo_arg();
-    let (id, path) = env.create("rebase-retry");
-    commit_file(&path, "task.txt", "task\n");
-    commit_file(&env.repo, "m1.txt", "1\n");
-    let hook = env.repo.join(".git/hooks/post-merge");
-    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-    let args = [
-        "finish",
-        "--repo",
-        &repo,
-        "--id",
-        &id,
-        "--rebase",
-        "--external-writers-quiesced",
-    ];
-    assert_eq!(env.run(&args).status.code(), Some(4));
-    fs::remove_file(&hook).unwrap();
-    commit_file(&env.repo, "m2.txt", "2\n");
-    env.ok(&args);
-    assert!(!path.exists());
-    assert_eq!(git(&env.repo, &["show", "HEAD:task.txt"]), "task");
-    assert_eq!(git(&env.repo, &["show", "HEAD:m2.txt"]), "2");
 }

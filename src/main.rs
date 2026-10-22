@@ -26,6 +26,15 @@ use serde_json::{json, Value};
 use task::{canon, owner_json, Entry, Marker, Meta};
 
 const DEFAULT_GRACE_SECS: i64 = 600;
+/// Hooks a merge commit can trigger, shared by the merge path and its preflight.
+const MERGE_HOOKS: &[&str] = &[
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-merge",
+    "post-index-change",
+    "reference-transaction",
+];
 
 const USAGE: &str = "usage: wtctl <command> [options]
 
@@ -34,7 +43,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy | --abandoned] [--all-repos] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
-  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--squash | --rebase] [--push] [--remote <name>] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--recover-failed-merge] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [--push] [--remote <name>] [--keep-worktree] [--dry-run] [--json] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id> [--session <id>]
   show    --repo <path> --id <task-id> [--main <branch> | --base <ref>] [--json]
@@ -49,7 +58,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
     --discard-generated-build-outputs, --discard-generated-artifacts,
     --preserve-generated-artifacts, --purge-preserved-quarantine <operation-id>
 
-exit codes: 0 ok, 1 error, 2 usage, 3 main diverged (rebase needed),
+exit codes: 0 ok, 1 error, 2 usage, 3 main diverged,
 4 refused by a safety check, 5 lock busy";
 
 macro_rules! out {
@@ -103,7 +112,6 @@ mod finish_plan;
 mod housekeeping;
 mod remote;
 mod show;
-mod strategy;
 
 #[derive(Debug)]
 pub struct Fail {
@@ -142,7 +150,6 @@ fn cmd_capabilities(a: &Args) -> R<()> {
         "show": true,
         "describe": true,
         "finish_dry_run": true,
-        "finish_strategies": ["merge", "squash", "rebase"],
         "abandon": true,
         "restore": true,
         "doctor": true,
@@ -208,14 +215,12 @@ const FLAG_OPTS: &[&str] = &[
     "--allow-unreferenced-reflog",
     "--keep-worktree",
     "--abandon",
-    "--squash",
     "--fetch",
     "--push",
     "--all-repos",
     "--quarantine",
     "--refs",
     "--fix-stale-lock",
-    "--rebase",
     "--abandoned",
     "--allow-annex-filter",
     "--allow-commit-signing",
@@ -1759,7 +1764,7 @@ fn merge_main_into_task(
         }
     };
     verify_tracked_filter_safety(repo, &entry.path, &task_tree, context.allow_annex_filter)?;
-    let hooks = active_hooks(&entry.path, strategy::MERGE_HOOKS, None, None)?;
+    let hooks = active_hooks(&entry.path, MERGE_HOOKS, None, None)?;
     check_hooks(&hooks, context.allow_hooks)?;
     ensure_ref(&repo.root, context.main_ref, context.main_tip)?;
     ensure_task_head(entry, context.task_tip)?;
@@ -3147,8 +3152,6 @@ fn cmd_finish(a: &Args) -> R<()> {
         return finish_plan::cmd_finish_preflight(a);
     }
     let repo = a.repo(true)?;
-    let strategy = strategy::parse(a)?;
-    strategy::validate(a, strategy)?;
     let id = a.get("--id")?;
     let legacy_id = a.get("--legacy-worktree-id")?;
     let branch = a.get("--expect-branch")?;
@@ -3311,30 +3314,7 @@ fn cmd_finish(a: &Args) -> R<()> {
     }
     let diverged = !is_ancestor(&repo.root, &main_tip, &task_tip)?
         && !is_ancestor(&repo.root, &task_tip, &main_tip)?;
-    if diverged && strategy == strategy::Strategy::Rebase {
-        let rebased = strategy::rebase_onto_main(
-            &repo,
-            strategy::Rebase {
-                id: &display_id,
-                entry: &entry,
-                main_ref: &refname,
-                main_tip: &main_tip,
-                task_tip: &task_tip,
-                allow_hooks: a.flag("--allow-repository-hooks"),
-                allow_signing: a.flag("--allow-commit-signing"),
-            },
-        )?;
-        entry = Entry::load(entry.admin.clone()).ok_or_else(|| {
-            Fail::new(
-                4,
-                format!("{display_id} registration disappeared after rebase"),
-            )
-        })?;
-        if entry.current_oid().as_deref() != Some(rebased.as_str()) {
-            return refuse(format!("{display_id} HEAD changed after rebase"));
-        }
-        verify_removal_authority(&repo, &entry, &removal)?;
-    } else if diverged {
+    if diverged {
         let merged_tip = merge_main_into_task(
             &repo,
             &display_id,
@@ -3368,40 +3348,6 @@ fn cmd_finish(a: &Args) -> R<()> {
             require_owner(marker)?;
         }
     }
-    if strategy == strategy::Strategy::Squash {
-        let current = entry
-            .current_oid()
-            .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before squash"))?;
-        // A retry after a refused integration finds the squash already done.
-        let already_squashed = strategy::already_squashed(&repo, &display_id, &current, &main_tip)?;
-        if current != main_tip
-            && !already_squashed
-            && !is_ancestor(&repo.root, &current, &main_tip)?
-        {
-            let squashed = strategy::squash_onto_main(
-                &repo,
-                &display_id,
-                &entry,
-                &main_tip,
-                &current,
-                integration_message,
-                a.flag("--allow-commit-signing"),
-            )?;
-            entry = Entry::load(entry.admin.clone()).ok_or_else(|| {
-                Fail::new(
-                    4,
-                    format!("{display_id} registration disappeared after squash"),
-                )
-            })?;
-            if entry.current_oid().as_deref() != Some(squashed.as_str()) {
-                return refuse(format!("{display_id} HEAD changed after squash"));
-            }
-            verify_removal_authority(&repo, &entry, &removal)?;
-        }
-    }
-    // The tip kept before a rewrite counts as preserved when removal checks
-    // for commits that main does not contain; nothing else is exempted.
-    let kept = strategy::kept_tips(&repo, &display_id);
     let finish_head = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before integration"))?;
@@ -3498,7 +3444,6 @@ fn cmd_finish(a: &Args) -> R<()> {
         &removal,
         RemovalContext {
             main_ref: &refname,
-            kept: &kept,
             cwds: &procinfo::scan_cwds(),
             annex,
             cleanup,
@@ -3928,8 +3873,6 @@ fn verify_removal_authority(repo: &Repo, entry: &Entry, authority: &RemovalAutho
 
 struct RemovalContext<'a> {
     main_ref: &'a str,
-    /// Tips kept in refs, counted as preserved like `main_ref`'s history.
-    kept: &'a [String],
     cwds: &'a procinfo::CwdScan,
     annex: bool,
     cleanup: artifact::Options,
@@ -3944,7 +3887,6 @@ fn remove_worktree(
 ) -> R<()> {
     let RemovalContext {
         main_ref,
-        kept,
         cwds,
         annex,
         cleanup,
@@ -3998,7 +3940,7 @@ fn remove_worktree(
     }
     let expected_tree = format!("{expected_head}^{{tree}}");
     verify_tracked_filter_safety(repo, &entry.path, &expected_tree, annex)?;
-    let facts = task::facts_excluding(&[entry], main_ref, kept)?;
+    let facts = task::facts(&[entry], main_ref)?;
     facts
         .first()
         .cloned()
@@ -4048,7 +3990,7 @@ fn remove_worktree(
             return refuse(format!("{id} changed during git annex restage"));
         }
         verify_removal_authority(repo, &refreshed, authority)?;
-        let facts = task::facts_excluding(&[&refreshed], main_ref, kept)?;
+        let facts = task::facts(&[&refreshed], main_ref)?;
         facts
             .first()
             .cloned()
@@ -4092,7 +4034,7 @@ fn remove_worktree(
                 Fail::new(4, format!("cannot quarantine worktree artifacts: {why}"))
             })?;
         }
-        let facts = task::facts_excluding(&[entry], main_ref, kept)?;
+        let facts = task::facts(&[entry], main_ref)?;
         facts
             .first()
             .cloned()
@@ -4333,7 +4275,6 @@ fn cmd_reap(a: &Args) -> R<()> {
                     &removal,
                     RemovalContext {
                         main_ref: &main_ref,
-                        kept: &[],
                         cwds: &cwds,
                         annex,
                         cleanup: artifact::Options {
@@ -4627,13 +4568,7 @@ fn cmd_remove(a: &Args) -> R<()> {
         main_ref = tip;
         abandoned_ref = Some(abandon::ref_name(&authority.worktree_id));
     }
-    // Tips kept by an earlier squash or rebase of this task count as preserved.
-    let kept = if id.is_some() {
-        strategy::kept_tips(&repo, &authority.worktree_id)
-    } else {
-        Vec::new()
-    };
-    let facts = task::facts_excluding(&[&entry], &main_ref, &kept)?;
+    let facts = task::facts(&[&entry], &main_ref)?;
     let f = facts.first().cloned().unwrap_or_default();
     f.removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
         .or_else(|why| refuse(format!("{}: {why}", authority.worktree_id)))?;
@@ -4727,7 +4662,6 @@ fn cmd_remove(a: &Args) -> R<()> {
         &authority,
         RemovalContext {
             main_ref: &main_ref,
-            kept: &kept,
             cwds: &procinfo::scan_cwds(),
             annex,
             cleanup,
@@ -4865,12 +4799,6 @@ fn run(argv: &[OsString]) -> R<()> {
         return Err(Fail::new(
             2,
             "--all-repos cannot be combined with --abandoned",
-        ));
-    }
-    if cmd != "finish" && (args.flag("--squash") || args.flag("--rebase")) {
-        return Err(Fail::new(
-            2,
-            "--squash and --rebase are only valid for finish",
         ));
     }
     if cmd != "prune"

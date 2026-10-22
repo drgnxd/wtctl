@@ -12,12 +12,8 @@ pub fn ref_name(id: &str) -> String {
 
 /// Records `head` under the abandoned namespace.
 pub fn preserve(repo: &Repo, id: &str, head: &str) -> R<String> {
-    preserve_at(repo, ref_name(id), head, &format!("wtctl: abandon {id}"))
-}
-
-/// Creates `refname` at `head`. An existing ref must already name `head`, so a
-/// retry after a failed step succeeds while a different tip is never overwritten.
-pub fn preserve_at(repo: &Repo, refname: String, head: &str, message: &str) -> R<String> {
+    let refname = ref_name(id);
+    let message = format!("wtctl: abandon {id}");
     deny_reference_hook(repo)?;
     let existing = git::output(
         &repo.root,
@@ -37,7 +33,7 @@ pub fn preserve_at(repo: &Repo, refname: String, head: &str, message: &str) -> R
         // A retry after more commits moves the kept tip forward; it never
         // replaces a tip that the new one does not contain.
         if is_ancestor(&repo.root, &current, head)? {
-            cas_update(&repo.root, &refname, head, &current, message)?;
+            cas_update(&repo.root, &refname, head, &current, &message)?;
             return Ok(refname);
         }
         return refuse(format!("{refname} already preserves {current}, not {head}"));
@@ -49,7 +45,7 @@ pub fn preserve_at(repo: &Repo, refname: String, head: &str, message: &str) -> R
             "update-ref",
             "--create-reflog",
             "-m",
-            message,
+            &message,
             &refname,
             head,
             ZERO_OID,

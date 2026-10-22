@@ -97,17 +97,11 @@ Nothing is adopted automatically.
   reflog-only commits still refuse. `list --abandoned` shows what is kept and
   `restore` starts a new task from it.
 - `finish --dry-run` takes no lock and changes nothing. It reports how the task
-  would integrate (already integrated, fast-forward, merge, rebase), runs the
+  would integrate (already integrated, fast-forward, or merge), runs the
   checks a real run would (owner, signing, hooks, filters, merge conflicts,
   worktree state, open processes, artifact cleanup), and lists the flags the
   real run needs. It exits 4 unless the real run would pass with the flags
   given.
-- `finish --squash --integration-message <text>` integrates one commit; `finish
-  --rebase` replays the task onto an advanced `main` instead of merging `main`
-  into it. Both keep the original tip under `refs/wtctl/superseded/<id>.<n>` (one ref per attempt),
-  require a clean worktree, refuse git-annex repositories, honor
-  `--allow-commit-signing` and `--allow-repository-hooks`, and leave the
-  worktree in place when a rebase conflicts. The default remains a merge.
 - `create --fetch [--remote <name>]` fetches before resolving `--from`, and
   `finish --push [--remote <name>]` pushes the integrated `main` without
   forcing (`pre-push` hooks need `--allow-repository-hooks`). A rejected push is
