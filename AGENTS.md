@@ -23,4 +23,7 @@ small, standard-library first, and fail closed.
 
 - Commits follow the Conventional Commits subject format in English; see
   `CONTRIBUTING.md`. CI checks subject syntax.
+- Keep built-in artifact roots limited to broadly disposable outputs. Handle
+  exceptional files only through an explicit, exact-path, per-invocation
+  selector; do not broaden default cleanup roots for a single consumer case.
 - Comments explain why, never what.

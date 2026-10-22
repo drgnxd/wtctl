@@ -492,6 +492,289 @@ fn finish_discards_default_generated_artifacts_after_integration() {
 }
 
 #[test]
+fn one_off_artifact_path_dry_run_reports_exact_file_then_removes_it() {
+    let env = Env::new();
+    let (id, path) = env.create("one-off-artifact");
+    let selected = path.join("snapshot.jsonl");
+    fs::write(&selected, b"one-off generated snapshot").unwrap();
+
+    let dry = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-artifact-path",
+        "snapshot.jsonl",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let report: Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(
+        report["generated_artifact_paths"],
+        serde_json::json!(["snapshot.jsonl"])
+    );
+    assert_eq!(fs::read(&selected).unwrap(), b"one-off generated snapshot");
+    assert!(!env.quarantine_root().exists());
+
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-artifact-path",
+        "snapshot.jsonl",
+    ]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    assert!(env.quarantine_root().exists());
+    assert!(env.quarantine_root().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn one_off_artifact_path_refuses_siblings_and_broad_selectors() {
+    let env = Env::new();
+    let (id, path) = env.create("one-off-artifact-sibling");
+    env.exclude("/.cache/");
+    fs::create_dir_all(path.join(".cache")).unwrap();
+    let selected = path.join(".cache/snapshot.jsonl");
+    let sibling = path.join(".cache/keep.txt");
+    fs::write(&selected, b"selected").unwrap();
+    fs::write(&sibling, b"keep").unwrap();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--keep-worktree",
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert_eq!(fs::read(&selected).unwrap(), b"selected");
+    assert_eq!(fs::read(&sibling).unwrap(), b"keep");
+    assert!(!env.quarantine_root().exists());
+
+    let broad = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--discard-generated-caches",
+        "--dry-run",
+    ]);
+    assert_eq!(broad.status.code(), Some(2), "{broad:?}");
+    assert_eq!(fs::read(&selected).unwrap(), b"selected");
+    assert_eq!(fs::read(&sibling).unwrap(), b"keep");
+    assert!(path.exists());
+}
+
+#[test]
+fn one_off_artifact_path_refuses_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let (id, path) = env.create("one-off-artifact-symlink");
+    env.exclude("/.cache/");
+    let outside = env.tmp.join("outside-cache");
+    fs::create_dir_all(&outside).unwrap();
+    let external_file = outside.join("snapshot.jsonl");
+    fs::write(&external_file, b"external data").unwrap();
+    symlink(&outside, path.join(".cache")).unwrap();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--keep-worktree",
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(path.join(".cache").is_symlink());
+    assert_eq!(fs::read(&external_file).unwrap(), b"external data");
+    assert!(!env.quarantine_root().exists());
+
+    let env = Env::new();
+    let (id, path) = env.create("oneoff-leaf-link");
+    let main_before = env.main_oid();
+    env.exclude("/.cache/");
+    fs::create_dir_all(path.join(".cache")).unwrap();
+    let outside = env.tmp.join("outside-file");
+    fs::write(&outside, b"external data").unwrap();
+    symlink(&outside, path.join(".cache/snapshot.jsonl")).unwrap();
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--keep-worktree",
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(path.join(".cache/snapshot.jsonl").is_symlink());
+    assert_eq!(fs::read(&outside).unwrap(), b"external data");
+    assert_eq!(env.main_oid(), main_before);
+}
+
+#[test]
+fn finish_one_off_nested_path_requires_keep_worktree_to_preserve_parent() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-one-off-artifact");
+    env.exclude("/.cache/");
+    let selected = path.join(".cache/snapshot.jsonl");
+    fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    fs::write(&selected, b"one-off generated snapshot").unwrap();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--preserve-generated-artifacts",
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--keep-worktree"));
+    assert_eq!(fs::read(&selected).unwrap(), b"one-off generated snapshot");
+    assert!(path.exists());
+}
+
+#[test]
+fn finish_keep_worktree_discards_exact_nested_artifact_and_retains_empty_parent() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let (id, path) = env.create("finish-keep-oneoff-parent");
+    env.exclude("/.cache/");
+    let canonical_database = env.repo.join("state.db");
+    fs::write(&canonical_database, b"canonical database").unwrap();
+    symlink(&canonical_database, path.join("state.db")).unwrap();
+    let selected = path.join(".cache/snapshot.jsonl");
+    fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    fs::write(&selected, b"one-off generated snapshot").unwrap();
+    commit_file(&path, "task.txt", "task change\n");
+    let task_tip = git(&path, &["rev-parse", "HEAD"]);
+
+    let finished = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--keep-worktree",
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--external-writers-quiesced",
+        "--integration-message",
+        "docs: integrate one-off artifact cleanup test",
+        "--json",
+    ]);
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let report: Value = serde_json::from_slice(&finished.stdout).unwrap();
+    assert_eq!(report["status"], "integrated-kept");
+    assert_eq!(
+        report["one_off_artifact_discarded"],
+        ".cache/snapshot.jsonl"
+    );
+    assert!(path.is_dir());
+    assert!(!selected.exists());
+    assert!(selected.parent().unwrap().is_dir());
+    assert!(selected
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_none());
+    assert!(path.join("state.db").is_symlink());
+    assert_eq!(
+        fs::canonicalize(path.join("state.db")).unwrap(),
+        fs::canonicalize(&canonical_database).unwrap()
+    );
+    assert_eq!(
+        fs::read(&canonical_database).unwrap(),
+        b"canonical database"
+    );
+    assert_eq!(env.main_oid(), task_tip);
+}
+
+#[test]
+fn finish_keep_worktree_reports_integrated_but_keeps_artifact_if_sibling_appears() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-hook-sibling");
+    env.exclude("/.cache/");
+    let selected = path.join(".cache/snapshot.jsonl");
+    fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    fs::write(&selected, b"one-off generated snapshot").unwrap();
+    commit_file(&path, "task.txt", "task change\n");
+    let task_tip = git(&path, &["rev-parse", "HEAD"]);
+
+    let sibling = path.join(".cache/concurrent-output.jsonl");
+    let hook = env.repo.join(".git/hooks/post-merge");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf sibling > \"{}\"\n", sibling.display()),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&hook).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&hook, permissions).unwrap();
+
+    let finished = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--keep-worktree",
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--integration-message",
+        "docs: test cleanup pending after integration",
+    ]);
+    assert_eq!(finished.status.code(), Some(4), "{finished:?}");
+    let stderr = String::from_utf8_lossy(&finished.stderr);
+    assert!(stderr.contains("is integrated to main"), "{stderr}");
+    assert!(stderr.contains("cleanup was not started"), "{stderr}");
+    assert_eq!(env.main_oid(), task_tip);
+    assert!(path.is_dir());
+    assert_eq!(fs::read(&selected).unwrap(), b"one-off generated snapshot");
+    assert_eq!(fs::read(&sibling).unwrap(), b"sibling");
+}
+
+#[test]
 fn discarding_result_removes_only_the_symlink() {
     use std::os::unix::fs::symlink;
 

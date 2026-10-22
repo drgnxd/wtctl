@@ -128,6 +128,18 @@ still match; unknown `.direnv` layouts are retained. Direct
 `--discard-generated-caches`, `--discard-generated-build-outputs`,
 `--discard-direnv-cache`, or `--discard-generated-artifacts`.
 
+For a user-authorized one-off exception, `finish` and `remove` accept
+`--discard-artifact-path <relative-file>`. It selects only one ignored or
+untracked regular file, requires every path component to be a real directory,
+and refuses if the parent contains another tracked, untracked, or ignored file.
+It cannot be combined with broad discard selectors. A nested path requires
+`finish --keep-worktree` so its parent remains; a worktree-removing `finish` or
+`remove` refuses nested selections. With `finish --keep-worktree`, the selected
+file is signed and quarantined while the worktree and parent remain. Dry-run
+reports the exact path without writing, and a failed operation restores it only
+after verifying its signature. This exception is per invocation and does not
+change the repository or built-in artifact policy.
+
 `reap` also selects only disposable Python caches (`.pytest_cache`,
 `.ruff_cache`, and `__pycache__`) for cleanup. Other ignored or untracked data
 keeps an orphan from being removed.

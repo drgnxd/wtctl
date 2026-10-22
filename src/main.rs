@@ -34,14 +34,15 @@ const USAGE: &str = "usage: wtctl <command> [options]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
-  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--keep-worktree] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id>
   remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
 
   artifact cleanup options: --discard-direnv-cache, --discard-generated-caches,
     --discard-generated-build-outputs, --discard-generated-artifacts,
-    --preserve-generated-artifacts, --purge-preserved-quarantine <operation-id>
+    --discard-artifact-path <relative-file>, --preserve-generated-artifacts,
+    --purge-preserved-quarantine <operation-id>
 
 exit codes: 0 ok, 1 error, 2 usage, 3 main diverged (rebase needed),
 4 refused by a safety check, 5 lock busy";
@@ -85,12 +86,13 @@ fn cmd_capabilities(a: &Args) -> R<()> {
         "legacy_session_lifecycle": true,
         "git_annex": true,
         "artifact_quarantine": true,
+        "artifact_path_selector": true,
         "quarantine_purge": true,
     });
     if a.flag("--json") {
         out!("{capabilities}");
     } else {
-        out!("wtctl lifecycle capabilities: schema 1, legacy, git-annex, artifact-quarantine");
+        out!("wtctl lifecycle capabilities: schema 1, legacy, git-annex, artifact-quarantine, exact-artifact-path");
     }
     Ok(())
 }
@@ -120,6 +122,7 @@ const VALUE_OPTS: &[&str] = &[
     "--worktrees-root",
     "--base",
     "--lock-name",
+    "--discard-artifact-path",
 ];
 const FLAG_OPTS: &[&str] = &[
     "--mine",
@@ -168,6 +171,12 @@ impl Args {
                         .cloned()
                         .ok_or_else(|| Fail::new(2, format!("{name} needs a value")))?,
                 };
+                if name == "--discard-artifact-path" && values.contains_key(name) {
+                    return Err(Fail::new(
+                        2,
+                        "--discard-artifact-path may be specified only once",
+                    ));
+                }
                 values.insert(name.to_string(), value);
             } else if FLAG_OPTS.contains(&name) && inline.is_none() {
                 flags.push(name.to_string());
@@ -219,6 +228,24 @@ fn artifact_options(a: &Args, finish_default: bool) -> R<artifact::Options> {
     let preserve = a.flag("--preserve-generated-artifacts");
     let discard_all = a.flag("--discard-generated-artifacts") || (finish_default && !preserve);
     let discard_caches = a.flag("--discard-generated-caches");
+    let discard_artifact_path = a.get("--discard-artifact-path")?.map(PathBuf::from);
+    if discard_artifact_path.is_some()
+        && (a.flag("--discard-direnv-cache")
+            || a.flag("--discard-generated-artifacts")
+            || a.flag("--discard-generated-caches")
+            || a.flag("--discard-generated-build-outputs"))
+    {
+        return Err(Fail::new(
+            2,
+            "--discard-artifact-path cannot be combined with broad artifact selectors",
+        ));
+    }
+    if finish_default && discard_artifact_path.is_some() && !preserve {
+        return Err(Fail::new(
+            2,
+            "finish with --discard-artifact-path requires --preserve-generated-artifacts to keep other generated artifacts",
+        ));
+    }
     if discard_all && preserve {
         return Err(Fail::new(
             2,
@@ -238,6 +265,7 @@ fn artifact_options(a: &Args, finish_default: bool) -> R<artifact::Options> {
         discard_all,
         preserve_generated: preserve,
         allow_unreferenced_reflog: a.flag("--allow-unreferenced-reflog"),
+        discard_artifact_path,
     })
 }
 
@@ -1044,7 +1072,7 @@ fn cmd_list(a: &Args) -> R<()> {
                     artifact::inspect_plan(
                         &e.path,
                         main_worktree.as_deref(),
-                        artifact::Options::default(),
+                        &artifact::Options::default(),
                     )
                     .map(|_| ())
                 })
@@ -1326,7 +1354,7 @@ fn integrate_task(
         f.removable_except_integration()
             .map_err(|why| Fail::new(4, format!("{id} has unsafe state: {why}")))?;
         let main_worktree = canonical_main_checkout(repo)?;
-        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
             .map_err(|why| Fail::new(4, format!("{id} has changes: {why}")))?;
     } else {
         match f.clean {
@@ -1522,7 +1550,7 @@ fn merge_main_into_task(
         .map_err(|why| Fail::new(4, format!("{id} is not safe to merge: {why}")))?;
     let main_worktree = canonical_main_checkout(repo)?;
     let initial_plan =
-        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup).map_err(
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &context.cleanup).map_err(
             |why| {
                 Fail::new(
                     4,
@@ -1538,14 +1566,15 @@ fn merge_main_into_task(
             entry,
             &entry.head,
             main_worktree.as_deref(),
-            context.cleanup,
+            &context.cleanup,
             &initial_plan,
         )?;
     }
     ensure_task_head(entry, context.task_tip)?;
     ensure_no_cwd_users(entry, "merge preparation")?;
-    let merge_plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
-        .map_err(|why| Fail::new(4, format!("{id} changed during merge preparation: {why}")))?;
+    let merge_plan =
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &context.cleanup)
+            .map_err(|why| Fail::new(4, format!("{id} changed during merge preparation: {why}")))?;
     let preview = git::output(
         &repo.root,
         [
@@ -1681,14 +1710,14 @@ fn merge_main_into_task(
         .trim()
         .to_string();
     let merged_plan =
-        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup)
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &context.cleanup)
             .map_err(|why| Fail::new(4, format!("{id} changed before annex restage: {why}")))?;
     if context.annex {
         annex_restage(
             entry,
             &merged_tip,
             main_worktree.as_deref(),
-            context.cleanup,
+            &context.cleanup,
             &merged_plan,
         )?;
     }
@@ -1722,7 +1751,7 @@ fn merge_main_into_task(
     let refreshed = task::facts(&[entry], context.main_ref)?;
     let refreshed = refreshed.first().cloned().unwrap_or_default();
     if refreshed.removable_except_integration().is_err()
-        || artifact::inspect_plan(&entry.path, main_worktree.as_deref(), context.cleanup).is_err()
+        || artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &context.cleanup).is_err()
     {
         return refuse(format!(
             "{id} changed after merging main; leave it for inspection"
@@ -2325,11 +2354,18 @@ fn cmd_finish(a: &Args) -> R<()> {
             "inspect scheduled and non-cooperating writers, then pass --external-writers-quiesced",
         );
     }
-    let cleanup = if keep_worktree {
-        artifact::Options::default()
-    } else {
-        artifact_options(a, true)?
-    };
+    let cleanup = artifact_options(a, !keep_worktree)?;
+    if !keep_worktree
+        && cleanup
+            .discard_artifact_path
+            .as_ref()
+            .is_some_and(|path| path.components().count() > 1)
+    {
+        return Err(Fail::new(
+            2,
+            "nested --discard-artifact-path requires --keep-worktree to retain its parent",
+        ));
+    }
     let (main, refname) = main_ref(a, &repo.root)?;
     let annex = repo.require_annex_ready(true)?;
     let _lock = repo.lock()?;
@@ -2398,7 +2434,7 @@ fn cmd_finish(a: &Args) -> R<()> {
                 task_tip: &task_tip,
                 allow_hooks: a.flag("--allow-repository-hooks"),
                 annex,
-                cleanup,
+                cleanup: cleanup.clone(),
                 integration_message,
                 allow_annex_filter: a.flag("--allow-annex-filter"),
                 allow_commit_signing: a.flag("--allow-commit-signing"),
@@ -2436,7 +2472,7 @@ fn cmd_finish(a: &Args) -> R<()> {
         IntegrationOptions {
             allow_hooks: a.flag("--allow-repository-hooks"),
             allow_annex_filter: a.flag("--allow-annex-filter"),
-            cleanup: Some(cleanup),
+            cleanup: Some(cleanup.clone()),
             json_output: a.flag("--json"),
         },
     )?;
@@ -2463,9 +2499,62 @@ fn cmd_finish(a: &Args) -> R<()> {
         .removable_except_integration()
         .map_err(|why| Fail::new(4, format!("{display_id} changed after integration: {why}")))?;
     let main_worktree = canonical_main_checkout(&repo)?;
-    artifact::inspect_plan(&fresh.path, main_worktree.as_deref(), cleanup)
-        .map_err(|why| Fail::new(4, format!("{display_id} changed after integration: {why}")))?;
+    let post_integration_plan = match artifact::inspect_plan(
+        &fresh.path,
+        main_worktree.as_deref(),
+        &cleanup,
+    ) {
+        Ok(plan) => plan,
+        Err(why) => {
+            repo.audit(json!({
+                "at": now(),
+                "event": "finish-cleanup-pending",
+                "worktree_id": removal.worktree_id,
+                "ref": refname,
+                "main_tip": tip,
+                "task_tip": finish_head,
+                "one_off_artifact_path": cleanup.discard_artifact_path.as_ref(),
+                "reason": &why,
+                "pid": caller.pid,
+            }));
+            return Err(Fail::new(
+                4,
+                format!(
+                    "{display_id} is integrated to {main}; worktree remains and cleanup was not started: {why}"
+                ),
+            ));
+        }
+    };
     if keep_worktree {
+        if cleanup.discard_artifact_path.is_some() {
+            if let Err(why) = artifact::discard_one_off_for_kept_worktree(
+                &post_integration_plan,
+                &repo.name(),
+                &repo.common,
+                &fresh.path,
+                &fresh.admin,
+                &finish_head,
+                fresh.branch_ref(),
+            ) {
+                repo.audit(json!({
+                    "at": now(),
+                    "event": "finish-kept-cleanup-pending",
+                    "worktree_id": removal.worktree_id,
+                    "ref": refname,
+                    "main_tip": tip,
+                    "task_tip": finish_head,
+                    "one_off_artifact_path": cleanup.discard_artifact_path.as_ref(),
+                    "reason": &why,
+                    "pid": caller.pid,
+                }));
+                return Err(Fail::new(
+                    4,
+                    format!(
+                        "{display_id} is integrated; worktree remains; one-off cleanup is incomplete: {why}"
+                    ),
+                ));
+            }
+        }
         repo.audit(json!({
             "at": now(),
             "event": "finish-kept",
@@ -2474,6 +2563,7 @@ fn cmd_finish(a: &Args) -> R<()> {
             "old": old,
             "new": tip,
             "already_integrated": already,
+            "one_off_artifact_discarded": cleanup.discard_artifact_path.as_ref(),
             "pid": caller.pid,
         }));
         if a.flag("--json") {
@@ -2486,10 +2576,16 @@ fn cmd_finish(a: &Args) -> R<()> {
                     "task_id": display_id,
                     "worktree_id": removal.worktree_id,
                     "task_tip": finish_head,
+                    "one_off_artifact_discarded": cleanup.discard_artifact_path.as_ref(),
                 })
             );
         } else {
-            out!("integrated {display_id}: {main} (worktree kept)");
+            let artifact = cleanup
+                .discard_artifact_path
+                .as_ref()
+                .map(|path| format!("; discarded one-off artifact {}", path.display()))
+                .unwrap_or_default();
+            out!("integrated {display_id}: {main} (worktree kept{artifact})");
         }
         return Ok(());
     }
@@ -2706,7 +2802,7 @@ fn annex_restage(
     entry: &Entry,
     expected_head: &str,
     main_worktree: Option<&Path>,
-    cleanup: artifact::Options,
+    cleanup: &artifact::Options,
     expected_plan: &artifact::Plan,
 ) -> R<()> {
     let result = git::output(&entry.path, ["annex", "restage"])?;
@@ -2985,10 +3081,16 @@ fn remove_worktree(
     let locked = removal_lock_state(entry, authority)?;
     gitfile_pointer(entry)?;
     let main_worktree = canonical_main_checkout(repo)?;
-    let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+    let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
         .map_err(|why| Fail::new(4, format!("{id}: {why}")))?;
     if annex {
-        annex_restage(entry, &entry.head, main_worktree.as_deref(), cleanup, &plan)?;
+        annex_restage(
+            entry,
+            &entry.head,
+            main_worktree.as_deref(),
+            &cleanup,
+            &plan,
+        )?;
         let refreshed = Entry::load(entry.admin.clone()).ok_or_else(|| {
             Fail::new(
                 4,
@@ -3454,6 +3556,7 @@ fn cmd_remove(a: &Args) -> R<()> {
             ]
             .iter()
             .any(|flag| a.flag(flag))
+            || a.os("--discard-artifact-path").is_some()
             || a.os("--base").is_some()
         {
             return Err(Fail::new(
@@ -3498,6 +3601,16 @@ fn cmd_remove(a: &Args) -> R<()> {
         ));
     }
     let cleanup = artifact_options(a, false)?;
+    if cleanup
+        .discard_artifact_path
+        .as_ref()
+        .is_some_and(|path| path.components().count() > 1)
+    {
+        return Err(Fail::new(
+            2,
+            "nested --discard-artifact-path requires finish --keep-worktree to retain its parent",
+        ));
+    }
     let id = a.get("--id")?;
     let legacy_id = a.get("--legacy-worktree-id")?;
     let branch = a.get("--expect-branch")?;
@@ -3574,8 +3687,21 @@ fn cmd_remove(a: &Args) -> R<()> {
         let main_worktree = canonical_main_checkout(&repo)?;
         artifact::check_pending_transaction(&repo.name(), &entry.path)
             .map_err(|why| Fail::new(4, why))?;
-        let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), cleanup)
+        let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
             .map_err(|why| Fail::new(4, why))?;
+        let generated_artifact_paths: Vec<String> = plan
+            .generated
+            .iter()
+            .map(|artifact| {
+                artifact
+                    .path
+                    .strip_prefix(&entry.path)
+                    .map_err(|_| Fail::new(4, "generated artifact path escaped the worktree"))?
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| Fail::new(4, "generated artifact path is not UTF-8"))
+            })
+            .collect::<R<_>>()?;
         verify_removal_authority(&repo, &entry, &authority)?;
         removal_lock_state(&entry, &authority)?;
         let users = procinfo::users_inside(&procinfo::scan_cwds(), &entry.path)
@@ -3598,13 +3724,14 @@ fn cmd_remove(a: &Args) -> R<()> {
                     "head": head,
                     "verified_dotgit": if dotgit.is_some() { "symlink" } else { "gitfile" },
                     "generated_artifacts": plan.generated.len() + usize::from(plan.direnv.is_some()),
+                    "generated_artifact_paths": generated_artifact_paths.clone(),
                     "canonical_database_link": plan.database_link.is_some(),
                     "git_annex_restage": annex,
                 })
             );
         } else {
             out!(
-                "dry-run ok: {} (.git is a {}; HEAD {}) would be removed{}{}",
+                "dry-run ok: {} (.git is a {}; HEAD {}) would be removed{}{}{}",
                 entry.path.display(),
                 if dotgit.is_some() {
                     "verified symlink"
@@ -3626,6 +3753,14 @@ fn cmd_remove(a: &Args) -> R<()> {
                     format!(
                         "; {} generated artifact(s) would be quarantined then cleaned or preserved",
                         plan.generated.len() + usize::from(plan.direnv.is_some())
+                    )
+                },
+                if generated_artifact_paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; selected artifact path(s): {}",
+                        generated_artifact_paths.join(", ")
                     )
                 },
             );
