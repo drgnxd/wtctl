@@ -34,7 +34,7 @@ const USAGE: &str = "usage: wtctl <command> [options]
   whoami  [--path <path>] [--json]
   list    [--repo <path>] [--mine | --orphans | --all | --wtctl | --legacy] [--active-hours <n>] [--main <branch> | --base <ref>] [--json]
   integrate --repo <path> --id <task-id> [--main <branch>] [--allow-repository-hooks] [--allow-annex-filter] [--external-writers-quiesced]
-  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--keep-worktree] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
+  finish  --repo <path> --id <task-id> [--main <branch>] [--integration-message <text>] [--keep-worktree] [--resume-one-off-quarantine <operation-id>] [--allow-repository-hooks] [--allow-annex-filter] [--allow-commit-signing] [artifact cleanup options] --external-writers-quiesced
   reap    [--repo <path>] [--dry-run] [--grace-secs <n>] [--main <branch> | --base <ref>] [--external-writers-quiesced]
   adopt   --repo <path> --id <task-id>
   remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
@@ -43,6 +43,8 @@ const USAGE: &str = "usage: wtctl <command> [options]
     --discard-generated-build-outputs, --discard-generated-artifacts,
     --discard-artifact-path <relative-file>, --preserve-generated-artifacts,
     --purge-preserved-quarantine <operation-id>
+  A failed exact-file purge can resume with --keep-worktree, the same
+  --discard-artifact-path, and --resume-one-off-quarantine <operation-id>.
 
 exit codes: 0 ok, 1 error, 2 usage, 3 main diverged (rebase needed),
 4 refused by a safety check, 5 lock busy";
@@ -117,6 +119,7 @@ const VALUE_OPTS: &[&str] = &[
     "--legacy-worktree-id",
     "--expect-branch",
     "--purge-preserved-quarantine",
+    "--resume-one-off-quarantine",
     "--integration-message",
     "--parent",
     "--worktrees-root",
@@ -2355,6 +2358,15 @@ fn cmd_finish(a: &Args) -> R<()> {
         );
     }
     let cleanup = artifact_options(a, !keep_worktree)?;
+    let resume_one_off_quarantine = a.get("--resume-one-off-quarantine")?;
+    if resume_one_off_quarantine.is_some()
+        && (!keep_worktree || cleanup.discard_artifact_path.is_none())
+    {
+        return Err(Fail::new(
+            2,
+            "--resume-one-off-quarantine requires --keep-worktree and --discard-artifact-path",
+        ));
+    }
     if !keep_worktree
         && cleanup
             .discard_artifact_path
@@ -2420,6 +2432,9 @@ fn cmd_finish(a: &Args) -> R<()> {
     let task_tip = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, format!("cannot resolve {display_id} HEAD")))?;
+    if resume_one_off_quarantine.is_some() && !is_ancestor(&repo.root, &task_tip, &main_tip)? {
+        return refuse("one-off quarantine recovery requires the task HEAD to be integrated");
+    }
     if !is_ancestor(&repo.root, &main_tip, &task_tip)?
         && !is_ancestor(&repo.root, &task_tip, &main_tip)?
     {
@@ -2459,23 +2474,27 @@ fn cmd_finish(a: &Args) -> R<()> {
     let finish_head = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD before integration"))?;
-    let (old, tip, already) = integrate_task(
-        &repo,
-        IntegrationContext {
-            id: &display_id,
-            main: &main,
-            refname: &refname,
-            task_base: &task_base,
-        },
-        &entry,
-        &caller,
-        IntegrationOptions {
-            allow_hooks: a.flag("--allow-repository-hooks"),
-            allow_annex_filter: a.flag("--allow-annex-filter"),
-            cleanup: Some(cleanup.clone()),
-            json_output: a.flag("--json"),
-        },
-    )?;
+    let (old, tip, already) = if resume_one_off_quarantine.is_some() {
+        (main_tip.clone(), main_tip.clone(), true)
+    } else {
+        integrate_task(
+            &repo,
+            IntegrationContext {
+                id: &display_id,
+                main: &main,
+                refname: &refname,
+                task_base: &task_base,
+            },
+            &entry,
+            &caller,
+            IntegrationOptions {
+                allow_hooks: a.flag("--allow-repository-hooks"),
+                allow_annex_filter: a.flag("--allow-annex-filter"),
+                cleanup: Some(cleanup.clone()),
+                json_output: a.flag("--json"),
+            },
+        )?
+    };
     let fresh = Entry::load(entry.admin.clone()).ok_or_else(|| {
         Fail::new(
             4,
@@ -2499,46 +2518,71 @@ fn cmd_finish(a: &Args) -> R<()> {
         .removable_except_integration()
         .map_err(|why| Fail::new(4, format!("{display_id} changed after integration: {why}")))?;
     let main_worktree = canonical_main_checkout(&repo)?;
-    let post_integration_plan = match artifact::inspect_plan(
-        &fresh.path,
-        main_worktree.as_deref(),
-        &cleanup,
-    ) {
-        Ok(plan) => plan,
-        Err(why) => {
-            repo.audit(json!({
-                "at": now(),
-                "event": "finish-cleanup-pending",
-                "worktree_id": removal.worktree_id,
-                "ref": refname,
-                "main_tip": tip,
-                "task_tip": finish_head,
-                "one_off_artifact_path": cleanup.discard_artifact_path.as_ref(),
-                "reason": &why,
-                "pid": caller.pid,
-            }));
-            return Err(Fail::new(
-                4,
-                format!(
-                    "{display_id} is integrated to {main}; worktree remains and cleanup was not started: {why}"
-                ),
-            ));
-        }
+    let post_integration_plan = if resume_one_off_quarantine.is_some() {
+        None
+    } else {
+        Some(
+            match artifact::inspect_plan(&fresh.path, main_worktree.as_deref(), &cleanup) {
+                Ok(plan) => plan,
+                Err(why) => {
+                    repo.audit(json!({
+                        "at": now(),
+                        "event": "finish-cleanup-pending",
+                        "worktree_id": removal.worktree_id,
+                        "ref": refname,
+                        "main_tip": tip,
+                        "task_tip": finish_head,
+                        "one_off_artifact_path": cleanup.discard_artifact_path.as_ref(),
+                        "reason": &why,
+                        "pid": caller.pid,
+                    }));
+                    return Err(Fail::new(
+                    4,
+                    format!(
+                        "{display_id} is integrated to {main}; worktree remains and cleanup was not started: {why}"
+                    ),
+                ));
+                }
+            },
+        )
     };
     if keep_worktree {
-        if cleanup.discard_artifact_path.is_some() {
-            if let Err(why) = artifact::discard_one_off_for_kept_worktree(
-                &post_integration_plan,
-                &repo.name(),
-                &repo.common,
-                &fresh.path,
-                &fresh.admin,
-                &finish_head,
-                fresh.branch_ref(),
-            ) {
+        if let Some(relative) = &cleanup.discard_artifact_path {
+            let cleanup_result = if let Some(operation_id) = resume_one_off_quarantine {
+                artifact::resume_one_off_for_kept_worktree(artifact::KeptOneOffRecovery {
+                    operation_id,
+                    repo_name: &repo.name(),
+                    common: &repo.common,
+                    worktree: &fresh.path,
+                    admin: &fresh.admin,
+                    head: &finish_head,
+                    branch: fresh.branch_ref(),
+                    relative,
+                })
+            } else {
+                post_integration_plan
+                    .as_ref()
+                    .ok_or_else(|| "one-off cleanup plan is missing".to_string())
+                    .and_then(|plan| {
+                        artifact::discard_one_off_for_kept_worktree(
+                            plan,
+                            &repo.name(),
+                            &repo.common,
+                            &fresh.path,
+                            &fresh.admin,
+                            &finish_head,
+                            fresh.branch_ref(),
+                        )
+                    })
+            };
+            if let Err(why) = cleanup_result {
                 repo.audit(json!({
                     "at": now(),
-                    "event": "finish-kept-cleanup-pending",
+                    "event": if resume_one_off_quarantine.is_some() {
+                        "finish-kept-cleanup-resume-pending"
+                    } else {
+                        "finish-kept-cleanup-pending"
+                    },
                     "worktree_id": removal.worktree_id,
                     "ref": refname,
                     "main_tip": tip,
@@ -3847,6 +3891,12 @@ fn run(argv: &[OsString]) -> R<()> {
         return Err(Fail::new(
             2,
             "merge integration options are only valid for finish",
+        ));
+    }
+    if cmd != "finish" && args.os("--resume-one-off-quarantine").is_some() {
+        return Err(Fail::new(
+            2,
+            "--resume-one-off-quarantine is only valid with finish",
         ));
     }
     if args.os("--base").is_some() && !matches!(cmd, "list" | "reap" | "remove") {

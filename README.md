@@ -136,8 +136,14 @@ It cannot be combined with broad discard selectors. A nested path requires
 `finish --keep-worktree` so its parent remains; a worktree-removing `finish` or
 `remove` refuses nested selections. With `finish --keep-worktree`, the selected
 file is signed and quarantined while the worktree and parent remain. Dry-run
-reports the exact path without writing, and a failed operation restores it only
-after verifying its signature. This exception is per invocation and does not
+reports the exact path without writing. A failure before quarantine restores the
+file only after verifying its signature; a purge failure keeps it in quarantine
+and reports the operation ID. Resume with the same worktree and exact path:
+`finish --repo <repo> --id <worktree-id> --keep-worktree
+--discard-artifact-path <relative-file> --resume-one-off-quarantine <operation-id>
+--external-writers-quiesced`. Resume requires the selected path to remain absent
+and its parent to remain empty; it purges only the signed quarantined file and
+keeps the parent and worktree. This exception is per invocation and does not
 change the repository or built-in artifact policy.
 
 `reap` also selects only disposable Python caches (`.pytest_cache`,

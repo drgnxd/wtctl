@@ -68,6 +68,17 @@ pub struct Plan {
     pub database_link: Option<DatabaseLink>,
 }
 
+pub struct KeptOneOffRecovery<'a> {
+    pub operation_id: &'a str,
+    pub repo_name: &'a str,
+    pub common: &'a Path,
+    pub worktree: &'a Path,
+    pub admin: &'a Path,
+    pub head: &'a str,
+    pub branch: Option<&'a str>,
+    pub relative: &'a Path,
+}
+
 #[derive(Clone, Debug)]
 pub struct MovedArtifact {
     pub original: PathBuf,
@@ -961,6 +972,191 @@ pub fn discard_one_off_for_kept_worktree(
         ));
     }
     verify_kept_one_off_parent(worktree, &relative).map_err(|error| {
+        format!("one-off file was purged, but its parent postcondition failed: {error}")
+    })?;
+    Ok(report)
+}
+
+pub fn resume_one_off_for_kept_worktree(
+    recovery: KeptOneOffRecovery<'_>,
+) -> Result<FinishReport, String> {
+    let KeptOneOffRecovery {
+        operation_id,
+        repo_name,
+        common,
+        worktree,
+        admin,
+        head,
+        branch,
+        relative,
+    } = recovery;
+    if operation_id.len() != 32
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("quarantine operation ID must be 32 lowercase hexadecimal characters".into());
+    }
+    validate_one_off_artifact_path(relative)?;
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        });
+    if !state_home.is_absolute() {
+        return Err("XDG_STATE_HOME must be absolute for quarantine recovery".into());
+    }
+    let root = state_home
+        .join(repo_name)
+        .join("worktrees/.removal-quarantine");
+    let operation = root.join(operation_id);
+    let root_meta = fs::symlink_metadata(&root)
+        .map_err(|error| format!("quarantine root does not exist: {error}"))?;
+    let operation_meta = fs::symlink_metadata(&operation)
+        .map_err(|error| format!("one-off quarantine transaction not found: {error}"))?;
+    if !private_dir(&root_meta)
+        || !private_dir(&operation_meta)
+        || root_meta.dev() != operation_meta.dev()
+    {
+        return Err(
+            "quarantine root or operation is not a private directory owned by the current user"
+                .into(),
+        );
+    }
+    let manifest_path = operation.join("manifest.json");
+    let manifest_meta = fs::symlink_metadata(&manifest_path)
+        .map_err(|error| format!("cannot inspect quarantine manifest: {error}"))?;
+    if !manifest_meta.is_file()
+        || manifest_meta.file_type().is_symlink()
+        || manifest_meta.uid() != unsafe { libc::getuid() }
+        || manifest_meta.mode() & 0o077 != 0
+        || manifest_meta.size() > 64 * 1024 * 1024
+    {
+        return Err("quarantine manifest is not a private regular file".into());
+    }
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|error| format!("cannot read quarantine manifest: {error}"))?,
+    )
+    .map_err(|error| format!("quarantine manifest is invalid: {error}"))?;
+    if manifest["schema_version"] != 1
+        || manifest["operation_id"] != operation_id
+        || manifest["common_dir"] != common.to_string_lossy().as_ref()
+        || manifest["worktree"] != worktree.to_string_lossy().as_ref()
+        || manifest["admin_dir"] != admin.to_string_lossy().as_ref()
+        || manifest["head"] != head
+        || manifest["branch_ref"] != json!(branch)
+        || !matches!(
+            manifest["phase"].as_str(),
+            Some("completed_preserved" | "purging_preserved")
+        )
+        || !manifest["database_link"].is_null()
+        || !manifest["direnv"].is_null()
+    {
+        return Err("quarantine manifest does not identify this kept one-off cleanup".into());
+    }
+    let worktree_meta = fs::symlink_metadata(worktree)
+        .map_err(|error| format!("cannot inspect kept worktree: {error}"))?;
+    let admin_meta = fs::symlink_metadata(admin)
+        .map_err(|error| format!("cannot inspect kept worktree admin directory: {error}"))?;
+    if !worktree_meta.is_dir()
+        || worktree_meta.file_type().is_symlink()
+        || !admin_meta.is_dir()
+        || admin_meta.file_type().is_symlink()
+        || manifest["worktree_identity"] != json!([worktree_meta.dev(), worktree_meta.ino()])
+        || manifest["admin_identity"] != json!([admin_meta.dev(), admin_meta.ino()])
+    {
+        return Err("kept worktree or admin identity changed since quarantine".into());
+    }
+    let current_head = git::run(worktree, ["rev-parse", "HEAD"])
+        .map_err(|error| format!("cannot verify kept worktree HEAD: {}", error.msg))?;
+    if current_head.trim() != head {
+        return Err("kept worktree HEAD changed since quarantine".into());
+    }
+    if one_off_path_exists(worktree, relative)? {
+        return Err(
+            "selected one-off artifact was recreated; quarantine was left untouched".into(),
+        );
+    }
+    verify_kept_one_off_parent(worktree, relative)?;
+
+    let records = manifest["generated_caches"]
+        .as_array()
+        .ok_or_else(|| "quarantine manifest has no generated-cache records".to_string())?;
+    if records.len() != 1 {
+        return Err("kept-worktree recovery requires one quarantined artifact".into());
+    }
+    let record = &records[0];
+    let relative_text = relative
+        .to_str()
+        .ok_or_else(|| "one-off artifact path must be valid UTF-8".to_string())?;
+    if record["one_off"] != true
+        || record["preserve"] != false
+        || record["path"] != relative_text
+        || record["purge_state"] != "purging"
+        || record["purge_journal"] != "purge-generated-cache-000.jsonl"
+        || record["quarantine_path"]
+            != operation
+                .join("generated-cache-000")
+                .to_string_lossy()
+                .as_ref()
+    {
+        return Err("quarantine does not contain the requested one-off artifact".into());
+    }
+    let signature = parse_signature(&record["signature"])?;
+    if !is_one_off_file_signature(&signature) {
+        return Err("one-off quarantine must contain one signed regular file".into());
+    }
+    let quarantine = operation.join("generated-cache-000");
+    verify_signature(&quarantine, &signature, worktree)?;
+    let journal = operation.join("purge-generated-cache-000.jsonl");
+    let mut allowed = BTreeSet::from([
+        "manifest.json".to_string(),
+        "generated-cache-000".to_string(),
+    ]);
+    if fs::symlink_metadata(&journal).is_ok() {
+        allowed.insert("purge-generated-cache-000.jsonl".into());
+    }
+    let actual: BTreeSet<String> = fs::read_dir(&operation)
+        .map_err(|error| format!("cannot inspect quarantine contents: {error}"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("cannot read quarantine entry: {error}"))?;
+    if actual != allowed {
+        return Err("one-off quarantine contains unrecognized or missing entries".into());
+    }
+
+    let moved = MovedArtifact {
+        original: worktree.join(relative),
+        quarantine,
+        journal,
+        signature,
+        preserve: false,
+        direnv: false,
+        one_off: true,
+    };
+    let mut transaction = Transaction {
+        operation,
+        manifest_path,
+        manifest,
+        moved: vec![moved],
+        database_link: None,
+    };
+    let operation = transaction.operation.clone();
+    let report = finish_transaction(&mut transaction).map_err(|error| {
+        format!(
+            "kept-worktree one-off quarantine needs inspection at {}: {error}",
+            operation.display()
+        )
+    })?;
+    if !report.preserved.is_empty() || !report.warnings.is_empty() {
+        return Err(format!(
+            "kept-worktree one-off quarantine remains at {}: {}",
+            operation.display(),
+            report.warnings.join("; ")
+        ));
+    }
+    verify_kept_one_off_parent(worktree, relative).map_err(|error| {
         format!("one-off file was purged, but its parent postcondition failed: {error}")
     })?;
     Ok(report)

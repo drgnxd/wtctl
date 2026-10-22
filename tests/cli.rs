@@ -732,6 +732,135 @@ fn finish_keep_worktree_discards_large_exact_nested_artifact_and_retains_empty_p
 }
 
 #[test]
+fn finish_resumes_one_off_quarantine_without_removing_kept_worktree() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-resume-oneoff");
+    let selected = path.join(".cache/snapshot.jsonl");
+    commit_file(&path, "task.txt", "task change\n");
+    let task_tip = git(&path, &["rev-parse", "HEAD"]);
+    let integrated = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--keep-worktree",
+        "--external-writers-quiesced",
+        "--integration-message",
+        "docs: keep worktree before one-off recovery test",
+    ]);
+    assert!(integrated.status.success(), "{integrated:?}");
+    assert_eq!(env.main_oid(), task_tip);
+    assert!(path.is_dir());
+    env.exclude("/.cache/");
+    fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    fs::write(&selected, b"one-off generated snapshot").unwrap();
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+
+    let quarantine_root = env.quarantine_root();
+    fs::create_dir_all(&quarantine_root).unwrap();
+    fs::set_permissions(&quarantine_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let operation_id = "0123456789abcdef0123456789abcdef";
+    let operation = quarantine_root.join(operation_id);
+    fs::create_dir(&operation).unwrap();
+    fs::set_permissions(&operation, fs::Permissions::from_mode(0o700)).unwrap();
+    let archive = operation.join("generated-cache-000");
+    let metadata = fs::symlink_metadata(&selected).unwrap();
+    let digest = format!("sha256:{:x}", Sha256::digest(fs::read(&selected).unwrap()));
+    let mtime_ns = metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128;
+    let signature = serde_json::json!([[
+        ".",
+        "file",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.size(),
+        mtime_ns.to_string(),
+        digest,
+    ]]);
+    fs::rename(&selected, &archive).unwrap();
+    let worktree = fs::canonicalize(&path).unwrap();
+    let admin = fs::canonicalize(env.admin(&id)).unwrap();
+    let common = fs::canonicalize(env.repo.join(".git")).unwrap();
+    let worktree_metadata = fs::symlink_metadata(&worktree).unwrap();
+    let admin_metadata = fs::symlink_metadata(&admin).unwrap();
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "phase": "completed_preserved",
+        "worktree": worktree,
+        "worktree_identity": [worktree_metadata.dev(), worktree_metadata.ino()],
+        "admin_dir": admin,
+        "admin_identity": [admin_metadata.dev(), admin_metadata.ino()],
+        "common_dir": common,
+        "branch_ref": null,
+        "head": task_tip,
+        "database_link": null,
+        "direnv": null,
+        "generated_caches": [{
+            "path": ".cache/snapshot.jsonl",
+            "signature": signature,
+            "quarantine_path": archive,
+            "purge_journal": "purge-generated-cache-000.jsonl",
+            "preserve": false,
+            "one_off": true,
+            "purge_state": "purging",
+            "purge_warning": "simulated interrupted purge"
+        }]
+    });
+    let manifest_path = operation.join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!selected.exists());
+    assert!(selected.parent().unwrap().is_dir());
+    assert!(selected
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_none());
+    assert!(path.is_dir());
+    let resumed = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--keep-worktree",
+        "--discard-artifact-path",
+        ".cache/snapshot.jsonl",
+        "--resume-one-off-quarantine",
+        operation_id,
+        "--external-writers-quiesced",
+        "--allow-repository-hooks",
+        "--integration-message",
+        "docs: resume one-off purge test",
+        "--json",
+    ]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["status"], "integrated-kept");
+    assert_eq!(
+        report["one_off_artifact_discarded"],
+        ".cache/snapshot.jsonl"
+    );
+    assert!(path.is_dir());
+    assert_eq!(env.main_oid(), task_tip);
+    assert!(!selected.exists());
+    assert!(selected.parent().unwrap().is_dir());
+    assert!(selected
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_none());
+    assert!(!operation.exists());
+}
+
+#[test]
 fn finish_keep_worktree_reports_integrated_but_keeps_artifact_if_sibling_appears() {
     let env = Env::new();
     let (id, path) = env.create("finish-hook-sibling");
