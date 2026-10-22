@@ -666,7 +666,7 @@ fn finish_one_off_nested_path_requires_keep_worktree_to_preserve_parent() {
 }
 
 #[test]
-fn finish_keep_worktree_discards_exact_nested_artifact_and_retains_empty_parent() {
+fn finish_keep_worktree_discards_large_exact_nested_artifact_and_retains_empty_parent() {
     use std::os::unix::fs::symlink;
 
     let env = Env::new();
@@ -677,7 +677,10 @@ fn finish_keep_worktree_discards_exact_nested_artifact_and_retains_empty_parent(
     symlink(&canonical_database, path.join("state.db")).unwrap();
     let selected = path.join(".cache/snapshot.jsonl");
     fs::create_dir_all(selected.parent().unwrap()).unwrap();
-    fs::write(&selected, b"one-off generated snapshot").unwrap();
+    fs::File::create(&selected)
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
     commit_file(&path, "task.txt", "task change\n");
     let task_tip = git(&path, &["rev-parse", "HEAD"]);
 

@@ -614,7 +614,13 @@ pub fn purge_preserved(
         if one_off && !is_one_off_file_signature(&signature) {
             return Err("one-off artifact quarantine must contain one signed regular file".into());
         }
-        verify_artifact_progress(&archive, &signature, record, &operation.join(&journal_name))?;
+        verify_artifact_progress(
+            &archive,
+            &signature,
+            record,
+            &operation.join(&journal_name),
+            one_off,
+        )?;
         allowed.insert(name);
         labels.push(relative.to_string());
         transaction.moved.push(MovedArtifact {
@@ -674,6 +680,7 @@ pub fn purge_preserved(
                 &signature,
                 &transaction.manifest["direnv"],
                 &operation.join("purge-direnv.jsonl"),
+                false,
             )?;
             if fs::symlink_metadata(&archive).is_ok() {
                 allowed.insert(".direnv".into());
@@ -795,6 +802,7 @@ fn verify_purge_progress(
     root: &Path,
     signature: &[TreeEntry],
     record: &Value,
+    one_off: bool,
 ) -> Result<(), String> {
     let ordered = legacy_purge_order(signature);
     let cursor = record["purge_cursor"].as_u64().unwrap_or(0) as usize;
@@ -832,11 +840,11 @@ fn verify_purge_progress(
             }
         } else if index == cursor && pending == Some(entry.relative.as_str()) {
             if fs::symlink_metadata(&path).is_ok() {
-                verify_one(&path, entry)?;
+                verify_one(&path, entry, one_off)?;
                 expected_paths.insert(entry.relative.clone());
             }
         } else {
-            verify_one(&path, entry)?;
+            verify_one(&path, entry, one_off)?;
             expected_paths.insert(entry.relative.clone());
         }
     }
@@ -856,6 +864,7 @@ fn verify_artifact_progress(
     signature: &[TreeEntry],
     record: &Value,
     journal: &Path,
+    one_off: bool,
 ) -> Result<(), String> {
     if record["purge_order"]
         .as_str()
@@ -864,7 +873,7 @@ fn verify_artifact_progress(
         return Err("artifact purge order is invalid".into());
     }
     if record.get("purge_cursor").is_some() || record.get("purge_pending").is_some() {
-        verify_purge_progress(root, signature, record)
+        verify_purge_progress(root, signature, record, one_off)
     } else if fs::symlink_metadata(journal).is_ok() {
         let ordered = if record["purge_order"] == "legacy" {
             legacy_purge_order(signature)
@@ -872,9 +881,9 @@ fn verify_artifact_progress(
             purge_order(signature)
         };
         let states = read_purge_journal(journal, &ordered)?;
-        verify_journal_progress(root, &ordered, &states)
+        verify_journal_progress(root, &ordered, &states, one_off)
     } else {
-        verify_purge_progress(root, signature, record)
+        verify_purge_progress(root, signature, record, one_off)
     }
 }
 
@@ -1151,7 +1160,7 @@ fn purge_tree(transaction: &mut Transaction, moved: &MovedArtifact) -> Result<()
     } else {
         let mut states = Vec::new();
         if legacy_progress {
-            verify_purge_progress(&moved.quarantine, &moved.signature, &record)?;
+            verify_purge_progress(&moved.quarantine, &moved.signature, &record, moved.one_off)?;
             let cursor = record["purge_cursor"].as_u64().unwrap_or(0) as usize;
             states.resize(cursor, Some(PurgeJournalState::Deleted));
             if let Some(pending) = record["purge_pending"].as_str() {
@@ -1204,7 +1213,7 @@ fn purge_tree(transaction: &mut Transaction, moved: &MovedArtifact) -> Result<()
         write_manifest(transaction, "purging_preserved", false)?;
         states
     };
-    verify_journal_progress(&moved.quarantine, &ordered, &states)?;
+    verify_journal_progress(&moved.quarantine, &ordered, &states, moved.one_off)?;
 
     let open_paths = purge_open_paths(&moved.quarantine, &ordered, &states);
     let open_pids = lsof_open_paths(&open_paths)?;
@@ -1245,7 +1254,7 @@ fn purge_tree(transaction: &mut Transaction, moved: &MovedArtifact) -> Result<()
             );
             match fs::symlink_metadata(&path) {
                 Ok(_) => {
-                    verify_one(&path, entry)?;
+                    verify_one(&path, entry, moved.one_off)?;
                     match entry.kind.as_str() {
                         "directory" => fs::remove_dir(&path),
                         "file" | "symlink" => fs::remove_file(&path),
@@ -1444,6 +1453,7 @@ fn verify_journal_progress(
     root: &Path,
     ordered: &[TreeEntry],
     states: &[Option<PurgeJournalState>],
+    one_off: bool,
 ) -> Result<(), String> {
     if states.len() > ordered.len() {
         return Err("artifact purge journal exceeds the signed artifact".into());
@@ -1491,7 +1501,7 @@ fn verify_journal_progress(
             }
             Some(PurgeJournalState::Pending) if path_is_missing(&path)? => {}
             Some(PurgeJournalState::Pending) | None => {
-                verify_one(&path, entry)?;
+                verify_one(&path, entry, one_off)?;
                 expected_paths.insert(entry.relative.clone());
             }
         }
@@ -1520,7 +1530,7 @@ fn path_is_missing(path: &Path) -> Result<bool, String> {
     }
 }
 
-fn verify_one(path: &Path, entry: &TreeEntry) -> Result<(), String> {
+fn verify_one(path: &Path, entry: &TreeEntry, one_off: bool) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect signed artifact {}: {error}", path.display()))?;
     if metadata.dev() != entry.device
@@ -1555,8 +1565,12 @@ fn verify_one(path: &Path, entry: &TreeEntry) -> Result<(), String> {
         ));
     }
     if entry.kind == "file" && !entry.link_or_digest.is_empty() {
-        let bytes = read_regular_nofollow(path, &metadata)?;
-        let digest = format!("sha256:{}", hex(&Sha256::digest(bytes)));
+        let digest = if one_off {
+            sign_one_off_absolute_file(path)?.link_or_digest
+        } else {
+            let bytes = read_regular_nofollow(path, &metadata)?;
+            format!("sha256:{}", hex(&Sha256::digest(bytes)))
+        };
         if digest != entry.link_or_digest {
             return Err(format!(
                 "signed file changed before purge: {}",
@@ -3777,9 +3791,13 @@ mod tests {
             &artifact,
             &signature,
             &json!({"purge_cursor": 0, "purge_pending": "."}),
+            false,
         )
         .is_ok());
-        assert!(verify_purge_progress(&artifact, &signature, &json!({"purge_cursor": 0})).is_err());
+        assert!(
+            verify_purge_progress(&artifact, &signature, &json!({"purge_cursor": 0}), false,)
+                .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3799,12 +3817,13 @@ mod tests {
         }
         journal.sync_all().unwrap();
         let pending = read_purge_journal(&journal_path, &ordered).unwrap();
-        verify_journal_progress(&artifact, &ordered, &pending).unwrap();
+        verify_journal_progress(&artifact, &ordered, &pending, false).unwrap();
         fs::remove_file(artifact.join("entry")).unwrap();
         verify_journal_progress(
             &artifact,
             &ordered,
             &read_purge_journal(&journal_path, &ordered).unwrap(),
+            false,
         )
         .unwrap();
         append_purge_journal(&mut journal, 0, &ordered[0], "deleted").unwrap();
@@ -3821,9 +3840,9 @@ mod tests {
             purge_open_paths(&artifact, &ordered, &states).as_slice(),
             std::slice::from_ref(&artifact)
         );
-        verify_journal_progress(&artifact, &ordered, &states).unwrap();
+        verify_journal_progress(&artifact, &ordered, &states, false).unwrap();
         fs::write(artifact.join("unexpected"), b"not signed").unwrap();
-        assert!(verify_journal_progress(&artifact, &ordered, &states).is_err());
+        assert!(verify_journal_progress(&artifact, &ordered, &states, false).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3924,6 +3943,30 @@ mod tests {
         assert!(rename_one_off_to_worktree(&moved, &worktree, relative, &signature).is_err());
         assert_eq!(fs::read(&selected).unwrap(), b"concurrent replacement");
         assert_eq!(fs::read(&moved).unwrap(), b"original snapshot");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_off_purge_verification_accepts_files_larger_than_generated_config_limit() {
+        let root = temp("one-off-large-purge");
+        let worktree = root.join("worktree");
+        let quarantine = root.join("quarantine");
+        let relative = Path::new(".cache/snapshot-check.jsonl");
+        let selected = worktree.join(relative);
+        let moved = quarantine.join("generated-cache-000");
+        fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::File::create(&selected)
+            .unwrap()
+            .set_len(MAX_PRECOMMIT_BYTES + 1)
+            .unwrap();
+        let signature = vec![sign_one_off_file(&worktree, relative).unwrap()];
+
+        rename_one_off_from_worktree(&worktree, relative, &moved, &signature).unwrap();
+        let ordered = purge_order(&signature);
+        verify_journal_progress(&moved, &ordered, &[], true).unwrap();
+        assert!(verify_journal_progress(&moved, &ordered, &[], false).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }
