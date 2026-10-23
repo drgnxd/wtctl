@@ -58,6 +58,8 @@ const USAGE: &str = "usage: wtctl <command> [options]
     --discard-generated-build-outputs, --discard-generated-artifacts,
     --discard-artifact-path <relative-file>, --preserve-generated-artifacts,
     --purge-preserved-quarantine <operation-id>
+  Default finish/remove follow Git: tracked changes and non-ignored untracked files
+    block; ignored files are deleted with the worktree.
   A failed exact-file purge can resume with --keep-worktree, the same
   --discard-artifact-path, and --resume-one-off-quarantine <operation-id>.
 
@@ -312,26 +314,25 @@ impl Args {
     }
 }
 
-fn artifact_options(a: &Args, finish_default: bool) -> R<artifact::Options> {
+fn artifact_options(a: &Args) -> R<artifact::Options> {
     let preserve = a.flag("--preserve-generated-artifacts");
-    let discard_all = a.flag("--discard-generated-artifacts") || (finish_default && !preserve);
+    let discard_all = a.flag("--discard-generated-artifacts");
+    let discard_direnv = a.flag("--discard-direnv-cache");
     let discard_caches = a.flag("--discard-generated-caches");
+    let discard_build_outputs = a.flag("--discard-generated-build-outputs");
     let discard_artifact_path = a.get("--discard-artifact-path")?.map(PathBuf::from);
+    let explicit_artifact_policy = preserve
+        || discard_all
+        || discard_direnv
+        || discard_caches
+        || discard_build_outputs
+        || discard_artifact_path.is_some();
     if discard_artifact_path.is_some()
-        && (a.flag("--discard-direnv-cache")
-            || a.flag("--discard-generated-artifacts")
-            || a.flag("--discard-generated-caches")
-            || a.flag("--discard-generated-build-outputs"))
+        && (discard_direnv || discard_all || discard_caches || discard_build_outputs)
     {
         return Err(Fail::new(
             2,
             "--discard-artifact-path cannot be combined with broad artifact selectors",
-        ));
-    }
-    if finish_default && discard_artifact_path.is_some() && !preserve {
-        return Err(Fail::new(
-            2,
-            "finish with --discard-artifact-path requires --preserve-generated-artifacts to keep other generated artifacts",
         ));
     }
     if discard_all && preserve {
@@ -347,14 +348,24 @@ fn artifact_options(a: &Args, finish_default: bool) -> R<artifact::Options> {
         ));
     }
     Ok(artifact::Options {
-        discard_direnv: a.flag("--discard-direnv-cache"),
+        native_git_cleanup: !explicit_artifact_policy,
+        discard_direnv,
         discard_caches,
-        discard_build_outputs: a.flag("--discard-generated-build-outputs"),
+        discard_build_outputs,
         discard_all,
         preserve_generated: preserve,
         allow_unreferenced_reflog: a.flag("--allow-unreferenced-reflog"),
         discard_artifact_path,
     })
+}
+
+fn has_explicit_artifact_policy(options: &artifact::Options) -> bool {
+    options.discard_direnv
+        || options.discard_caches
+        || options.discard_build_outputs
+        || options.discard_all
+        || options.preserve_generated
+        || options.discard_artifact_path.is_some()
 }
 
 /// `refs/heads/<branch>` for `--main`, validated by Git's own branch-name rules.
@@ -3237,7 +3248,7 @@ fn cmd_finish(a: &Args) -> R<()> {
             "inspect scheduled and non-cooperating writers, then pass --external-writers-quiesced",
         );
     }
-    let cleanup = artifact_options(a, !keep_worktree)?;
+    let cleanup = artifact_options(a)?;
     let resume_one_off_quarantine = a.get("--resume-one-off-quarantine")?;
     if resume_one_off_quarantine.is_some()
         && (!keep_worktree || cleanup.discard_artifact_path.is_none())
@@ -3320,6 +3331,24 @@ fn cmd_finish(a: &Args) -> R<()> {
     let task_tip = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, format!("cannot resolve {display_id} HEAD")))?;
+    if !keep_worktree && !recover_failed_merge && entry.in_progress().is_none() {
+        let main_worktree = canonical_main_checkout(&repo)?;
+        let task_tree = format!("{task_tip}^{{tree}}");
+        verify_tracked_filter_safety(
+            &repo,
+            &entry.path,
+            &task_tree,
+            a.flag("--allow-annex-filter"),
+        )?;
+        artifact::check_pending_transaction(&repo.name(), &entry.path)
+            .map_err(|why| Fail::new(4, format!("{display_id}: {why}")))?;
+        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup).map_err(|why| {
+            Fail::new(
+                4,
+                format!("{display_id} cannot finish before cleanup is possible: {why}"),
+            )
+        })?;
+    }
     if recover_failed_merge {
         let external_writers_quiesced = a.flag("--external-writers-quiesced");
         verify_removal_authority(&repo, &entry, &removal)?;
@@ -3443,7 +3472,9 @@ fn cmd_finish(a: &Args) -> R<()> {
         .removable_except_integration()
         .map_err(|why| Fail::new(4, format!("{display_id} changed after integration: {why}")))?;
     let main_worktree = canonical_main_checkout(&repo)?;
-    let post_integration_plan = if resume_one_off_quarantine.is_some() {
+    let post_integration_plan = if resume_one_off_quarantine.is_some()
+        || (keep_worktree && !has_explicit_artifact_policy(&cleanup))
+    {
         None
     } else {
         Some(
@@ -4180,7 +4211,10 @@ fn remove_worktree(
             .first()
             .cloned()
             .unwrap_or_default()
-            .removable_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
+            .removable_with_reflog_opt_in(
+                cleanup.allow_unreferenced_reflog,
+                cleanup.native_git_cleanup,
+            )
             .map_err(|why| Fail::new(4, format!("{id} changed before removal: {why}")))?;
         verify_removal_authority(repo, entry, authority)?;
         let fresh = Entry::load(entry.admin.clone())
@@ -4216,7 +4250,14 @@ fn remove_worktree(
         git::run(
             &repo.root,
             [OsStr::new("worktree"), OsStr::new("remove"), path],
-        )?;
+        )
+        .map_err(|error| {
+            if error.msg.contains("modified or untracked files") {
+                Fail::new(4, format!("Git refused to remove {id}: {}", error.msg))
+            } else {
+                error
+            }
+        })?;
         if entry.path.exists() || Entry::load(entry.admin.clone()).is_some() {
             return refuse(
                 "git worktree remove returned success but the path or registration remains",
@@ -4631,7 +4672,7 @@ fn cmd_remove(a: &Args) -> R<()> {
             "--discard-unverified-direnv requires --purge-preserved-quarantine",
         ));
     }
-    let cleanup = artifact_options(a, false)?;
+    let cleanup = artifact_options(a)?;
     if cleanup
         .discard_artifact_path
         .as_ref()

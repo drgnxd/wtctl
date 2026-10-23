@@ -1,20 +1,22 @@
 # Worktree Artifact Lifecycle: Design Review and Roadmap
 
-Status: design review and proposed roadmap.
+Status: historical design review; default cleanup policy updated on 2026-10-23.
 
 Review date: 2026-10-23.
 
 ## Scope
 
-This review covers artifact classification, repository artifact policy, tree inspection, quarantine and purge, and the `finish` lifecycle.
+This review covers opt-in artifact classification, repository artifact policy, tree inspection, quarantine and purge, and their interaction with the `finish` lifecycle.
 
 It also covers the contract between `wtctl` and package-manager build/test commands that create ignored output inside task worktrees.
 
-It does not propose weakening the rule that unknown ignored or untracked paths block worktree removal.
+Ordinary `finish` and `remove` now follow Git's default worktree-removal behavior: tracked changes and non-ignored untracked files block removal, while ignored files are removed with the worktree.
+
+The recommendations below apply only when an explicit artifact selector requests quarantine or preservation; they do not define ordinary cleanup behavior.
 
 ## Summary
 
-The core lifecycle has a sound fail-closed shape: `wtctl` classifies only known outputs, snapshots selected artifacts, quarantines them on the same filesystem, and refuses to remove a worktree if state is not understood.
+Explicit artifact handling has a sound fail-closed shape: `wtctl` classifies selected outputs, snapshots them, quarantines them on the same filesystem, and refuses the selected operation if state is not understood.
 
 The main design gap is that the policy model is narrower than common nested package-manager output layouts.
 
@@ -32,27 +34,28 @@ Artifact safety policy and Git ignore rules are intentionally separate, but ther
 
 Package-manager wrappers can also direct dependency caches and build outputs to different locations, so configuring one path does not ensure that every generated path is classifiable by `wtctl`.
 
-The resulting failure is a cross-layer contract gap, not a reason to treat every ignored path as disposable.
+The resulting failure remains relevant to explicit quarantine and preservation, but it does not justify changing Git-compatible ordinary cleanup.
 
 ## Lifecycle model
 
 ```mermaid
 flowchart TD
-  A[Task worktree writes outputs] --> B[Classify against built-ins and committed policy]
-  B -->|Unknown path| U[Refuse and preserve worktree]
-  B -->|Known path| C[Inspect and snapshot selected tree]
-  C --> D[Preflight integration]
-  D --> E[Integrate main]
-  E --> F[Reinspect artifact plan]
-  F -->|Plan unchanged| G[Quarantine on same filesystem]
-  G --> H[Remove worktree]
+  A[Task worktree writes outputs] --> B{Cleanup mode}
+  B -->|Ordinary finish/remove| C[Git status check: tracked and visible untracked block]
+  C -->|Pass| D[Git removes worktree, including ignored files]
+  B -->|Explicit artifact selector| E[Classify against built-ins and committed policy]
+  E -->|Unsupported selected tree| U[Refuse and preserve worktree]
+  E -->|Supported selected tree| F[Inspect and snapshot selected paths]
+  F --> G[Quarantine on same filesystem]
+  G --> H[Git removes worktree]
   H --> I[Discard or preserve quarantine]
-  F -->|Changed or unsupported| P[Keep worktree and report cleanup pending]
 ```
 
-The safety boundary depends on recognizing a path before it is quarantined.
+The explicit-artifact safety boundary depends on recognizing a path before it is quarantined.
 
-Git ignore status alone is not evidence that a path is disposable.
+Git ignore status alone does not authorize quarantine or preservation.
+
+For ordinary cleanup, Git ignore status determines whether a path blocks removal, matching `git worktree remove`.
 
 ## Verified design facts
 
@@ -105,7 +108,9 @@ Priority definitions: P0 blocks an ordinary documented task workflow; P1 is an i
 
 ## Intentional safeguards to preserve
 
-Unknown ignored or untracked paths must continue to block cleanup.
+Unknown ignored paths are removed by ordinary cleanup, matching Git; non-ignored untracked paths continue to block it.
+
+Explicit artifact selection remains opt-in and retains its classification, signature, and quarantine checks.
 
 Repository artifact policy must remain committed in `main`, not be supplied by the task being cleaned up.
 
@@ -117,7 +122,9 @@ Nested Git metadata, symlinks, special files, mount points, and tracked descenda
 
 ## Recommended direction
 
-Keep unknown ignored or untracked paths fail-closed rather than treating `.gitignore` as a cleanup policy.
+Keep ordinary cleanup aligned with Git's status-based refusal behavior rather than requiring artifact classification for ignored paths.
+
+Keep quarantine and preservation opt-in; `.gitignore` status alone must not authorize moving a path into artifact quarantine.
 
 Use built-in rules only for directory names that are broadly and predictably disposable across repositories.
 
@@ -127,13 +134,17 @@ For any supported directory root, define how nested symlinks, nested Git metadat
 
 Deploy and verify any new directory-policy capability before committing consumer configuration that uses it, because older binaries reject unknown `.wtctl.json` fields.
 
-## Remediation roadmap
+## Historical roadmap for explicit artifact handling
+
+The following phases remain candidate work for explicit artifact handling only.
+
+They are not prerequisites for ordinary Git-compatible `finish` or `remove`.
 
 ### Phase 0: Reproduce and define the supported tree shape
 
 Add a consumer-neutral CLI fixture for a nested SwiftPM-style build output and a separately configured dependency cache.
 
-Use two fixtures: one containing only the authorized generated roots, and one with an unknown sibling that must continue to block cleanup.
+Use fixtures for ordinary Git-compatible cleanup and explicit artifact selection, including an unknown sibling that must block the explicit quarantine operation.
 
 Include internal and external symlink targets, dangling symlinks, nested `.git` directories and `.git` files, normal files, and tracked descendants.
 
@@ -211,7 +222,9 @@ Only then commit downstream configuration that uses the new directory-policy fie
 
 ## Acceptance criteria
 
-An unknown artifact discovered before integration refuses cleanup without changing `main`, task files, or quarantine state.
+An unsupported path selected for explicit artifact handling before integration refuses that operation without changing `main`, task files, or quarantine state.
+
+Ordinary cleanup permits ignored paths and refuses tracked changes or non-ignored untracked paths before `main` integration.
 
 An artifact change discovered after integration leaves `main` integrated and preserves the worktree and data with an explicit cleanup-pending result.
 
@@ -233,9 +246,9 @@ The installed capability JSON is checked before downstream workflows rely on opt
 
 ## Open decisions
 
-Should `.build` be a broadly recognized generated root, or should the consumer explicitly declare it in committed repository policy?
+For explicit artifact handling, should `.build` be a broadly recognized generated root, or should the consumer explicitly declare it in committed repository policy?
 
-Should nested Git directories and symlinks be allowed only inside a declared build root, or should package managers place those trees outside worktrees?
+For explicit artifact handling, should nested Git directories and symlinks be allowed only inside a declared build root, or should package managers place those trees outside worktrees?
 
 Should directory manifests hash every regular file, use a compact tree digest, or retain metadata snapshots with a documented trust boundary?
 

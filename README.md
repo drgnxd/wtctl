@@ -60,7 +60,9 @@ is versioned independently of the package version.
 3. `finish` integrates the task and removes it while holding the shared lock.
    If `main` advanced, it merges `main` into the owned task worktree without
    rebasing. A conflict leaves the worktree in place for resolution. Use
-   `--keep-worktree` to integrate without removing it.
+   `--keep-worktree` to integrate without removing it. Default cleanup follows
+   Git's worktree-removal boundary: tracked changes and non-ignored untracked
+   files block, while ignored files are removed with the worktree.
 
 If a rejected merge commit leaves `MERGE_HEAD` in the task worktree, `finish`
 refuses by default. With a wtctl task `--id` and explicit
@@ -145,8 +147,9 @@ A worktree is removable only when all of these hold:
 
 - no rebase, merge, cherry-pick, revert, sequencer, or bisect state, and no
   files under the admin directory's `refs/` or `logs/refs/`;
-- no tracked, untracked, or ignored changes, except explicitly selected
-  generated artifacts that are signed and quarantined before removal;
+- no tracked changes or non-ignored untracked files;
+- ignored files are not treated as dirty by the default cleanup and are deleted
+  with the worktree, as with ordinary `git worktree remove`;
 - no assume-unchanged or skip-worktree entries;
 - no submodule state or gitlink changes (they require a separate task);
 - every commit reachable from `HEAD`, its reflog, and per-worktree refs
@@ -169,9 +172,16 @@ Hooks: an executable `reference-transaction` hook always blocks; a
 `--allow-repository-hooks` is passed, including hooks a relative
 `core.hooksPath` would pick up from the source commit.
 
-## Generated artifacts and quarantine
+## Optional artifact handling and quarantine
 
-The built-in artifact roots live in `src/artifact_defaults.json`: `.pytest_cache`,
+Default `finish` and `remove` do not classify caches or read `.wtctl.json`;
+ignored paths are removed with the worktree, and visible untracked files block
+removal. Move task results that need to survive outside the worktree or commit
+them before finishing. Do not rely on `.gitignore` as a preservation mechanism.
+
+The following opt-in artifact selectors add signature checks and quarantine
+handling beyond Git's normal worktree removal. The built-in artifact roots live
+in `src/artifact_defaults.json`: `.pytest_cache`,
 `.ruff_cache`, `__pycache__`, root `target`, `rust/target`, the root `result`
 symlink, and the marked `git-hooks.nix` `.pre-commit-config.yaml`. A verified
 Nix-direnv `.direnv` cache has separate validation, including stale caches whose
@@ -182,7 +192,7 @@ supported layout must still match; unknown `.direnv` layouts are retained. Direc
 `--discard-direnv-cache`, or `--discard-generated-artifacts`.
 
 Repository-specific generated files are declared in a tracked root `.wtctl.json`
-file:
+file for opt-in artifact handling only; it is not needed for ordinary cleanup:
 
 ```json
 {
@@ -202,14 +212,16 @@ in `main`. wtctl verifies the symlink and target, unlinks only the task-local
 link, and restores it if removal fails; multiple matching links fail closed.
 wtctl reads this configuration from the committed `HEAD` of the main worktree;
 an untracked configuration file is an error and task-worktree edits cannot
-authorize their own cleanup. Configured artifacts follow the same quarantine
-policy as built-in artifacts: default `finish` discards them, while
-`--preserve-generated-artifacts` retains them in quarantine. The JSON schema is
-validated strictly and rejects traversal, absolute paths, reserved roots, and
-unknown fields; each configured output must exist as a regular non-symlink file
-when selected for cleanup. Purge validates the saved manifest path and signature
-independently of the current repository configuration, so a later policy
-change does not strand a retained artifact.
+authorize their own cleanup. This file is only consulted in explicit artifact
+handling mode; ordinary cleanup follows Git and does not require `.wtctl.json`.
+In explicit mode, configured artifacts use the same quarantine policy as
+built-in artifacts: `--discard-generated-artifacts` selects them for cleanup,
+while `--preserve-generated-artifacts` retains them in quarantine. The JSON
+schema is validated strictly and rejects traversal, absolute paths, reserved
+roots, and unknown fields; each configured output must exist as a regular
+non-symlink file when selected for cleanup. Purge validates the saved manifest
+path and signature independently of the current repository configuration, so a
+later policy change does not strand a retained artifact.
 
 For a user-authorized one-off exception, `finish` and `remove` accept
 `--discard-artifact-path <relative-file>`. It selects only one ignored or
@@ -233,7 +245,7 @@ change the repository or built-in artifact policy.
 `.ruff_cache`, and `__pycache__`) for cleanup. Other ignored or untracked data
 keeps an orphan from being removed.
 
-Before Git removes a worktree, selected paths are moved without replacement to
+In explicit artifact mode, before Git removes a worktree, selected paths are moved without replacement to
 `$XDG_STATE_HOME/<repo>/worktrees/.removal-quarantine` on the same filesystem.
 If removal fails, wtctl restores paths only after rechecking worktree identity,
 HEAD, and destination vacancy. `--preserve-generated-artifacts` keeps selected

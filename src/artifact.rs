@@ -36,6 +36,7 @@ pub struct TreeEntry {
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
+    pub native_git_cleanup: bool,
     pub discard_direnv: bool,
     pub discard_caches: bool,
     pub discard_build_outputs: bool,
@@ -2789,6 +2790,15 @@ pub fn inspect_plan(
     options: &Options,
 ) -> Result<Plan, String> {
     let status = status(worktree)?;
+    if options.native_git_cleanup {
+        if let Some(entry) = status.iter().find(|entry| entry.code != *b"!!") {
+            return Err(format!(
+                "worktree has modified or untracked files, as git worktree remove would refuse: {}",
+                String::from_utf8_lossy(&entry.path)
+            ));
+        }
+        return Ok(Plan::default());
+    }
     let caches = options.discard_caches || options.discard_all || options.preserve_generated;
     let build_outputs =
         options.discard_build_outputs || options.discard_all || options.preserve_generated;

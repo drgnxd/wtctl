@@ -111,6 +111,11 @@ impl Cleanliness {
     pub fn is_clean(&self) -> bool {
         self.tracked == 0 && self.untracked == 0 && self.ignored == 0
     }
+
+    /// Matches Git's default status-based worktree removal check.
+    pub fn is_clean_for_git_removal(&self) -> bool {
+        self.tracked == 0 && self.untracked == 0
+    }
 }
 
 pub fn parse_status(raw: &[u8]) -> Cleanliness {
@@ -212,5 +217,19 @@ mod status_tests {
     fn malformed_status_entry_fails_closed() {
         assert!(parse_status_entries(b"??\0").is_err());
         assert!(parse_status_entries(b"bad entry\0").is_err());
+    }
+
+    #[test]
+    fn ignored_paths_do_not_make_git_status_dirty() {
+        let cleanliness = parse_status(b"!! cache/output\0");
+        assert_eq!(cleanliness.ignored, 1);
+        assert!(!cleanliness.is_clean());
+        assert!(cleanliness.is_clean_for_git_removal());
+    }
+
+    #[test]
+    fn tracked_and_untracked_paths_make_git_status_dirty() {
+        assert!(!parse_status(b" M tracked\0").is_clean());
+        assert!(!parse_status(b"?? untracked\0").is_clean());
     }
 }

@@ -428,34 +428,34 @@ fn create_supports_parent_metadata_and_a_custom_worktrees_root() {
 }
 
 #[test]
-fn remove_requires_explicit_selection_for_build_outputs_and_discards_after_success() {
+fn remove_uses_git_default_for_ignored_build_outputs() {
     let env = Env::new();
     let (id, path) = env.create("remove-build-artifact");
     env.exclude("/target/");
     fs::create_dir_all(path.join("target/debug")).unwrap();
     fs::write(path.join("target/debug/artifact"), b"generated").unwrap();
 
-    let refused = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
-    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
-    assert!(path.join("target/debug/artifact").exists());
-
-    let removed = env.run(&[
-        "remove",
-        "--repo",
-        &env.repo_arg(),
-        "--id",
-        &id,
-        "--discard-generated-build-outputs",
-    ]);
+    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
     assert!(
         removed.status.success(),
         "{}",
         String::from_utf8_lossy(&removed.stderr)
     );
     assert!(!path.exists());
-    let quarantine = env.quarantine_root();
-    assert!(quarantine.exists());
-    assert!(quarantine.read_dir().unwrap().next().is_none());
+    assert!(!env.quarantine_root().exists());
+}
+
+#[test]
+fn remove_keeps_non_ignored_untracked_files_like_git() {
+    let env = Env::new();
+    let (id, path) = env.create("remove-untracked-file");
+    let output = path.join("task-output.json");
+    fs::write(&output, b"keep me").unwrap();
+
+    let refused = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(path.is_dir());
+    assert_eq!(fs::read(output).unwrap(), b"keep me");
 }
 
 #[test]
@@ -543,7 +543,7 @@ fn failed_worktree_removal_restores_quarantined_generated_artifacts() {
 }
 
 #[test]
-fn finish_discards_default_generated_artifacts_after_integration() {
+fn finish_uses_git_default_for_ignored_build_outputs_after_integration() {
     let env = Env::new();
     let (id, path) = env.create("finish-build-artifact");
     env.exclude("/target/");
@@ -563,8 +563,30 @@ fn finish_discards_default_generated_artifacts_after_integration() {
         String::from_utf8_lossy(&finished.stderr)
     );
     assert!(!path.exists());
-    assert!(env.quarantine_root().exists());
-    assert!(env.quarantine_root().read_dir().unwrap().next().is_none());
+    assert!(!env.quarantine_root().exists());
+}
+
+#[test]
+fn finish_keep_worktree_preserves_ignored_data() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-keep-ignored");
+    env.exclude("/local-cache/");
+    let cache = path.join("local-cache/state.bin");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    fs::write(&cache, b"keep while worktree is kept").unwrap();
+
+    let output = env.ok(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--keep-worktree",
+    ]);
+    assert!(output.contains("worktree kept"), "{output}");
+    assert_eq!(fs::read(cache).unwrap(), b"keep while worktree is kept");
+    assert!(path.is_dir());
 }
 
 #[test]
@@ -1138,7 +1160,14 @@ fn unknown_direnv_is_quarantined_and_requires_an_explicit_unverified_purge() {
     let (id, path) = env.create("preserve-direnv");
     fs::create_dir_all(path.join(".direnv/user-data")).unwrap();
     fs::write(path.join(".direnv/user-data/keep"), b"not a verified cache").unwrap();
-    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--preserve-generated-artifacts",
+    ]);
     assert!(
         removed.status.success(),
         "{}",
@@ -1197,7 +1226,14 @@ fn canonical_database_link_is_unlinked_without_touching_its_target() {
     fs::write(&database, b"canonical database").unwrap();
     let (id, path) = env.create("database-link");
     symlink(&database, path.join("state.db")).unwrap();
-    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-generated-artifacts",
+    ]);
     assert!(
         removed.status.success(),
         "{}",
@@ -1249,7 +1285,14 @@ fn multiple_matching_main_worktree_symlinks_are_refused() {
     symlink(&first, path.join("first.db")).unwrap();
     symlink(&second, path.join("second.db")).unwrap();
 
-    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-generated-artifacts",
+    ]);
     assert!(!removed.status.success());
     assert!(path.is_dir());
     assert!(fs::symlink_metadata(path.join("first.db"))
@@ -1365,13 +1408,21 @@ fn reap_removes_only_integrated_clean_orphans() {
     let (ahead, ahead_path) = env.create("ahead-task");
     let (dirty, dirty_path) = env.create("dirty-task");
     let (data, data_path) = env.create("data-task");
+    let (unknown_ignored, unknown_ignored_path) = env.create("unknown-ignored-task");
     let (live, live_path) = env.create("live-task");
     commit_file(&ahead_path, "new.txt", "x\n");
     fs::write(dirty_path.join("scratch.txt"), "x").unwrap();
     fs::write(data_path.join("local.db"), "x").unwrap();
+    env.exclude("/private-cache/");
+    fs::create_dir_all(unknown_ignored_path.join("private-cache")).unwrap();
+    fs::write(
+        unknown_ignored_path.join("private-cache/keep"),
+        b"user data",
+    )
+    .unwrap();
     fs::create_dir_all(done_path.join("__pycache__")).unwrap();
     fs::write(done_path.join("__pycache__/m.pyc"), "x").unwrap();
-    for id in [&done, &ahead, &dirty, &data] {
+    for id in [&done, &ahead, &dirty, &data, &unknown_ignored] {
         env.kill_owner(id);
     }
     let dry = env.ok(&[
@@ -1386,11 +1437,21 @@ fn reap_removes_only_integrated_clean_orphans() {
     assert!(done_path.exists());
     let out = env.ok(&["reap", "--repo", &env.repo_arg(), "--grace-secs", "0"]);
     assert!(out.contains(&format!("reaped\t{done}")), "{out}");
-    for id in [&ahead, &dirty, &data] {
+    for id in [&ahead, &dirty, &data, &unknown_ignored] {
         assert!(out.contains(&format!("orphan\t{id}")), "{out}");
     }
     assert!(!done_path.exists());
-    assert!(ahead_path.exists() && dirty_path.exists() && data_path.exists() && live_path.exists());
+    assert!(
+        ahead_path.exists()
+            && dirty_path.exists()
+            && data_path.exists()
+            && unknown_ignored_path.exists()
+            && live_path.exists()
+    );
+    assert_eq!(
+        fs::read(unknown_ignored_path.join("private-cache/keep")).unwrap(),
+        b"user data"
+    );
     assert!(!out.contains(&live));
     // Preserved orphans stay locked against plain removal.
     assert!(env.admin(&ahead).join("locked").exists());
@@ -1567,6 +1628,66 @@ fn finish_rejects_ignored_and_case_aliased_paths_before_updating_main() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn finish_refuses_non_ignored_untracked_files_before_integrating_main() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-untracked-preflight");
+    commit_file(&path, "task.txt", "task\n");
+    commit_file(&env.repo, "main.txt", "main\n");
+    let main_tip = env.main_oid();
+    let output = path.join("local-output.json");
+    fs::write(&output, b"keep me").unwrap();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert_eq!(env.main_oid(), main_tip);
+    assert!(path.is_dir());
+    assert_eq!(fs::read(output).unwrap(), b"keep me");
+}
+
+#[test]
+fn finish_does_not_force_remove_files_created_after_cleanup_preflight() {
+    let env = Env::new();
+    let (id, path) = env.create("finish-untracked-race");
+    let task_tip = commit_file(&path, "task.txt", "task\n");
+    let late_file = path.join("late-output.json");
+    let path_var = git_shim(
+        &env,
+        "add-untracked-before-native-remove",
+        "if [ \"$sub\" = worktree ] && [ \"$verb\" = remove ]; then printf 'late data' > \"$WTCTL_TEST_LATE_FILE\"; fi",
+    );
+
+    let output = env
+        .cmd(&[
+            "finish",
+            "--repo",
+            &env.repo_arg(),
+            "--id",
+            &id,
+            "--external-writers-quiesced",
+        ])
+        .env("PATH", path_var)
+        .env("WTCTL_TEST_LATE_FILE", &late_file)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("integrated but cleanup is pending"),
+        "{stderr}"
+    );
+    assert_eq!(env.main_oid(), task_tip);
+    assert!(path.is_dir());
+    assert_eq!(fs::read(late_file).unwrap(), b"late data");
 }
 
 #[test]
@@ -1950,6 +2071,7 @@ fn finish_recovers_a_verified_failed_merge_only_with_opt_in() {
         "--external-writers-quiesced",
         "--allow-repository-hooks",
         "--allow-annex-filter",
+        "--preserve-generated-artifacts",
         "--integration-message",
         "docs: rejected first merge",
     ]);
@@ -1971,7 +2093,11 @@ fn finish_recovers_a_verified_failed_merge_only_with_opt_in() {
         "docs: refused without opt in",
     ]);
     assert_eq!(no_opt_in.status.code(), Some(4), "{no_opt_in:?}");
-    assert!(String::from_utf8_lossy(&no_opt_in.stderr).contains("MERGE_HEAD in progress"));
+    assert!(
+        String::from_utf8_lossy(&no_opt_in.stderr).contains("MERGE_HEAD in progress"),
+        "{}",
+        String::from_utf8_lossy(&no_opt_in.stderr)
+    );
     assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
     assert_eq!(env.main_oid(), first_main_tip);
     assert!(env.admin(&id).join("MERGE_HEAD").exists());
@@ -3069,6 +3195,7 @@ fn git_annex_finish_quarantines_recognized_direnv_data() {
         "--external-writers-quiesced",
         "--allow-repository-hooks",
         "--allow-annex-filter",
+        "--preserve-generated-artifacts",
     ]);
     assert!(
         finished.status.success(),
@@ -3113,6 +3240,7 @@ fn git_annex_finish_discards_stale_nix_direnv_cache() {
         "--external-writers-quiesced",
         "--allow-repository-hooks",
         "--allow-annex-filter",
+        "--discard-direnv-cache",
     ]);
     assert!(
         finished.status.success(),
@@ -3199,7 +3327,7 @@ fn finish_preserves_verified_nested_nix_direnv_cache_in_quarantine() {
 }
 
 #[test]
-fn finish_discards_verified_nested_nix_direnv_cache_by_default() {
+fn finish_discards_verified_nested_nix_direnv_cache_with_selector() {
     let env = Env::new();
     let (id, path) = env.create("discard-nested-direnv");
     commit_file(&path, "task.txt", "task work\n");
@@ -3214,6 +3342,7 @@ fn finish_discards_verified_nested_nix_direnv_cache_by_default() {
         "--id",
         &id,
         "--external-writers-quiesced",
+        "--discard-direnv-cache",
         "--integration-message",
         "docs: discard nested Nix direnv cache",
     ]);
@@ -3246,6 +3375,7 @@ fn finish_refuses_unverified_nested_direnv_data() {
         "--id",
         &id,
         "--external-writers-quiesced",
+        "--preserve-generated-artifacts",
         "--integration-message",
         "docs: reject unknown nested direnv data",
     ]);
@@ -3257,14 +3387,21 @@ fn finish_refuses_unverified_nested_direnv_data() {
 }
 
 #[test]
-fn remove_preserves_verified_nested_nix_direnv_cache_by_default() {
+fn remove_preserves_verified_nested_nix_direnv_cache_with_selector() {
     let env = Env::new();
     let (id, path) = env.create("remove-nested-direnv");
     env.exclude("/project/.direnv/");
     let (input_target, profile_target) =
         write_stale_nix_direnv_cache_at(&path, Path::new("project/.direnv"));
 
-    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    let removed = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--preserve-generated-artifacts",
+    ]);
     assert!(
         removed.status.success(),
         "{}",
@@ -3341,7 +3478,7 @@ fn remove_discards_verified_nested_nix_direnv_cache_with_generated_selector() {
 }
 
 #[test]
-fn git_annex_remove_refuses_unknown_ignored_data_before_restage() {
+fn git_annex_remove_uses_git_semantics_for_ignored_data() {
     let env = Env::new();
     git(&env.repo, &["annex", "init", "-q"]);
     fs::write(env.repo.join("annexed.bin"), vec![b'x'; 8192]).unwrap();
@@ -3353,16 +3490,14 @@ fn git_annex_remove_refuses_unknown_ignored_data_before_restage() {
     fs::create_dir_all(path.join("private-data")).unwrap();
     fs::write(path.join("private-data/keep"), b"user data").unwrap();
 
-    let refused = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
-    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("worktree has unrecognized changes"),
-        "{refused:?}"
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
     );
-    assert_eq!(
-        fs::read(path.join("private-data/keep")).unwrap(),
-        b"user data"
-    );
+    assert!(!path.exists());
+    assert!(env.repo.join("annexed.bin").exists());
 }
 
 #[test]

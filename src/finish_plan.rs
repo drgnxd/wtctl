@@ -74,11 +74,7 @@ pub fn cmd_finish_preflight(a: &Args) -> R<()> {
     }
     let id = a.need("--id")?;
     let keep_worktree = a.flag("--keep-worktree");
-    let cleanup = if keep_worktree {
-        artifact::Options::default()
-    } else {
-        artifact_options(a, true)?
-    };
+    let cleanup = artifact_options(a)?;
     let (main, refname) = main_ref(a, &repo.root)?;
     let (entry, marker) = repo.find_task(id)?;
     let kept = superseded::kept_tips(&repo, id);

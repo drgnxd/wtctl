@@ -319,7 +319,7 @@ impl Entry {
         }
     }
 
-    fn in_progress(&self) -> Option<&'static str> {
+    pub fn in_progress(&self) -> Option<&'static str> {
         IN_PROGRESS
             .iter()
             .copied()
@@ -367,8 +367,8 @@ impl Facts {
         };
         if !c.is_clean() {
             return Err(format!(
-                "not clean ({} tracked, {} untracked, {} ignored)",
-                c.tracked, c.untracked, c.ignored
+                "not clean ({} tracked, {} untracked)",
+                c.tracked, c.untracked
             ));
         }
         Ok(())
@@ -400,15 +400,24 @@ impl Facts {
         Ok(())
     }
 
-    pub fn removable_with_reflog_opt_in(&self, allow: bool) -> Result<(), String> {
+    pub fn removable_with_reflog_opt_in(
+        &self,
+        allow: bool,
+        allow_ignored: bool,
+    ) -> Result<(), String> {
         self.removable_except_status_with_reflog_opt_in(allow)?;
         let Some(clean) = self.clean else {
             return Err("status unavailable".into());
         };
-        if !clean.is_clean() {
+        let clean_enough = if allow_ignored {
+            clean.is_clean_for_git_removal()
+        } else {
+            clean.is_clean()
+        };
+        if !clean_enough {
             return Err(format!(
-                "not clean ({} tracked, {} untracked, {} ignored)",
-                clean.tracked, clean.untracked, clean.ignored
+                "not clean ({} tracked, {} untracked)",
+                clean.tracked, clean.untracked
             ));
         }
         Ok(())
@@ -563,4 +572,47 @@ pub fn facts_excluding(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clean_facts(clean: git::Cleanliness) -> Facts {
+        Facts {
+            clean: Some(clean),
+            unintegrated: Some(0),
+            hidden: Some(0),
+            ..Facts::default()
+        }
+    }
+
+    #[test]
+    fn ordinary_removability_keeps_ignored_paths_protected() {
+        let facts = clean_facts(git::Cleanliness {
+            ignored: 1,
+            ..git::Cleanliness::default()
+        });
+
+        assert!(facts.removable().is_err());
+        assert!(facts.removable_with_reflog_opt_in(false, true).is_ok());
+    }
+
+    #[test]
+    fn git_removability_still_rejects_tracked_and_untracked_paths() {
+        for clean in [
+            git::Cleanliness {
+                tracked: 1,
+                ..git::Cleanliness::default()
+            },
+            git::Cleanliness {
+                untracked: 1,
+                ..git::Cleanliness::default()
+            },
+        ] {
+            assert!(clean_facts(clean)
+                .removable_with_reflog_opt_in(false, true)
+                .is_err());
+        }
+    }
 }
