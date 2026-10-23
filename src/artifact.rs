@@ -2803,6 +2803,19 @@ pub fn inspect_plan(
         include_configured,
         &rules,
     )?;
+    let mut nested_direnv = Vec::new();
+    for relative in nested_direnv_roots(&status) {
+        if roots.iter().any(|root| relative.starts_with(root)) {
+            continue;
+        }
+        let path = worktree.join(&relative);
+        if is_nix_direnv_cache(&path) {
+            roots.retain(|root| !root.starts_with(&relative));
+            roots.push(relative.clone());
+            nested_direnv.push(relative);
+        }
+    }
+    roots.sort();
     let explicit_status = if let Some(path) = &options.discard_artifact_path {
         validate_one_off_artifact_path(path)?;
         if roots
@@ -2922,15 +2935,25 @@ pub fn inspect_plan(
         } else if rules.generated_artifacts.contains(relative) {
             sign_configured_artifact(&path, worktree)?
         } else {
-            sign_tree(&path, worktree, allow_symlink, false, false)?
+            sign_tree(
+                &path,
+                worktree,
+                allow_symlink,
+                false,
+                nested_direnv.contains(relative),
+            )?
         };
         let is_build = matches!(relative.to_str(), Some("result" | "target" | "rust/target"));
         generated.push(SignedArtifact {
             path,
             signature,
-            preserve: !one_off
-                && options.preserve_generated
-                && !(options.discard_all || (options.discard_build_outputs && is_build)),
+            preserve: if nested_direnv.contains(relative) {
+                !options.discard_direnv && !options.discard_all
+            } else {
+                !one_off
+                    && options.preserve_generated
+                    && !(options.discard_all || (options.discard_build_outputs && is_build))
+            },
             one_off,
         });
     }
@@ -3156,6 +3179,30 @@ fn under_root(path: &[u8], root: &[u8]) -> bool {
 
 fn is_direnv_path(path: &[u8]) -> bool {
     path == b".direnv" || path == b".direnv/" || path.starts_with(b".direnv/")
+}
+
+fn nested_direnv_roots(status: &[StatusEntry]) -> BTreeSet<PathBuf> {
+    status
+        .iter()
+        .filter(|entry| entry.code == *b"!!" || entry.code == *b"??")
+        .filter_map(|entry| {
+            let path = entry.path.strip_suffix(b"/").unwrap_or(&entry.path);
+            let parent = path.strip_suffix(b"/.direnv")?;
+            if parent.is_empty() {
+                return None;
+            }
+            let relative = PathBuf::from(OsStr::from_bytes(path));
+            if relative.to_str().is_none()
+                || relative.components().count() < 2
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return None;
+            }
+            Some(relative)
+        })
+        .collect()
 }
 
 fn canonical_main_file_link(

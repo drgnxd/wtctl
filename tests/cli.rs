@@ -285,9 +285,13 @@ impl Env {
 }
 
 fn write_stale_nix_direnv_cache(worktree: &Path) -> (PathBuf, PathBuf) {
+    write_stale_nix_direnv_cache_at(worktree, Path::new(".direnv"))
+}
+
+fn write_stale_nix_direnv_cache_at(worktree: &Path, relative: &Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::symlink;
 
-    let cache = worktree.join(".direnv");
+    let cache = worktree.join(relative);
     fs::create_dir_all(cache.join("bin")).unwrap();
     fs::create_dir_all(cache.join("flake-inputs")).unwrap();
     let input_hash = "a".repeat(32);
@@ -3119,6 +3123,221 @@ fn git_annex_finish_discards_stale_nix_direnv_cache() {
     assert!(env.quarantine_root().read_dir().unwrap().next().is_none());
     assert!(fs::symlink_metadata(input_target).is_err());
     assert!(fs::symlink_metadata(profile_target).is_err());
+}
+
+#[test]
+fn finish_preserves_verified_nested_nix_direnv_cache_in_quarantine() {
+    let env = Env::new();
+    let (id, path) = env.create("nested-direnv");
+    commit_file(&path, "task.txt", "task work\n");
+    env.exclude("/project/.direnv/");
+    let (input_target, profile_target) =
+        write_stale_nix_direnv_cache_at(&path, Path::new("project/.direnv"));
+
+    let finished = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--preserve-generated-artifacts",
+        "--external-writers-quiesced",
+        "--integration-message",
+        "docs: preserve nested Nix direnv cache",
+    ]);
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!path.exists());
+    let operation = env
+        .quarantine_root()
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let archive = operation.join("generated-cache-000");
+    assert_eq!(
+        fs::read(archive.join("bin/nix-direnv-reload")).unwrap(),
+        b"reload"
+    );
+    assert!(archive.join("flake-inputs").is_dir());
+    assert!(archive
+        .join("flake-profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.rc")
+        .is_file());
+    assert_eq!(
+        fs::read_link(archive.join("flake-inputs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source"))
+            .unwrap(),
+        input_target
+    );
+    assert_eq!(
+        fs::read_link(archive.join("flake-profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).unwrap(),
+        profile_target
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(operation.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["generated_caches"][0]["path"], "project/.direnv");
+    assert_eq!(manifest["generated_caches"][0]["preserve"], true);
+
+    let operation_id = operation.file_name().unwrap().to_string_lossy();
+    let purged = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--purge-preserved-quarantine",
+        &operation_id,
+    ]);
+    assert!(
+        purged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&purged.stderr)
+    );
+    assert!(!operation.exists());
+}
+
+#[test]
+fn finish_discards_verified_nested_nix_direnv_cache_by_default() {
+    let env = Env::new();
+    let (id, path) = env.create("discard-nested-direnv");
+    commit_file(&path, "task.txt", "task work\n");
+    env.exclude("/project/.direnv/");
+    let (input_target, profile_target) =
+        write_stale_nix_direnv_cache_at(&path, Path::new("project/.direnv"));
+
+    let finished = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--integration-message",
+        "docs: discard nested Nix direnv cache",
+    ]);
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!path.exists());
+    assert!(env.quarantine_root().read_dir().unwrap().next().is_none());
+    assert!(fs::symlink_metadata(input_target).is_err());
+    assert!(fs::symlink_metadata(profile_target).is_err());
+}
+
+#[test]
+fn finish_refuses_unverified_nested_direnv_data() {
+    let env = Env::new();
+    let (id, path) = env.create("unknown-nested-direnv");
+    let private_file = path.join("project/.direnv/user-data/keep");
+    env.exclude("/project/.direnv/");
+    fs::create_dir_all(private_file.parent().unwrap()).unwrap();
+    fs::write(&private_file, b"user data").unwrap();
+    let task_tip = commit_file(&path, "task.txt", "task work\n");
+    let main_tip = env.main_oid();
+
+    let refused = env.run(&[
+        "finish",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--external-writers-quiesced",
+        "--integration-message",
+        "docs: reject unknown nested direnv data",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("worktree has unrecognized changes"));
+    assert_eq!(fs::read(private_file).unwrap(), b"user data");
+    assert_eq!(git(&path, &["rev-parse", "HEAD"]), task_tip);
+    assert_eq!(env.main_oid(), main_tip);
+}
+
+#[test]
+fn remove_preserves_verified_nested_nix_direnv_cache_by_default() {
+    let env = Env::new();
+    let (id, path) = env.create("remove-nested-direnv");
+    env.exclude("/project/.direnv/");
+    let (input_target, profile_target) =
+        write_stale_nix_direnv_cache_at(&path, Path::new("project/.direnv"));
+
+    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    let operation = env
+        .quarantine_root()
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let archive = operation.join("generated-cache-000");
+    assert_eq!(
+        fs::read(archive.join("bin/nix-direnv-reload")).unwrap(),
+        b"reload"
+    );
+    assert_eq!(
+        fs::read_link(archive.join("flake-inputs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source"))
+            .unwrap(),
+        input_target
+    );
+    assert_eq!(
+        fs::read_link(archive.join("flake-profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).unwrap(),
+        profile_target
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(operation.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["generated_caches"][0]["path"], "project/.direnv");
+    assert_eq!(manifest["generated_caches"][0]["preserve"], true);
+
+    let operation_id = operation.file_name().unwrap().to_string_lossy();
+    let purged = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--purge-preserved-quarantine",
+        &operation_id,
+    ]);
+    assert!(
+        purged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&purged.stderr)
+    );
+    assert!(!operation.exists());
+}
+
+fn assert_remove_discards_nested_direnv_with(selector: &str) {
+    let env = Env::new();
+    let (id, path) = env.create("discard-nested-direnv");
+    env.exclude("/project/.direnv/");
+    write_stale_nix_direnv_cache_at(&path, Path::new("project/.direnv"));
+
+    let removed = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id, selector]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    assert!(env.quarantine_root().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn remove_discards_verified_nested_nix_direnv_cache_with_direnv_selector() {
+    assert_remove_discards_nested_direnv_with("--discard-direnv-cache");
+}
+
+#[test]
+fn remove_discards_verified_nested_nix_direnv_cache_with_generated_selector() {
+    assert_remove_discards_nested_direnv_with("--discard-generated-artifacts");
 }
 
 #[test]
