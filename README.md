@@ -198,9 +198,9 @@ file:
 `generated_artifacts` contains exact repository-root regular-file paths, not
 globs or directories. Optional `main_worktree_symlinks` lists exact root file
 names for ignored task-worktree symlinks that point to same-named regular files
-in `main`. WTCTL verifies the symlink and target, unlinks only the task-local
+in `main`. wtctl verifies the symlink and target, unlinks only the task-local
 link, and restores it if removal fails; multiple matching links fail closed.
-WTCTL reads this configuration from the committed `HEAD` of the main worktree;
+wtctl reads this configuration from the committed `HEAD` of the main worktree;
 an untracked configuration file is an error and task-worktree edits cannot
 authorize their own cleanup. Configured artifacts follow the same quarantine
 policy as built-in artifacts: default `finish` discards them, while
