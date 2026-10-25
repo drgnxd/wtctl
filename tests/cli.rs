@@ -139,19 +139,6 @@ impl Env {
         }
     }
 
-    fn allow_main_worktree_symlinks(&self, names: &[&str]) {
-        let names = serde_json::to_string(names).unwrap();
-        let config = format!(
-            r#"{{"schema_version":1,"generated_artifacts":[],"main_worktree_symlinks":{names}}}"#
-        );
-        fs::write(self.repo.join(".wtctl.json"), config).unwrap();
-        git(&self.repo, &["add", ".wtctl.json"]);
-        git(
-            &self.repo,
-            &["commit", "-q", "-m", "configure main-worktree symlinks"],
-        );
-    }
-
     fn raw_cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_wtctl"));
         c.args(args)
@@ -879,7 +866,6 @@ fn finish_resumes_one_off_quarantine_without_removing_kept_worktree() {
         "common_dir": common,
         "branch_ref": null,
         "head": task_tip,
-        "database_link": null,
         "direnv": null,
         "generated_caches": [{
             "path": ".cache/snapshot.jsonl",
@@ -1217,11 +1203,10 @@ fn unknown_direnv_is_quarantined_and_requires_an_explicit_unverified_purge() {
 }
 
 #[test]
-fn canonical_database_link_is_unlinked_without_touching_its_target() {
+fn ignored_symlinks_to_main_worktree_files_are_not_authorized_for_artifact_cleanup() {
     use std::os::unix::fs::symlink;
 
     let env = Env::new();
-    env.allow_main_worktree_symlinks(&["state.db"]);
     let database = env.repo.join("state.db");
     fs::write(&database, b"canonical database").unwrap();
     let (id, path) = env.create("database-link");
@@ -1234,77 +1219,10 @@ fn canonical_database_link_is_unlinked_without_touching_its_target() {
         &id,
         "--discard-generated-artifacts",
     ]);
-    assert!(
-        removed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&removed.stderr)
-    );
-    assert!(!path.exists());
-    assert_eq!(fs::read(database).unwrap(), b"canonical database");
-}
-
-#[test]
-fn failed_removal_restores_the_canonical_database_symlink() {
-    use std::os::unix::fs::symlink;
-
-    let env = Env::new();
-    env.allow_main_worktree_symlinks(&["state.db"]);
-    let database = env.repo.join("state.db");
-    fs::write(&database, b"canonical database").unwrap();
-    let (id, path) = env.create("restore-database-link");
-    symlink(&database, path.join("state.db")).unwrap();
-    let path_var = git_shim(
-        &env,
-        "fail-database-remove",
-        "if [ \"$sub\" = worktree ] && [ \"$verb\" = remove ]; then exit 1; fi",
-    );
-    let out = env
-        .cmd(&["remove", "--repo", &env.repo_arg(), "--id", &id])
-        .env("PATH", path_var)
-        .output()
-        .unwrap();
-    assert_ne!(out.status.code(), Some(0));
-    assert!(path.is_dir());
-    assert!(fs::symlink_metadata(path.join("state.db"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    assert_eq!(fs::canonicalize(path.join("state.db")).unwrap(), database);
-    assert_eq!(fs::read(database).unwrap(), b"canonical database");
-}
-
-#[test]
-fn multiple_matching_main_worktree_symlinks_are_refused() {
-    let env = Env::new();
-    env.allow_main_worktree_symlinks(&["first.db", "second.db"]);
-    let first = env.repo.join("first.db");
-    let second = env.repo.join("second.db");
-    fs::write(&first, b"first database").unwrap();
-    fs::write(&second, b"second database").unwrap();
-    let (id, path) = env.create("multiple-database-links");
-    symlink(&first, path.join("first.db")).unwrap();
-    symlink(&second, path.join("second.db")).unwrap();
-
-    let removed = env.run(&[
-        "remove",
-        "--repo",
-        &env.repo_arg(),
-        "--id",
-        &id,
-        "--discard-generated-artifacts",
-    ]);
     assert!(!removed.status.success());
     assert!(path.is_dir());
-    assert!(fs::symlink_metadata(path.join("first.db"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    assert!(fs::symlink_metadata(path.join("second.db"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    assert_eq!(fs::read(first).unwrap(), b"first database");
-    assert_eq!(fs::read(second).unwrap(), b"second database");
+    assert!(path.join("state.db").is_symlink());
+    assert_eq!(fs::read(database).unwrap(), b"canonical database");
 }
 
 #[test]

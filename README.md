@@ -174,10 +174,11 @@ Hooks: an executable `reference-transaction` hook always blocks; a
 
 ## Optional artifact handling and quarantine
 
-Default `finish` and `remove` do not classify caches or read `.wtctl.json`;
-ignored paths are removed with the worktree, and visible untracked files block
-removal. Move task results that need to survive outside the worktree or commit
-them before finishing. Do not rely on `.gitignore` as a preservation mechanism.
+Default `finish` and `remove` follow Git's worktree-removal boundary; ignored
+paths are removed with the worktree, and visible untracked files block removal.
+No repository configuration file is needed or supported for artifact handling.
+Move task results that need to survive outside the worktree or commit them before
+finishing. Do not rely on `.gitignore` as a preservation mechanism.
 
 The following opt-in artifact selectors add signature checks and quarantine
 handling beyond Git's normal worktree removal. The built-in artifact roots live
@@ -191,37 +192,10 @@ supported layout must still match; unknown `.direnv` layouts are retained. Direc
 `--discard-generated-caches`, `--discard-generated-build-outputs`,
 `--discard-direnv-cache`, or `--discard-generated-artifacts`.
 
-Repository-specific generated files are declared in a tracked root `.wtctl.json`
-file for opt-in artifact handling only; it is not needed for ordinary cleanup:
-
-```json
-{
-  "schema_version": 1,
-  "generated_artifacts": [
-    "output.csv",
-    "report.md"
-  ],
-  "main_worktree_symlinks": ["state.db"]
-}
-```
-
-`generated_artifacts` contains exact repository-root regular-file paths, not
-globs or directories. Optional `main_worktree_symlinks` lists exact root file
-names for ignored task-worktree symlinks that point to same-named regular files
-in `main`. wtctl verifies the symlink and target, unlinks only the task-local
-link, and restores it if removal fails; multiple matching links fail closed.
-wtctl reads this configuration from the committed `HEAD` of the main worktree;
-an untracked configuration file is an error and task-worktree edits cannot
-authorize their own cleanup. This file is only consulted in explicit artifact
-handling mode; ordinary cleanup follows Git and does not require `.wtctl.json`.
-In explicit mode, configured artifacts use the same quarantine policy as
-built-in artifacts: `--discard-generated-artifacts` selects them for cleanup,
-while `--preserve-generated-artifacts` retains them in quarantine. The JSON
-schema is validated strictly and rejects traversal, absolute paths, reserved
-roots, and unknown fields; each configured output must exist as a regular
-non-symlink file when selected for cleanup. Purge validates the saved manifest
-path and signature independently of the current repository configuration, so a
-later policy change does not strand a retained artifact.
+Repository-specific generated paths are not classified or authorized by
+repository metadata, including ignored symlinks that point into the main
+worktree. Built-in artifact selectors remain opt-in and are limited to broadly
+disposable roots; `.gitignore` patterns do not grant destructive authorization.
 
 For a user-authorized one-off exception, `finish` and `remove` accept
 `--discard-artifact-path <relative-file>`. It selects only one ignored or

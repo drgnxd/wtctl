@@ -1,8 +1,20 @@
 # Worktree Artifact Lifecycle: Design Review and Roadmap
 
-Status: historical design review; default cleanup policy updated on 2026-10-23.
+Status: historical design review; superseded by the configuration-free policy recorded below.
 
 Review date: 2026-10-23.
+
+## Current policy
+
+No repository configuration file is needed or supported for artifact handling.
+
+Ordinary `finish` and `remove` follow Git's worktree-removal boundary, built-in artifact selectors remain opt-in, and exceptional individual ignored files require the exact per-invocation `--discard-artifact-path` selector.
+
+`.gitignore` does not authorize destructive artifact classification, and repository metadata does not authorize ignored symlinks to main-worktree files.
+
+The rest of this document is a historical snapshot of the former design and its proposed work; its configuration-based directions are not current recommendations.
+
+## Historical design snapshot
 
 ## Scope
 
@@ -65,9 +77,9 @@ For ordinary cleanup, Git ignore status determines whether a path blocks removal
 
 The current cache directory name set contains `__pycache__`, and the current build-output roots are `target`, `rust/target`, and `result`.
 
-`src/artifact_config.rs::load` reads `.wtctl.json` from the committed `HEAD` of the main worktree so a task cannot authorize its own cleanup.
+Historical implementation: `src/artifact_config.rs::load` read `.wtctl.json` from the committed `HEAD` of the main worktree so a task could not authorize its own cleanup; this configuration mechanism has been removed.
 
-The schema-1 `generated_artifacts` field accepts exact repository-root regular-file paths and rejects directories, nested paths, globs, traversal, and unknown fields.
+The former schema-1 `generated_artifacts` field accepted exact repository-root regular-file paths and rejected directories, nested paths, globs, traversal, and unknown fields.
 
 `src/artifact.rs::sign_tree` walks directory contents without following symlinks, refuses nested Git repositories and special files, and checks mount boundaries.
 
@@ -97,7 +109,7 @@ Priority definitions: P0 blocks an ordinary documented task workflow; P1 is an i
 
 | ID | Priority | Finding | Evidence and impact |
 |---|---|---|---|
-| A1 | P0 | Common nested build and package-cache directories are not covered by the artifact policy. | `artifact_defaults.json` has no SwiftPM build root or package-cache root, while `.wtctl.json` accepts only exact repository-root regular files and cannot declare directories; normal package validation can therefore block `finish`. |
+| A1 | P0 | Common nested build and package-cache directories are not covered by the artifact policy. | Historical observation: `artifact_defaults.json` had no SwiftPM build root or package-cache root, while the former `.wtctl.json` mechanism accepted only exact repository-root regular files; repository configuration is no longer supported. |
 | A2 | P0 | Adding a build-directory name alone is insufficient for SwiftPM-shaped trees. | The generic signer refuses nested symlinks and nested `.git` entries; SwiftPM output trees may contain both forms, so Phase 0 must reproduce the exact forms before a classifier change can be accepted. |
 | A3 | P1 | Manifest write and recovery limits disagree. | The writer can serialize an unbounded tree snapshot, but recovery readers cap the manifest at 64 MiB; an interrupted large-tree quarantine could become unreadable to the recovery path. |
 | A4 | P1 | Directory-tree change detection is metadata-based for most files. | Ordinary entries are checked by device, inode, mode, size, and mtime, while content digests are only recorded on specialized paths; same-metadata content rewrites are outside the current detection guarantee. |
@@ -120,7 +132,7 @@ Nested Git metadata, symlinks, special files, mount points, and tracked descenda
 
 `--external-writers-quiesced` is an operator assertion, not a substitute for the integration lock or scheduled-writer inspection.
 
-## Recommended direction
+## Historical recommendations (superseded)
 
 Keep ordinary cleanup aligned with Git's status-based refusal behavior rather than requiring artifact classification for ignored paths.
 
@@ -128,11 +140,11 @@ Keep quarantine and preservation opt-in; `.gitignore` status alone must not auth
 
 Use built-in rules only for directory names that are broadly and predictably disposable across repositories.
 
-Use exact, committed-main directory policy for nonstandard generated directories, and retain the exact-file selector for isolated one-off files.
+The former proposal to use exact, committed-main directory policy is superseded; use only broadly disposable built-ins and the exact per-invocation selector for an exceptional individual file.
 
 For any supported directory root, define how nested symlinks, nested Git metadata, mount points, special files, tracked descendants, and large trees are handled before enabling cleanup.
 
-Deploy and verify any new directory-policy capability before committing consumer configuration that uses it, because older binaries reject unknown `.wtctl.json` fields.
+The former proposal to deploy and verify a directory-policy capability before committing consumer configuration is obsolete; wtctl has no repository artifact-configuration capability.
 
 ## Historical roadmap for explicit artifact handling
 
@@ -168,11 +180,11 @@ Decide and test whether ordinary files need content digests or whether metadata 
 
 Do not enable new directory cleanup until these resource and recovery limits pass regression tests.
 
-### Phase 2: Introduce an explicit directory-artifact contract
+### Historical Phase 2: Introduce an explicit directory-artifact contract
 
-Evaluate a standard `.build` built-in against exact repository-declared directory roots for nonstandard generated paths.
+The former proposal was to evaluate a standard `.build` built-in against exact repository-declared directory roots for nonstandard generated paths; repository-declared artifact roots are no longer supported.
 
-Prefer exact, committed-main directory roots over globs or inference from `.gitignore`.
+The former proposal preferred exact, committed-main directory roots over globs or inference from `.gitignore`; this is not the current policy.
 
 Require real directory ancestors and a real directory root, reject path traversal and symlinked ancestors, and refuse tracked descendants.
 
@@ -188,7 +200,7 @@ Keep the artifact tree signer no-follow and preserve mount-point, special-file, 
 
 Do not release or deploy directory cleanup until the integration, recovery, and failure-path gates in Phases 3 and 4 pass.
 
-### Phase 3: Connect real build workflows to the artifact contract
+### Historical Phase 3: Connect real build workflows to the artifact contract
 
 For each supported package-manager wrapper, set both the dependency-cache path and build-output path deliberately.
 
@@ -198,7 +210,7 @@ Add an end-to-end test against the candidate package that runs the wrapper, conf
 
 Do not require consumers to infer that `--cache-path` also changes the separate build-output path.
 
-### Phase 4: Clarify partial completion and operator diagnostics
+### Historical Phase 4: Clarify partial completion and operator diagnostics
 
 Make dry-run output identify every selected artifact root, its classification rule, and any unsupported nested content.
 
@@ -208,7 +220,7 @@ Add separate regression tests for refusal before integration, which must leave `
 
 Document that dry-run is a point-in-time preview and the real `finish` repeats checks under its lock.
 
-### Phase 5: Align release and deployment contracts
+### Historical Phase 5: Align release and deployment contracts
 
 Keep command documentation tied to the installed `capabilities` contract rather than assuming every source checkout has been deployed.
 
@@ -218,7 +230,7 @@ Release and deploy the wtctl feature only after all earlier phase gates pass.
 
 For downstream Nix consumers, verify the pinned revision, build output, installed binary path, and capability JSON after deployment.
 
-Only then commit downstream configuration that uses the new directory-policy field.
+The former proposal was to commit downstream configuration using a directory-policy field after deployment; wtctl no longer supports such a field and consumers must not add one.
 
 ## Acceptance criteria
 
@@ -228,7 +240,7 @@ Ordinary cleanup permits ignored paths and refuses tracked changes or non-ignore
 
 An artifact change discovered after integration leaves `main` integrated and preserves the worktree and data with an explicit cleanup-pending result.
 
-Every supported generated directory is covered by either a committed built-in rule or an exact committed repository policy.
+The historical acceptance criterion that every generated directory be covered by exact committed repository policy is superseded; only built-in roots are classified, with one-off file selection for explicitly authorized exceptions.
 
 Directory cleanup either safely handles its documented symlink and nested-repository contents or refuses before moving anything.
 
@@ -246,9 +258,9 @@ The installed capability JSON is checked before downstream workflows rely on opt
 
 ## Open decisions
 
-For explicit artifact handling, should `.build` be a broadly recognized generated root, or should the consumer explicitly declare it in committed repository policy?
+Historical open decision: should `.build` be a broadly recognized generated root, or should a consumer explicitly declare it in committed repository policy? The repository-policy option is not supported by the current design.
 
-For explicit artifact handling, should nested Git directories and symlinks be allowed only inside a declared build root, or should package managers place those trees outside worktrees?
+Historical open decision: should nested Git directories and symlinks be allowed only inside a declared build root, or should package managers place those trees outside worktrees? Declared build roots are not supported by the current design.
 
 Should directory manifests hash every regular file, use a compact tree digest, or retain metadata snapshots with a documented trust boundary?
 

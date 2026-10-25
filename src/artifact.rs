@@ -54,22 +54,12 @@ pub struct SignedArtifact {
     pub one_off: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DatabaseLink {
-    pub path: PathBuf,
-    pub link_text: PathBuf,
-    pub target: PathBuf,
-    pub device: u64,
-    pub inode: u64,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Plan {
     pub generated: Vec<SignedArtifact>,
     pub direnv: Option<SignedArtifact>,
     pub direnv_discardable: bool,
     pub discard_direnv: bool,
-    pub database_link: Option<DatabaseLink>,
 }
 
 pub struct KeptOneOffRecovery<'a> {
@@ -100,7 +90,6 @@ pub struct Transaction {
     pub manifest_path: PathBuf,
     pub manifest: Value,
     pub moved: Vec<MovedArtifact>,
-    pub database_link: Option<DatabaseLink>,
 }
 
 struct BeginTransactionContext<'a> {
@@ -173,7 +162,7 @@ fn begin_transaction_in_state(
         head,
         branch,
     } = context;
-    if plan.generated.is_empty() && plan.direnv.is_none() && plan.database_link.is_none() {
+    if plan.generated.is_empty() && plan.direnv.is_none() {
         return Ok(None);
     }
     if !state_home.is_absolute() {
@@ -280,15 +269,6 @@ fn begin_transaction_in_state(
             "purge_state": "planned",
         })
     });
-    let database = plan.database_link.as_ref().map(|link| {
-        json!({
-            "link_text": link.link_text,
-            "target": link.target,
-            "device": link.device,
-            "inode": link.inode,
-            "unlinked": false,
-        })
-    });
     let manifest = json!({
         "schema_version": 1,
         "operation_id": operation.file_name().unwrap_or_default().to_string_lossy(),
@@ -300,7 +280,6 @@ fn begin_transaction_in_state(
         "common_dir": common,
         "branch_ref": branch,
         "head": head,
-        "database_link": database,
         "direnv": direnv,
         "generated_caches": generated_manifest,
     });
@@ -309,7 +288,6 @@ fn begin_transaction_in_state(
         manifest_path,
         manifest,
         moved: Vec::new(),
-        database_link: plan.database_link.clone(),
     };
     if let Err(error) = write_manifest(&transaction, "prepared", true) {
         if fs::symlink_metadata(&transaction.manifest_path).is_err()
@@ -334,17 +312,6 @@ pub fn quarantine(
     }
     for artifact in &plan.generated {
         move_artifact(transaction, artifact, false, worktree)?;
-    }
-    if let Some(link) = &plan.database_link {
-        verify_database_link(link)?;
-        fs::remove_file(&link.path).map_err(|error| {
-            format!(
-                "cannot unlink canonical state.db symlink {}: {error}",
-                link.path.display()
-            )
-        })?;
-        transaction.manifest["database_link"]["unlinked"] = Value::Bool(true);
-        write_manifest(transaction, "database_symlink_unlinked", false)?;
     }
     Ok(())
 }
@@ -422,12 +389,6 @@ pub fn restore(
     head: &str,
 ) -> Result<(), String> {
     verify_transaction_identity(transaction, worktree, admin, head)?;
-    if let Some(link) = &transaction.database_link {
-        if transaction.manifest["database_link"]["unlinked"] == true {
-            restore_database_link(link)?;
-            transaction.manifest["database_link"]["unlinked"] = Value::Bool(false);
-        }
-    }
     for moved in transaction.moved.iter().rev() {
         if fs::symlink_metadata(&moved.quarantine).is_err() {
             verify_signature(&moved.original, &moved.signature, worktree)?;
@@ -654,7 +615,6 @@ fn purge_preserved_in_state(context: PurgeContext<'_>) -> Result<Vec<String>, St
         manifest_path,
         manifest,
         moved: Vec::new(),
-        database_link: None,
     };
     let mut allowed = BTreeSet::from(["manifest.json".to_string()]);
     let mut labels = Vec::new();
@@ -1117,7 +1077,6 @@ pub fn resume_one_off_for_kept_worktree(
             manifest["phase"].as_str(),
             Some("completed_preserved" | "purging_preserved")
         )
-        || !manifest["database_link"].is_null()
         || !manifest["direnv"].is_null()
     {
         return Err("quarantine manifest does not identify this kept one-off cleanup".into());
@@ -1207,7 +1166,6 @@ pub fn resume_one_off_for_kept_worktree(
         manifest_path,
         manifest,
         moved: vec![moved],
-        database_link: None,
     };
     let operation = transaction.operation.clone();
     let report = finish_transaction(&mut transaction).map_err(|error| {
@@ -2110,49 +2068,6 @@ fn verify_transaction_identity(
     Ok(())
 }
 
-fn verify_database_link(link: &DatabaseLink) -> Result<(), String> {
-    verify_database_target(link)?;
-    let info = fs::symlink_metadata(&link.path)
-        .map_err(|error| format!("database symlink changed: {error}"))?;
-    if !info.file_type().is_symlink()
-        || fs::read_link(&link.path).ok().as_ref() != Some(&link.link_text)
-        || fs::canonicalize(&link.path).ok().as_ref() != Some(&link.target)
-    {
-        return Err("canonical state.db symlink changed".into());
-    }
-    Ok(())
-}
-
-fn restore_database_link(link: &DatabaseLink) -> Result<(), String> {
-    if fs::symlink_metadata(&link.path).is_ok() {
-        return Err(format!(
-            "database restore path is occupied: {}",
-            link.path.display()
-        ));
-    }
-    verify_database_target(link)?;
-    std::os::unix::fs::symlink(&link.link_text, &link.path).map_err(|error| {
-        format!(
-            "cannot restore database symlink {}: {error}",
-            link.path.display()
-        )
-    })?;
-    verify_database_link(link)
-}
-
-fn verify_database_target(link: &DatabaseLink) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(&link.target)
-        .map_err(|error| format!("canonical database disappeared: {error}"))?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.dev() != link.device
-        || metadata.ino() != link.inode
-    {
-        return Err("canonical database target changed".into());
-    }
-    Ok(())
-}
-
 fn create_operation_dir(root: &Path) -> Result<PathBuf, String> {
     let mut bytes = [0u8; 16];
     for _ in 0..8 {
@@ -2518,7 +2433,7 @@ pub fn validate_one_off_artifact_path(path: &Path) -> Result<(), String> {
             .any(|character| matches!(character, '*' | '?' | '[' | ']'))
         || text
             .split('/')
-            .any(|part| matches!(part, "" | "." | ".." | ".git" | ".direnv" | ".wtctl.json"))
+            .any(|part| matches!(part, "" | "." | ".." | ".git" | ".direnv"))
         || path.is_absolute()
         || path
             .components()
@@ -2786,7 +2701,7 @@ unsafe extern "C" {
 
 pub fn inspect_plan(
     worktree: &Path,
-    main_worktree: Option<&Path>,
+    _main_worktree: Option<&Path>,
     options: &Options,
 ) -> Result<Plan, String> {
     let status = status(worktree)?;
@@ -2802,15 +2717,12 @@ pub fn inspect_plan(
     let caches = options.discard_caches || options.discard_all || options.preserve_generated;
     let build_outputs =
         options.discard_build_outputs || options.discard_all || options.preserve_generated;
-    let include_config = options.discard_all || options.preserve_generated;
-    let rules = artifact_config::load(main_worktree)?;
-    let include_configured = options.discard_all || options.preserve_generated;
+    let rules = artifact_config::load()?;
     let mut roots = generated_roots(
         &status,
         caches,
         build_outputs,
-        include_config,
-        include_configured,
+        options.discard_all || options.preserve_generated,
         &rules,
     )?;
     let mut nested_direnv = Vec::new();
@@ -2942,8 +2854,6 @@ pub fn inspect_plan(
                 worktree,
                 options.discard_artifact_path.as_ref().unwrap(),
             )?]
-        } else if rules.generated_artifacts.contains(relative) {
-            sign_configured_artifact(&path, worktree)?
         } else {
             sign_tree(
                 &path,
@@ -3005,18 +2915,6 @@ pub fn inspect_plan(
     }
 
     for entry in &status {
-        if entry.code == *b"!!"
-            && rules
-                .main_worktree_symlinks
-                .contains(Path::new(OsStr::from_bytes(&entry.path)))
-        {
-            if let Some(link) = canonical_main_file_link(worktree, main_worktree, &entry.path) {
-                if plan.database_link.replace(link).is_some() {
-                    return Err("worktree has multiple root symlinks to main-worktree files".into());
-                }
-                continue;
-            }
-        }
         if plan.generated.iter().any(|artifact| {
             under_root(
                 &entry.path,
@@ -3069,29 +2967,10 @@ pub fn inspect_plan(
 pub fn verify_plan_artifacts(
     plan: &Plan,
     worktree: &Path,
-    main_worktree: Option<&Path>,
+    _main_worktree: Option<&Path>,
 ) -> Result<(), String> {
     for artifact in plan.generated.iter().chain(plan.direnv.iter()) {
         verify_signature(&artifact.path, &artifact.signature, worktree)?;
-    }
-    if let Some(link) = &plan.database_link {
-        let relative = link
-            .path
-            .strip_prefix(worktree)
-            .map_err(|_| "canonical main-worktree file symlink is outside the task worktree")?;
-        let main =
-            main_worktree.ok_or("canonical main-worktree file symlink has no main worktree")?;
-        let rules = artifact_config::load(Some(main))?;
-        if !rules.main_worktree_symlinks.contains(relative)
-            || canonical_main_file_link(worktree, Some(main), relative.as_os_str().as_bytes())
-                .as_ref()
-                != Some(link)
-        {
-            return Err(format!(
-                "canonical main-worktree file symlink changed during merge: {}",
-                link.path.display()
-            ));
-        }
     }
     Ok(())
 }
@@ -3215,47 +3094,11 @@ fn nested_direnv_roots(status: &[StatusEntry]) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-fn canonical_main_file_link(
-    worktree: &Path,
-    main_worktree: Option<&Path>,
-    relative: &[u8],
-) -> Option<DatabaseLink> {
-    let main = main_worktree?;
-    let relative = Path::new(OsStr::from_bytes(relative));
-    let mut components = relative.components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return None;
-    }
-    let canonical = main.join(relative);
-    let metadata = fs::symlink_metadata(&canonical).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let target = fs::canonicalize(&canonical).ok()?;
-    if target != canonical || target == worktree || target.starts_with(worktree) {
-        return None;
-    }
-    let link = worktree.join(relative);
-    if !fs::symlink_metadata(&link).ok()?.file_type().is_symlink()
-        || fs::canonicalize(&link).ok()? != target
-    {
-        return None;
-    }
-    Some(DatabaseLink {
-        path: link.clone(),
-        link_text: fs::read_link(link).ok()?,
-        target,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
 pub fn generated_roots(
     status: &[StatusEntry],
     caches: bool,
     build_outputs: bool,
     generated_config: bool,
-    include_configured: bool,
     rules: &artifact_config::Rules,
 ) -> Result<Vec<PathBuf>, String> {
     let mut candidates = BTreeSet::new();
@@ -3304,15 +3147,6 @@ pub fn generated_roots(
                     .cloned(),
             );
         }
-        if include_configured {
-            candidates.extend(
-                rules
-                    .generated_artifacts
-                    .iter()
-                    .filter(|root| configured_path_contains(path, root))
-                    .cloned(),
-            );
-        }
     }
 
     let mut roots = Vec::new();
@@ -3356,44 +3190,6 @@ pub fn sign_tree(
         allow_nested_symlinks,
         Path::new("/nix/store"),
     )
-}
-
-fn sign_configured_artifact(path: &Path, worktree: &Path) -> Result<Vec<TreeEntry>, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "cannot inspect configured generated artifact {}: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(format!(
-            "configured generated artifact must be a regular file: {}",
-            path.display()
-        ));
-    }
-    let mut signature = sign_tree(path, worktree, false, false, false)?;
-    if signature.len() != 1 {
-        return Err(format!(
-            "configured generated artifact is not a single file: {}",
-            path.display()
-        ));
-    }
-    let entry = &mut signature[0];
-    if entry.kind != "file"
-        || entry.device != metadata.dev()
-        || entry.inode != metadata.ino()
-        || entry.mode != metadata.mode()
-        || entry.size != metadata.size()
-        || entry.mtime_ns
-            != metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128
-    {
-        return Err(format!(
-            "configured generated artifact changed while signing: {}",
-            path.display()
-        ));
-    }
-    entry.link_or_digest = hash_regular_file_nofollow(path, &metadata)?;
-    Ok(signature)
 }
 
 fn sign_tree_with_store(
@@ -4091,7 +3887,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::process::Command;
-    use std::time::{Duration, UNIX_EPOCH};
 
     fn temp(name: &str) -> PathBuf {
         let path =
@@ -4145,7 +3940,7 @@ mod tests {
 
     #[test]
     fn selects_only_explicit_generated_roots_and_collapses_nested_roots() {
-        let rules = artifact_config::load(None).unwrap();
+        let rules = artifact_config::load().unwrap();
         let status = [
             StatusEntry {
                 code: *b"!!",
@@ -4165,117 +3960,12 @@ mod tests {
             },
         ];
         assert_eq!(
-            generated_roots(&status, true, true, false, false, &rules).unwrap(),
+            generated_roots(&status, true, true, false, &rules).unwrap(),
             vec![PathBuf::from("target"), PathBuf::from("src/__pycache__")]
         );
-        assert!(generated_roots(&status, false, false, false, false, &rules)
+        assert!(generated_roots(&status, false, false, false, &rules)
             .unwrap()
             .is_empty());
-    }
-
-    #[test]
-    fn selects_repository_configured_artifacts_only_when_cleanup_was_requested() {
-        let mut rules = artifact_config::load(None).unwrap();
-        rules
-            .generated_artifacts
-            .insert(PathBuf::from("output.csv"));
-        let status = [
-            StatusEntry {
-                code: *b"!!",
-                path: b"output.csv".to_vec(),
-            },
-            StatusEntry {
-                code: *b"??",
-                path: b"unlisted.csv".to_vec(),
-            },
-        ];
-        assert!(generated_roots(&status, false, false, false, false, &rules)
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            generated_roots(&status, false, false, false, true, &rules).unwrap(),
-            vec![PathBuf::from("output.csv")]
-        );
-    }
-
-    #[test]
-    fn inspect_plan_uses_committed_repository_artifact_configuration() {
-        let root = temp("repo-configured-artifact");
-        let git = |arguments: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(arguments)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                arguments,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.name", "wtctl test"]);
-        git(&["config", "user.email", "wtctl-test@example.invalid"]);
-        fs::write(root.join(".gitignore"), "output.csv\n").unwrap();
-        fs::write(
-            root.join(artifact_config::REPO_CONFIG),
-            br#"{"schema_version":1,"generated_artifacts":["output.csv"]}"#,
-        )
-        .unwrap();
-        git(&["add", ".gitignore", artifact_config::REPO_CONFIG]);
-        git(&["commit", "-q", "-m", "artifact config"]);
-        fs::write(root.join("output.csv"), "synthetic output\n").unwrap();
-
-        let plan = inspect_plan(
-            &root,
-            Some(&root),
-            &Options {
-                discard_all: true,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(plan.generated.len(), 1);
-        assert_eq!(plan.generated[0].path, root.join("output.csv"));
-        fs::remove_file(root.join("output.csv")).unwrap();
-        fs::create_dir(root.join("output.csv")).unwrap();
-        assert!(inspect_plan(
-            &root,
-            Some(&root),
-            &Options {
-                discard_all: true,
-                ..Options::default()
-            },
-        )
-        .unwrap_err()
-        .contains("must be a regular file"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn root_file_signature_detects_same_inode_same_size_rewrite_with_restored_mtime() {
-        let worktree = temp("root-file-signature");
-        let path = worktree.join("report.md");
-        fs::write(&path, b"original").unwrap();
-        let original = fs::metadata(&path).unwrap();
-        let signature = sign_configured_artifact(&path, &worktree).unwrap();
-
-        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.write_all(b"modified").unwrap();
-        file.set_times(fs::FileTimes::new().set_modified(
-            UNIX_EPOCH + Duration::new(original.mtime() as u64, original.mtime_nsec() as u32),
-        ))
-        .unwrap();
-
-        let changed = fs::metadata(&path).unwrap();
-        assert_eq!(changed.ino(), original.ino());
-        assert_eq!(changed.size(), original.size());
-        assert_eq!(changed.mtime(), original.mtime());
-        assert_eq!(changed.mtime_nsec(), original.mtime_nsec());
-        assert!(verify_signature(&path, &signature, &worktree).is_err());
-        let _ = fs::remove_dir_all(worktree);
     }
 
     #[test]
@@ -4367,123 +4057,6 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(state_namespace);
-        let _ = fs::remove_dir_all(fixture);
-    }
-
-    #[test]
-    fn preserved_custom_artifact_can_be_purged_after_repository_policy_changes() {
-        let fixture = temp("custom-artifact-policy-purge");
-        let repo = fixture.join("repo");
-        let state_home = fixture.join("state");
-        fs::create_dir_all(&repo).unwrap();
-        fs::create_dir_all(&state_home).unwrap();
-        let task = repo.join("fake-task");
-        let common = repo.join(".git");
-        let admin = common.join("worktrees/fake-task");
-        let artifact_path = task.join("report.md");
-        let repo_name = format!("wtctl-policy-test-{}", std::process::id());
-
-        let git = |arguments: &[&str]| {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(arguments)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                arguments,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "maintenance.auto", "false"]);
-        git(&["config", "gc.auto", "0"]);
-        git(&["config", "user.name", "wtctl test"]);
-        git(&["config", "user.email", "wtctl-test@example.invalid"]);
-        fs::write(
-            repo.join(artifact_config::REPO_CONFIG),
-            br#"{"schema_version":1,"generated_artifacts":["report.md"]}"#,
-        )
-        .unwrap();
-        git(&["add", artifact_config::REPO_CONFIG]);
-        git(&["commit", "-q", "-m", "add artifact policy"]);
-        let original_head = git(&["rev-parse", "HEAD"]);
-        assert!(artifact_config::load(Some(&repo))
-            .unwrap()
-            .generated_artifacts
-            .contains(Path::new("report.md")));
-
-        fs::create_dir_all(&admin).unwrap();
-        fs::create_dir_all(&task).unwrap();
-        fs::write(&artifact_path, "preserved report\n").unwrap();
-        let plan = Plan {
-            generated: vec![SignedArtifact {
-                path: artifact_path.clone(),
-                signature: sign_configured_artifact(&artifact_path, &task).unwrap(),
-                preserve: true,
-                one_off: false,
-            }],
-            ..Plan::default()
-        };
-        let mut transaction = begin_transaction_in_state(
-            &plan,
-            BeginTransactionContext {
-                repo_name: &repo_name,
-                state_home: &state_home,
-                common: &common,
-                worktree: &task,
-                admin: &admin,
-                head: &original_head,
-                branch: None,
-            },
-        )
-        .unwrap()
-        .unwrap();
-        quarantine(&mut transaction, &plan, &task).unwrap();
-        let report = finish_transaction(&mut transaction).unwrap();
-        let operation = report.operation.unwrap();
-        fs::remove_dir_all(&task).unwrap();
-
-        fs::write(
-            repo.join(artifact_config::REPO_CONFIG),
-            br#"{"schema_version":1,"generated_artifacts":[]}"#,
-        )
-        .unwrap();
-        git(&["add", artifact_config::REPO_CONFIG]);
-        git(&["commit", "-q", "-m", "remove artifact policy"]);
-        assert!(artifact_config::load(Some(&repo))
-            .unwrap()
-            .generated_artifacts
-            .is_empty());
-
-        let moved = transaction.moved[0].clone();
-        let ordered = purge_order(&moved.signature);
-        let mut journal = create_purge_journal(&moved.journal).unwrap();
-        append_purge_journal(&mut journal, 0, &ordered[0], "pending").unwrap();
-        journal.sync_all().unwrap();
-        drop(journal);
-        transaction.manifest["generated_caches"][0]["purge_state"] =
-            Value::String("purging".into());
-        transaction.manifest["generated_caches"][0]["purge_journal"] =
-            Value::String("purge-generated-cache-000.jsonl".into());
-        write_manifest(&transaction, "purging_preserved", false).unwrap();
-        fs::remove_file(&moved.quarantine).unwrap();
-
-        let purged = purge_preserved_in_state(PurgeContext {
-            state_home: &state_home,
-            repo_root: &repo,
-            repo_name: &repo_name,
-            common: &common,
-            main_ref: "refs/heads/main",
-            operation_id: operation.file_name().unwrap().to_str().unwrap(),
-            discard_unverified_direnv: false,
-            dry_run: false,
-        })
-        .unwrap();
-        assert_eq!(purged, vec!["report.md"]);
         let _ = fs::remove_dir_all(fixture);
     }
 
@@ -4705,7 +4278,6 @@ mod tests {
             ".cache//snapshot.jsonl",
             ".git/config",
             "nested/.direnv/cache",
-            ".wtctl.json",
             ".cache/*.jsonl",
         ] {
             assert!(

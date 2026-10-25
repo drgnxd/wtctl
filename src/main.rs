@@ -4822,7 +4822,6 @@ fn cmd_remove(a: &Args) -> R<()> {
                     "verified_dotgit": if dotgit.is_some() { "symlink" } else { "gitfile" },
                     "generated_artifacts": plan.generated.len() + usize::from(plan.direnv.is_some()),
                     "generated_artifact_paths": generated_artifact_paths.clone(),
-                    "canonical_database_link": plan.database_link.is_some(),
                     "git_annex_restage": annex,
                 })
             );
@@ -4841,10 +4840,7 @@ fn cmd_remove(a: &Args) -> R<()> {
                 } else {
                     ""
                 },
-                if plan.generated.is_empty()
-                    && plan.direnv.is_none()
-                    && plan.database_link.is_none()
-                {
+                if plan.generated.is_empty() && plan.direnv.is_none() {
                     String::new()
                 } else {
                     format!(
