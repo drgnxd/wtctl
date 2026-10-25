@@ -229,9 +229,6 @@ unverified `.direnv` purge additionally requires
 `--discard-unverified-direnv`. Purging verifies saved signatures and journals
 per-entry progress so an interrupted purge can resume safely.
 
-An ignored root symlink to a regular file of the same name in the registered
-`main` worktree is unlinked only after its target and link text are verified.
-The target is never modified; the link is restored if removal fails.
 `--allow-unreferenced-reflog` explicitly permits discarding commits held only
 by the target worktree's HEAD reflog, but never permits an unintegrated HEAD.
 

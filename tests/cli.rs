@@ -446,6 +446,32 @@ fn remove_keeps_non_ignored_untracked_files_like_git() {
 }
 
 #[test]
+fn obsolete_repository_policy_does_not_authorize_custom_artifacts() {
+    let env = Env::new();
+    commit_file(
+        &env.repo,
+        ".wtctl.json",
+        r#"{"schema_version":1,"generated_artifacts":["ranked_output.csv"]}"#,
+    );
+    let (id, path) = env.create("obsolete-artifact-policy");
+    env.exclude("ranked_output.csv");
+    let output = path.join("ranked_output.csv");
+    fs::write(&output, b"generated output").unwrap();
+
+    let refused = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-generated-artifacts",
+    ]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert!(path.is_dir());
+    assert_eq!(fs::read(output).unwrap(), b"generated output");
+}
+
+#[test]
 fn remove_dry_run_reports_selected_artifacts_without_mutating_them() {
     let env = Env::new();
     let (id, path) = env.create("dry-run-artifact");
