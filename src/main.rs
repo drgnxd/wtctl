@@ -1405,6 +1405,17 @@ fn require_owner_or_dead(marker: &Marker) -> R<Owner> {
     }
 }
 
+/// A refusal after the worktree was reset must say where the work went.
+fn after_reset(fail: Fail, snapshot: &str, refname: &str) -> Fail {
+    Fail::new(
+        fail.code,
+        format!(
+            "{}; the worktree was reset, and its uncommitted work is kept as {snapshot} under {refname}; do not delete that ref",
+            fail.msg
+        ),
+    )
+}
+
 fn ensure_ref(repo: &Path, refname: &str, expected: &str) -> R<()> {
     let actual = git::run(repo, ["rev-parse", "--verify", "--quiet", refname])?;
     if actual.trim() != expected {
@@ -4789,6 +4800,7 @@ fn cmd_remove(a: &Args) -> R<()> {
         (entry, authority)
     };
     let mut abandoned_ref = None;
+    let mut snapshot_oid: Option<String> = None;
     if abandon {
         // Commits reachable from the preserved tip count as kept, so every
         // other removal check still applies (reflog-only commits still refuse).
@@ -4799,11 +4811,28 @@ fn cmd_remove(a: &Args) -> R<()> {
         main_ref = tip;
         abandoned_ref = Some(abandon::ref_name(&authority.worktree_id));
     }
-    let kept = if id.is_some() {
+    let mut kept = if id.is_some() {
         superseded::kept_tips(&repo, &authority.worktree_id)
     } else {
         Vec::new()
     };
+    if abandon {
+        // Commits already kept under the abandoned ref (a snapshot from an
+        // earlier attempt) are preserved, so they are not "not in main".
+        let existing = git::output(
+            &repo.root,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &abandon::ref_name(&authority.worktree_id),
+            ],
+        )?;
+        if existing.status.success() {
+            kept.push(String::from_utf8_lossy(&existing.stdout).trim().to_string());
+        }
+    }
     let facts = task::facts_excluding(&[&entry], &main_ref, &kept)?;
     let f = facts.first().cloned().unwrap_or_default();
     f.removable_except_status_with_reflog_opt_in(cleanup.allow_unreferenced_reflog)
@@ -4818,6 +4847,7 @@ fn cmd_remove(a: &Args) -> R<()> {
         .current_oid()
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD"))?;
     let include_uncommitted = abandon && a.flag("--include-uncommitted");
+    let dead_owner = abandon && a.flag("--dead-owner");
     let uncommitted = if include_uncommitted {
         abandon::uncommitted_paths(&entry)?
     } else {
@@ -4832,6 +4862,9 @@ fn cmd_remove(a: &Args) -> R<()> {
         let main_worktree = canonical_main_checkout(&repo)?;
         artifact::check_pending_transaction(&repo.name(), &entry.path)
             .map_err(|why| Fail::new(4, why))?;
+        if include_uncommitted {
+            abandon::preflight_snapshot(&repo, &entry, annex, dead_owner)?;
+        }
         // Uncommitted paths are about to be preserved, so the strict
         // clean-worktree check is deferred until after the snapshot.
         let plan = if uncommitted > 0 {
@@ -4941,6 +4974,9 @@ fn cmd_remove(a: &Args) -> R<()> {
         verify_removal_authority(&repo, &entry, &authority)?;
         removal_lock_state(&entry, &authority)?;
         ensure_no_cwd_users(&entry, "removal")?;
+        if include_uncommitted {
+            abandon::preflight_snapshot(&repo, &entry, annex, dead_owner)?;
+        }
         let snapshot = if include_uncommitted {
             abandon::snapshot_uncommitted(&entry, &authority.worktree_id)?
         } else {
@@ -4949,15 +4985,22 @@ fn cmd_remove(a: &Args) -> R<()> {
         let keep = snapshot
             .as_ref()
             .map_or(head.as_str(), |s| s.commit.as_str());
-        abandon::preserve(&repo, &authority.worktree_id, keep)?;
+        let refname = abandon::preserve(&repo, &authority.worktree_id, keep)?;
         if let Some(s) = &snapshot {
-            abandon::discard_snapshotted_changes(&entry, &s.tree)?;
+            snapshot_oid = Some(s.commit.clone());
+            // Past this point the worktree is reset; say so if anything fails.
+            abandon::discard_snapshotted_changes(&entry, s)
+                .map_err(|f| after_reset(f, &s.commit, &refname))?;
         }
         if include_uncommitted {
             // The snapshot is preserved; what remains must pass the same
             // artifact checks as any other removal.
             artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
-                .map_err(|why| Fail::new(4, why))?;
+                .map_err(|why| Fail::new(4, why))
+                .map_err(|f| match &snapshot {
+                    Some(s) => after_reset(f, &s.commit, &refname),
+                    None => f,
+                })?;
         }
     }
     remove_worktree(
@@ -4972,25 +5015,41 @@ fn cmd_remove(a: &Args) -> R<()> {
             cleanup,
             json_output: a.flag("--json"),
         },
-    )?;
+    )
+    .map_err(|f| match (&snapshot_oid, &abandoned_ref) {
+        (Some(oid), Some(refname)) => after_reset(f, oid, refname),
+        _ => f,
+    })?;
     if let Some(branch) = branch {
         if a.flag("--delete-branch") {
             delete_legacy_branch(&repo, branch, &head, &main_ref)?;
         }
     }
-    repo.audit(json!({"at": now(), "event": "remove", "worktree_id": authority.worktree_id, "abandoned_ref": abandoned_ref}));
+    repo.audit(json!({
+        "at": now(),
+        "event": "remove",
+        "worktree_id": authority.worktree_id,
+        "abandoned_ref": abandoned_ref,
+        "snapshot": snapshot_oid,
+        "dead_owner": dead_owner,
+        "ignored_paths_not_kept": ignored_lost,
+    }));
     if a.flag("--json") {
         out!(
             "{}",
-            json!({"status": "removed", "worktree_id": authority.worktree_id, "branch_deleted": a.flag("--delete-branch"), "abandoned_ref": abandoned_ref})
+            json!({"status": "removed", "worktree_id": authority.worktree_id, "branch_deleted": a.flag("--delete-branch"), "abandoned_ref": abandoned_ref, "snapshot": snapshot_oid, "ignored_paths_not_kept": ignored_lost})
         );
     } else {
         out!("removed {}", authority.worktree_id);
         if let Some(refname) = &abandoned_ref {
             out!(
-                "preserved {head} as {refname}; restore with `wtctl restore --id {}`",
+                "preserved {} as {refname}; restore with `wtctl restore --id {}`",
+                snapshot_oid.as_deref().unwrap_or(&head),
                 authority.worktree_id
             );
+        }
+        if !ignored_lost.is_empty() {
+            out!("ignored paths not kept: {}", ignored_lost.join(", "));
         }
     }
     Ok(())

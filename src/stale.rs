@@ -5,10 +5,31 @@ use super::*;
 
 const DEFAULT_DAYS: f64 = 7.0;
 
+/// Days since the task last showed activity: the newer of its tip commit and
+/// its most recently changed uncommitted file.
 fn age_days(entry: &Entry) -> Option<f64> {
     let out = git::output(&entry.path, ["log", "-1", "--format=%ct", "HEAD"]).ok()?;
     let committed: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-    Some(((now() - committed).max(0) as f64) / 86_400.0)
+    let mut secs = (now() - committed).max(0) as f64;
+    if let Ok(Some(changed)) = abandon::newest_change_age_secs(entry) {
+        secs = secs.min(changed as f64);
+    }
+    Some(secs / 86_400.0)
+}
+
+/// Merge commits are skipped by `git cherry`, so any on the task make its
+/// "nothing unique" verdict unreliable.
+fn has_merge_commits(entry: &Entry, main_ref: &str) -> R<bool> {
+    let out = git::run(
+        &entry.path,
+        [
+            "rev-list",
+            "--merges",
+            "--count",
+            &format!("{main_ref}..HEAD"),
+        ],
+    )?;
+    Ok(out.trim() != "0")
 }
 
 /// Commits on the task that are not patch-equivalent to anything on `main`,
@@ -52,6 +73,7 @@ pub fn cmd_stale(a: &Args) -> R<()> {
         let unique = unique_commits(&entry, &main_ref)?;
         let uncommitted = abandon::uncommitted_paths(&entry)?;
         let ignored = abandon::ignored_paths(&entry)?;
+        let merges = has_merge_commits(&entry, &main_ref)?;
         rows.push(json!({
             "id": entry.id(),
             "path": entry.path,
@@ -61,7 +83,8 @@ pub fn cmd_stale(a: &Args) -> R<()> {
             "unique_subjects": unique.iter().take(5).collect::<Vec<_>>(),
             "uncommitted_paths": uncommitted,
             "ignored_paths": ignored,
-            "already_on_main": unique.is_empty() && uncommitted == 0,
+            "has_merge_commits": merges,
+            "already_on_main": unique.is_empty() && uncommitted == 0 && !merges,
         }));
     }
     if a.flag("--json") {
@@ -77,7 +100,11 @@ pub fn cmd_stale(a: &Args) -> R<()> {
             r["uncommitted_paths"],
             r["ignored_paths"].as_array().map_or(0, Vec::len),
             if r["already_on_main"] == true {
-                "already-on-main"
+                if r["ignored_paths"].as_array().is_some_and(|p| !p.is_empty()) {
+                    "already-on-main (ignored files would be lost)"
+                } else {
+                    "already-on-main"
+                }
             } else {
                 "has-unique-work"
             }

@@ -33,7 +33,7 @@ check. Supported system: aarch64-darwin.
 | `remove --repo <repo> (--id <id>\|--legacy-worktree-id <id>\|--expect-branch <branch>) [--external-writers-quiesced] [--base <ref>]` | Remove one exact wtctl or legacy worktree owned by the caller; actual removal requires writer acknowledgement and supports dry-run, reflog opt-in, and artifact cleanup options. |
 | `reap [--dry-run] [--grace-secs <n>] [--external-writers-quiesced] [--main <branch>\|--base <ref>]` | Delete removable worktrees whose owner is dead. |
 | `adopt --repo <repo> --id <id> [--session <id>]` | Take over a task whose owner is dead. |
-| `stale --repo <repo> [--older-than-days <n>] [--main <branch>] [--json]` | Dead-owner tasks idle for at least `n` days (default 7), with the evidence for deciding whether to abandon them: commits not patch-equivalent to anything on `main`, uncommitted paths, ignored paths, and whether the task is already on `main`. Read-only. |
+| `stale --repo <repo> [--older-than-days <n>] [--main <branch>] [--json]` | Dead-owner tasks idle for at least `n` days (default 7; idle is the newer of the tip commit and the latest uncommitted file change), with the evidence for deciding whether to abandon them: commits not patch-equivalent to anything on `main`, merge commits (which that comparison skips), uncommitted paths, ignored paths, and whether the task is already on `main`. Read-only. |
 | `show --repo <repo> --id <id> [--json]` | Task details: owner, session and resume command, age, changes, unintegrated commits, diffstat, and why it is or is not removable. |
 | `describe --repo <repo> --id <id> [--task <text>] [--session <id>]` | Update the task text or recorded session of an owned task. |
 | `restore --repo <repo> --id <abandoned-id> --slug <slug>` | Start a new task from an abandoned task tip. |
@@ -103,9 +103,17 @@ Nothing is adopted automatically.
   changes and untracked, non-ignored files are committed on top of the task tip
   in a private index (the worktree and its real index are not touched), the ref
   points at that snapshot, and only then is the worktree reset so the normal
-  removal checks see a clean tree. It refuses if the worktree changed while the
-  snapshot was taken. Ignored files are not kept; `--dry-run` lists them as
-  `ignored_paths_not_kept`, and a normal removal deletes them with the worktree.
+  removal checks see a clean tree. Repository hooks are disabled for these Git
+  calls. Every refusal that can be predicted is raised before anything is
+  written: submodules and nested repositories, unreviewed filters on tracked or
+  untracked paths, a changed `.gitignore` or `.gitattributes`, staged changes
+  that differ from the worktree, content stored in git-annex, a conflicting
+  existing ref, and (with `--dead-owner`) files changed within the last ten
+  minutes. After the reset only the untracked files the snapshot holds are
+  deleted, and the command refuses if anything else remains. A refusal after
+  the reset says where the work is kept; a retry accepts that ref.
+  Ignored files are not kept; `--dry-run` lists them as `ignored_paths_not_kept`,
+  and a normal removal deletes them with the worktree.
 - `--abandon --dead-owner` allows the owner to be dead. The owner must be
   verifiably dead; a live or unverifiable owner still refuses. Because the work
   is preserved in full, this does not need `adopt` first. Pass it only when the
@@ -138,7 +146,7 @@ Nothing is adopted automatically.
 - **Liveness** is `alive`, `dead`, or `unknown`. `dead` needs positive
   evidence: the pid is gone, is a zombie, or has a readable but different
   start time. `reap` and `adopt` act only on `dead`; `integrate` and `remove`
-  require the caller to be the live owner.
+  require the caller to be the live owner, except `remove --abandon --dead-owner`.
 - **Locks.** `integrate`, `remove`, `reap`, and `adopt` take a non-blocking
   `flock` on `<git-common-dir>/agent-locks/integrate.lock`, then an
   mkdir-based `main-integration.lock` (owner file `<token>\n<pid>\n<host>\n`,

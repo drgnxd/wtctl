@@ -6139,3 +6139,174 @@ fn stale_lists_dead_owner_tasks_with_their_unique_work() {
     let young = env.ok(&["stale", "--repo", &repo, "--json"]);
     assert_eq!(young.trim(), "[]", "the default age filter hides new tasks");
 }
+
+fn missing_ref(env: &Env, id: &str) -> bool {
+    !git_cmd(
+        &env.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/wtctl/abandoned/{id}"),
+        ],
+    )
+    .output()
+    .unwrap()
+    .status
+    .success()
+}
+
+fn text(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+fn abandon_dirty(env: &Env, id: &str, extra: &[&str]) -> Output {
+    let repo = env.repo_arg();
+    let mut args = vec![
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        id,
+        "--abandon",
+        "--include-uncommitted",
+    ];
+    args.extend_from_slice(extra);
+    env.run(&args)
+}
+
+#[test]
+fn snapshot_refuses_before_writing_anything_when_ignore_rules_changed() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-ignore");
+    commit_file(&path, ".gitignore", "a.tmp\n");
+    fs::write(path.join(".gitignore"), "a.tmp\nb.tmp\n").unwrap();
+    let out = abandon_dirty(&env, &id, &[]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(text(&out).contains(".gitignore"), "{}", text(&out));
+    assert!(
+        missing_ref(&env, &id),
+        "nothing may be written on a refusal"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join(".gitignore")).unwrap(),
+        "a.tmp\nb.tmp\n",
+        "the worktree is untouched"
+    );
+}
+
+#[test]
+fn snapshot_refuses_a_nested_repository_without_touching_the_worktree() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-nested");
+    let nested = path.join("inner");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    commit_file(&nested, "x.txt", "x\n");
+    let out = abandon_dirty(&env, &id, &[]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(missing_ref(&env, &id));
+    assert!(nested.join("x.txt").exists());
+}
+
+#[test]
+fn snapshot_refuses_staged_changes_that_the_worktree_diverged_from() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-staged");
+    commit_file(&path, "stage-me.txt", "base\n");
+    fs::write(path.join("stage-me.txt"), "staged version\n").unwrap();
+    git(&path, &["add", "stage-me.txt"]);
+    fs::write(path.join("stage-me.txt"), "newer worktree version\n").unwrap();
+    let out = abandon_dirty(&env, &id, &[]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(missing_ref(&env, &id));
+    assert_eq!(
+        fs::read_to_string(path.join("stage-me.txt")).unwrap(),
+        "newer worktree version\n"
+    );
+}
+
+#[test]
+fn snapshot_with_fully_staged_changes_is_kept() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-staged-ok");
+    commit_file(&path, "stage-me.txt", "base\n");
+    fs::write(path.join("stage-me.txt"), "staged and current\n").unwrap();
+    git(&path, &["add", "stage-me.txt"]);
+    let out = abandon_dirty(&env, &id, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let kept = ref_oid(&env.repo, &format!("refs/wtctl/abandoned/{id}"));
+    assert_eq!(
+        git(&env.repo, &["show", &format!("{kept}:stage-me.txt")]),
+        "staged and current"
+    );
+}
+
+#[test]
+fn snapshot_refuses_an_unreviewed_filter_before_writing_anything() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-filter");
+    commit_file(&path, ".gitattributes", "*.dat filter=custom\n");
+    fs::write(path.join("x.dat"), "payload\n").unwrap();
+    let out = abandon_dirty(&env, &id, &[]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(text(&out).contains("filter"), "{}", text(&out));
+    assert!(missing_ref(&env, &id));
+    assert!(path.join("x.dat").exists());
+}
+
+#[test]
+fn a_retry_accepts_a_ref_that_already_keeps_the_snapshot() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-retry");
+    let tip = commit_file(&path, "t.txt", "t\n");
+    fs::write(path.join("w.txt"), "wip\n").unwrap();
+    // Simulate an earlier attempt that preserved a snapshot, then failed.
+    git(&path, &["add", "w.txt"]);
+    git(&path, &["commit", "-q", "-m", "snapshot"]);
+    let snapshot = git(&path, &["rev-parse", "HEAD"]);
+    git(&path, &["reset", "-q", "--hard", &tip]);
+    git(
+        &env.repo,
+        &[
+            "update-ref",
+            &format!("refs/wtctl/abandoned/{id}"),
+            &snapshot,
+        ],
+    );
+    let out = abandon_dirty(&env, &id, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        ref_oid(&env.repo, &format!("refs/wtctl/abandoned/{id}")),
+        snapshot,
+        "the larger kept tip is never replaced"
+    );
+}
+
+#[test]
+fn dead_owner_snapshot_waits_for_the_worktree_to_go_quiet() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-idle");
+    commit_file(&path, "t.txt", "t\n");
+    fs::write(path.join("fresh.txt"), "just written\n").unwrap();
+    env.kill_owner(&id);
+    let out = abandon_dirty(&env, &id, &["--dead-owner"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(text(&out).contains("resumed"), "{}", text(&out));
+    assert!(missing_ref(&env, &id));
+
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(path.join("fresh.txt"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let out = abandon_dirty(&env, &id, &["--dead-owner"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!path.exists());
+}
