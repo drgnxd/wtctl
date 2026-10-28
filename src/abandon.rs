@@ -156,3 +156,127 @@ pub fn cmd_restore(a: &Args) -> R<()> {
     .collect();
     cmd_create(&Args { values, flags })
 }
+
+/// Uncommitted work captured as a commit on top of the task tip.
+pub struct Snapshot {
+    pub commit: String,
+    pub tree: String,
+}
+
+fn index_path(entry: &Entry) -> PathBuf {
+    entry.admin.join("wtctl-snapshot.index")
+}
+
+/// Tree of everything Git would commit from the worktree (tracked changes plus
+/// untracked, non-ignored files), built in a private index so neither the
+/// worktree nor its real index is touched.
+fn worktree_tree(entry: &Entry) -> R<String> {
+    let index = index_path(entry);
+    let _ = fs::remove_file(&index);
+    let mut results = Vec::new();
+    for args in [
+        vec!["read-tree", "HEAD"],
+        vec!["add", "-A", "--"],
+        vec!["write-tree"],
+    ] {
+        let out = git::command(&entry.path, args)
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .map_err(|e| Fail::new(1, format!("cannot run git: {e}")))?;
+        if !out.status.success() {
+            let _ = fs::remove_file(&index);
+            return refuse(format!(
+                "cannot snapshot uncommitted work: {}",
+                git::stderr_of(&out)
+            ));
+        }
+        results.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let _ = fs::remove_file(&index);
+    Ok(results.pop().unwrap_or_default())
+}
+
+/// Number of paths with uncommitted changes (ignored files excluded).
+pub fn uncommitted_paths(entry: &Entry) -> R<usize> {
+    let out = git::run(
+        &entry.path,
+        ["status", "--porcelain", "--untracked-files=all"],
+    )?;
+    Ok(out.lines().filter(|l| !l.is_empty()).count())
+}
+
+/// Ignored paths, which a normal removal deletes with the worktree and which a
+/// snapshot does not keep. Reported so the caller can see what would be lost.
+pub fn ignored_paths(entry: &Entry) -> R<Vec<String>> {
+    let out = git::run(
+        &entry.path,
+        [
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=normal",
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.strip_prefix("!! ").map(str::to_string))
+        .collect())
+}
+
+/// Captures uncommitted work as a commit whose parent is the task tip.
+/// Returns `None` when the worktree is clean.
+pub fn snapshot_uncommitted(entry: &Entry, id: &str) -> R<Option<Snapshot>> {
+    let head = entry
+        .current_oid()
+        .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD"))?;
+    let head_tree = git::run(&entry.path, ["rev-parse", &format!("{head}^{{tree}}")])?;
+    let tree = worktree_tree(entry)?;
+    if tree == head_tree.trim() {
+        return Ok(None);
+    }
+    let message = format!("wtctl: uncommitted changes of {id}");
+    let out = git::command(
+        &entry.path,
+        [
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-m",
+            &message,
+        ],
+    )
+    .env("GIT_AUTHOR_NAME", "wtctl")
+    .env("GIT_AUTHOR_EMAIL", "wtctl@localhost")
+    .env("GIT_COMMITTER_NAME", "wtctl")
+    .env("GIT_COMMITTER_EMAIL", "wtctl@localhost")
+    .output()
+    .map_err(|e| Fail::new(1, format!("cannot run git: {e}")))?;
+    if !out.status.success() {
+        return refuse(format!(
+            "cannot record the snapshot: {}",
+            git::stderr_of(&out)
+        ));
+    }
+    Ok(Some(Snapshot {
+        commit: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        tree,
+    }))
+}
+
+/// Resets the worktree to its tip once the snapshot is preserved, so the normal
+/// removal checks see a clean tree. Ignored files are left for the artifact
+/// policy. Refuses if the worktree changed after the snapshot was taken.
+pub fn discard_snapshotted_changes(entry: &Entry, snapshot_tree: &str) -> R<()> {
+    if worktree_tree(entry)? != snapshot_tree {
+        return refuse("the worktree changed while its snapshot was taken; retry");
+    }
+    git::run(&entry.path, ["reset", "--hard", "--quiet", "HEAD"])?;
+    git::run(&entry.path, ["clean", "-fd", "--quiet"])?;
+    if uncommitted_paths(entry)? != 0 {
+        return refuse("uncommitted changes remain after the snapshot was discarded");
+    }
+    Ok(())
+}

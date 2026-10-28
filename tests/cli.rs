@@ -5939,3 +5939,203 @@ fn abandon_never_overwrites_a_kept_tip_that_the_new_tip_does_not_contain() {
     assert_eq!(git(&env.repo, &["rev-parse", &ref_name]), unrelated);
     assert!(path.exists());
 }
+
+fn ref_oid(repo: &Path, name: &str) -> String {
+    git(repo, &["rev-parse", name])
+}
+
+#[test]
+fn abandon_include_uncommitted_keeps_dirty_and_untracked_work_in_the_ref() {
+    let env = Env::new();
+    let (id, path) = env.create("abandon-dirty");
+    let tip = commit_file(&path, "tracked.txt", "v1\n");
+    let repo = env.repo_arg();
+    fs::write(path.join("tracked.txt"), "v2 uncommitted\n").unwrap();
+    fs::write(path.join("new.txt"), "untracked\n").unwrap();
+    let ref_name = format!("refs/wtctl/abandoned/{id}");
+
+    let refused = env.run(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    assert_eq!(refused.status.code(), Some(4), "the default stays strict");
+
+    let dry: Value = serde_json::from_str(&env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--include-uncommitted",
+        "--dry-run",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(dry["uncommitted_paths"], 2);
+    assert!(path.exists(), "dry-run removes nothing");
+    assert!(
+        !git_cmd(&env.repo, &["rev-parse", "--verify", "--quiet", &ref_name])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--include-uncommitted",
+    ]);
+    assert!(!path.exists());
+    let kept = ref_oid(&env.repo, &ref_name);
+    assert_ne!(kept, tip, "the ref points at a snapshot on top of the tip");
+    assert_eq!(ref_oid(&env.repo, &format!("{kept}^")), tip);
+    assert_eq!(
+        git(&env.repo, &["show", &format!("{kept}:tracked.txt")]),
+        "v2 uncommitted"
+    );
+    assert_eq!(
+        git(&env.repo, &["show", &format!("{kept}:new.txt")]),
+        "untracked"
+    );
+}
+
+#[test]
+fn abandon_include_uncommitted_on_a_clean_worktree_keeps_the_tip() {
+    let env = Env::new();
+    let (id, path) = env.create("abandon-clean");
+    let tip = commit_file(&path, "a.txt", "a\n");
+    let repo = env.repo_arg();
+    env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--include-uncommitted",
+    ]);
+    assert_eq!(
+        ref_oid(&env.repo, &format!("refs/wtctl/abandoned/{id}")),
+        tip
+    );
+}
+
+#[test]
+fn abandon_snapshot_reports_ignored_files_it_does_not_keep() {
+    let env = Env::new();
+    let (id, path) = env.create("abandon-ignored");
+    commit_file(&path, ".gitignore", "secret.bin\n");
+    fs::write(path.join("secret.bin"), "not kept\n").unwrap();
+    fs::write(path.join("edit.txt"), "kept\n").unwrap();
+    let repo = env.repo_arg();
+    let dry: Value = serde_json::from_str(&env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--include-uncommitted",
+        "--dry-run",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(dry["ignored_paths_not_kept"][0], "secret.bin");
+    assert!(path.join("secret.bin").exists(), "dry-run deletes nothing");
+    env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--include-uncommitted",
+    ]);
+    let kept = ref_oid(&env.repo, &format!("refs/wtctl/abandoned/{id}"));
+    assert_eq!(
+        git(&env.repo, &["show", &format!("{kept}:edit.txt")]),
+        "kept"
+    );
+    let ignored = git_cmd(
+        &env.repo,
+        &["cat-file", "-e", &format!("{kept}:secret.bin")],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        !ignored.status.success(),
+        "ignored files are not in the snapshot"
+    );
+}
+
+#[test]
+fn abandon_dead_owner_needs_the_explicit_flag() {
+    let env = Env::new();
+    let (id, path) = env.create("abandon-dead");
+    let tip = commit_file(&path, "d.txt", "d\n");
+    let repo = env.repo_arg();
+    env.kill_owner(&id);
+
+    let plain = env.run(&["remove", "--repo", &repo, "--id", &id, "--abandon"]);
+    assert_eq!(plain.status.code(), Some(4));
+    assert!(path.exists());
+
+    env.ok(&[
+        "remove",
+        "--repo",
+        &repo,
+        "--id",
+        &id,
+        "--abandon",
+        "--dead-owner",
+    ]);
+    assert!(!path.exists());
+    assert_eq!(
+        ref_oid(&env.repo, &format!("refs/wtctl/abandoned/{id}")),
+        tip
+    );
+}
+
+#[test]
+fn abandon_only_flags_are_rejected_without_abandon() {
+    let env = Env::new();
+    let (id, _) = env.create("abandon-flags");
+    for flag in ["--include-uncommitted", "--dead-owner"] {
+        let out = env.run(&["remove", "--repo", &env.repo_arg(), "--id", &id, flag]);
+        assert_eq!(out.status.code(), Some(2), "{flag}");
+    }
+    let out = env.run(&["list", "--repo", &env.repo_arg(), "--dead-owner"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn stale_lists_dead_owner_tasks_with_their_unique_work() {
+    let env = Env::new();
+    let (live, _) = env.create("stale-live");
+    let (dead, path) = env.create("stale-dead");
+    commit_file(&path, "only-here.txt", "x\n");
+    fs::write(path.join("wip.txt"), "wip\n").unwrap();
+    env.kill_owner(&dead);
+    let repo = env.repo_arg();
+    let rows: Value = serde_json::from_str(&env.ok(&[
+        "stale",
+        "--repo",
+        &repo,
+        "--older-than-days",
+        "0",
+        "--json",
+    ]))
+    .unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "a live owner's task is never listed: {live}");
+    assert_eq!(rows[0]["id"], dead);
+    assert_eq!(rows[0]["unique_commits"], 1);
+    assert_eq!(rows[0]["unique_subjects"][0], "only-here.txt");
+    assert_eq!(rows[0]["uncommitted_paths"], 1);
+    assert_eq!(rows[0]["already_on_main"], false);
+    let young = env.ok(&["stale", "--repo", &repo, "--json"]);
+    assert_eq!(young.trim(), "[]", "the default age filter hides new tasks");
+}

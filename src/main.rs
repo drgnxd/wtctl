@@ -51,8 +51,9 @@ const USAGE: &str = "usage: wtctl <command> [options]
   quarantine --repo <path> [--json]
   prune   --repo <path> --older-than-days <n> [--quarantine] [--refs] [--dry-run] [--main <branch>] [--json] [--external-writers-quiesced]
   doctor  --repo <path> [--fix-stale-lock --external-writers-quiesced] [--json]
+  stale   --repo <path> [--older-than-days <n>] [--main <branch>] [--json]
   restore --repo <path> --id <abandoned-task-id> --slug <slug> [--task <text>] [--session <id>] [--worktrees-root <path>] [--allow-repository-hooks] [--external-writers-quiesced] [--json]
-  remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--abandon] [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
+  remove  --repo <path> (--id <task-id> | --legacy-worktree-id <id> | --expect-branch <branch>) [--abandon [--include-uncommitted] [--dead-owner]] [--delete-branch] [--dry-run] [artifact cleanup options] [--main <branch> | --base <ref>] [--external-writers-quiesced]
 
   artifact cleanup options: --discard-direnv-cache, --discard-generated-caches,
     --discard-generated-build-outputs, --discard-generated-artifacts,
@@ -117,6 +118,7 @@ mod finish_plan;
 mod housekeeping;
 mod remote;
 mod show;
+mod stale;
 mod superseded;
 
 #[derive(Debug)]
@@ -159,6 +161,9 @@ fn cmd_capabilities(a: &Args) -> R<()> {
         "finish_dry_run": true,
         "finish_strategies": ["merge"],
         "abandon": true,
+        "abandon_uncommitted": true,
+        "stale": true,
+        "abandon_dead_owner": true,
         "restore": true,
         "doctor": true,
         "quarantine_list": true,
@@ -225,6 +230,8 @@ const FLAG_OPTS: &[&str] = &[
     "--allow-unreferenced-reflog",
     "--keep-worktree",
     "--abandon",
+    "--include-uncommitted",
+    "--dead-owner",
     "--fetch",
     "--push",
     "--all-repos",
@@ -1376,6 +1383,26 @@ fn require_owner(marker: &Marker) -> R<Owner> {
         ));
     }
     Ok(current)
+}
+
+/// For `remove --abandon --dead-owner`: the work is preserved in full, so the
+/// owner no longer needs to be alive, but a live owner is never overridden.
+fn require_owner_or_dead(marker: &Marker) -> R<Owner> {
+    let current = me()?;
+    if is_mine(marker, Some(&current)) {
+        return Ok(current);
+    }
+    match procinfo::liveness(&marker.owner) {
+        Liveness::Dead => Ok(current),
+        Liveness::Alive => refuse(format!(
+            "{} is owned by a live {} pid {}; --dead-owner does not override it",
+            marker.task_id, marker.owner.client, marker.owner.pid
+        )),
+        Liveness::Unknown => refuse(format!(
+            "{}: owner liveness cannot be verified; --dead-owner needs a verified dead owner",
+            marker.task_id
+        )),
+    }
 }
 
 fn ensure_ref(repo: &Path, refname: &str, expected: &str) -> R<()> {
@@ -4709,6 +4736,12 @@ fn cmd_remove(a: &Args) -> R<()> {
             "--abandon needs --id and cannot be combined with --base or --allow-unreferenced-reflog",
         ));
     }
+    if !abandon && (a.flag("--include-uncommitted") || a.flag("--dead-owner")) {
+        return Err(Fail::new(
+            2,
+            "--include-uncommitted and --dead-owner are only valid with --abandon",
+        ));
+    }
     let (_, mut main_ref) = base_ref(a, &repo.root)?;
     let external_writers_quiesced = a.flag("--external-writers-quiesced") || a.flag("--dry-run");
     let annex = repo.require_annex_ready(external_writers_quiesced)?;
@@ -4720,7 +4753,11 @@ fn cmd_remove(a: &Args) -> R<()> {
     let _lock = repo.lock()?;
     let (entry, authority) = if let Some(id) = id {
         let (entry, marker) = repo.find_task(id)?;
-        require_owner(&marker)?;
+        if a.flag("--dead-owner") {
+            require_owner_or_dead(&marker)?;
+        } else {
+            require_owner(&marker)?;
+        }
         let authority = RemovalAuthority {
             worktree_id: entry.id(),
             wtctl_task_id: Some(marker.task_id.clone()),
@@ -4780,12 +4817,29 @@ fn cmd_remove(a: &Args) -> R<()> {
     let head = entry
         .current_oid()
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD"))?;
+    let include_uncommitted = abandon && a.flag("--include-uncommitted");
+    let uncommitted = if include_uncommitted {
+        abandon::uncommitted_paths(&entry)?
+    } else {
+        0
+    };
+    let ignored_lost = if include_uncommitted {
+        abandon::ignored_paths(&entry)?
+    } else {
+        Vec::new()
+    };
     if a.flag("--dry-run") {
         let main_worktree = canonical_main_checkout(&repo)?;
         artifact::check_pending_transaction(&repo.name(), &entry.path)
             .map_err(|why| Fail::new(4, why))?;
-        let plan = artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
-            .map_err(|why| Fail::new(4, why))?;
+        // Uncommitted paths are about to be preserved, so the strict
+        // clean-worktree check is deferred until after the snapshot.
+        let plan = if uncommitted > 0 {
+            artifact::Plan::default()
+        } else {
+            artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
+                .map_err(|why| Fail::new(4, why))?
+        };
         let generated_artifact_paths: Vec<String> = plan
             .generated
             .iter()
@@ -4823,6 +4877,8 @@ fn cmd_remove(a: &Args) -> R<()> {
                     "generated_artifacts": plan.generated.len() + usize::from(plan.direnv.is_some()),
                     "generated_artifact_paths": generated_artifact_paths.clone(),
                     "git_annex_restage": annex,
+                    "uncommitted_paths": uncommitted,
+                    "ignored_paths_not_kept": ignored_lost,
                 })
             );
         } else {
@@ -4857,6 +4913,18 @@ fn cmd_remove(a: &Args) -> R<()> {
                     )
                 },
             );
+            if uncommitted > 0 {
+                out!(
+                    "{uncommitted} uncommitted path(s) would be kept as a snapshot under {}",
+                    abandon::ref_name(&authority.worktree_id)
+                );
+            }
+            if !ignored_lost.is_empty() {
+                out!(
+                    "ignored path(s) are not kept and go with the worktree: {}",
+                    ignored_lost.join(", ")
+                );
+            }
         }
         return Ok(());
     }
@@ -4866,12 +4934,31 @@ fn cmd_remove(a: &Args) -> R<()> {
         let main_worktree = canonical_main_checkout(&repo)?;
         artifact::check_pending_transaction(&repo.name(), &entry.path)
             .map_err(|why| Fail::new(4, why))?;
-        artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
-            .map_err(|why| Fail::new(4, why))?;
+        if !include_uncommitted {
+            artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
+                .map_err(|why| Fail::new(4, why))?;
+        }
         verify_removal_authority(&repo, &entry, &authority)?;
         removal_lock_state(&entry, &authority)?;
         ensure_no_cwd_users(&entry, "removal")?;
-        abandon::preserve(&repo, &authority.worktree_id, &head)?;
+        let snapshot = if include_uncommitted {
+            abandon::snapshot_uncommitted(&entry, &authority.worktree_id)?
+        } else {
+            None
+        };
+        let keep = snapshot
+            .as_ref()
+            .map_or(head.as_str(), |s| s.commit.as_str());
+        abandon::preserve(&repo, &authority.worktree_id, keep)?;
+        if let Some(s) = &snapshot {
+            abandon::discard_snapshotted_changes(&entry, &s.tree)?;
+        }
+        if include_uncommitted {
+            // The snapshot is preserved; what remains must pass the same
+            // artifact checks as any other removal.
+            artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
+                .map_err(|why| Fail::new(4, why))?;
+        }
     }
     remove_worktree(
         &repo,
@@ -5028,7 +5115,7 @@ fn run(argv: &[OsString]) -> R<()> {
     if cmd != "prune"
         && (args.flag("--quarantine")
             || args.flag("--refs")
-            || args.os("--older-than-days").is_some())
+            || (cmd != "stale" && args.os("--older-than-days").is_some()))
     {
         return Err(Fail::new(
             2,
@@ -5053,8 +5140,15 @@ fn run(argv: &[OsString]) -> R<()> {
     if cmd != "doctor" && args.flag("--fix-stale-lock") {
         return Err(Fail::new(2, "--fix-stale-lock is only valid for doctor"));
     }
-    if cmd != "remove" && args.flag("--abandon") {
-        return Err(Fail::new(2, "--abandon is only valid for remove"));
+    if cmd != "remove"
+        && (args.flag("--abandon")
+            || args.flag("--include-uncommitted")
+            || args.flag("--dead-owner"))
+    {
+        return Err(Fail::new(
+            2,
+            "--abandon, --include-uncommitted and --dead-owner are only valid for remove",
+        ));
     }
     if cmd != "list" && (args.flag("--abandoned") || args.flag("--all-repos")) {
         return Err(Fail::new(
@@ -5079,6 +5173,7 @@ fn run(argv: &[OsString]) -> R<()> {
         "quarantine" => housekeeping::cmd_quarantine(&args),
         "prune" => housekeeping::cmd_prune(&args),
         "show" => show::cmd_show(&args),
+        "stale" => stale::cmd_stale(&args),
         "describe" => show::cmd_describe(&args),
         "remove" => cmd_remove(&args),
         _ => Err(Fail::new(2, format!("unknown command {cmd:?}\n{USAGE}"))),
