@@ -6310,3 +6310,108 @@ fn dead_owner_snapshot_waits_for_the_worktree_to_go_quiet() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(!path.exists());
 }
+
+#[test]
+fn snapshot_cleanup_never_follows_a_symlink_that_replaced_a_directory() {
+    use std::os::unix::fs::symlink;
+    let env = Env::new();
+    let (id, path) = env.create("snap-symlink");
+    let outside = env.tmp.join("outside-data");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("x"), "precious\n").unwrap();
+    symlink(&outside, path.join("data")).unwrap();
+    git(&path, &["add", "data"]);
+    git(&path, &["commit", "-q", "-m", "link"]);
+    fs::remove_file(path.join("data")).unwrap();
+    fs::create_dir(path.join("data")).unwrap();
+    fs::write(path.join("data/x"), "task copy\n").unwrap();
+
+    let out = abandon_dirty(&env, &id, &[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(outside.join("x")).unwrap(),
+        "precious\n",
+        "the file behind the symlink must survive"
+    );
+    let kept = ref_oid(&env.repo, &format!("refs/wtctl/abandoned/{id}"));
+    assert_eq!(
+        git(&env.repo, &["show", &format!("{kept}:data/x")]),
+        "task copy"
+    );
+    assert!(
+        text(&out).contains("do not delete that ref"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn include_uncommitted_rejects_explicit_artifact_selectors() {
+    let env = Env::new();
+    let (id, _) = env.create("snap-selectors");
+    let out = abandon_dirty(&env, &id, &["--discard-generated-caches"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+}
+
+#[test]
+fn staged_new_file_plus_an_untracked_file_is_accepted() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-staged-untracked");
+    commit_file(&path, "base.txt", "b\n");
+    fs::write(path.join("staged-new.txt"), "s\n").unwrap();
+    git(&path, &["add", "staged-new.txt"]);
+    fs::write(path.join("loose.txt"), "l\n").unwrap();
+    let out = abandon_dirty(&env, &id, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let kept = ref_oid(&env.repo, &format!("refs/wtctl/abandoned/{id}"));
+    assert_eq!(
+        git(&env.repo, &["show", &format!("{kept}:staged-new.txt")]),
+        "s"
+    );
+    assert_eq!(git(&env.repo, &["show", &format!("{kept}:loose.txt")]), "l");
+}
+
+#[test]
+fn dead_owner_needs_an_explicit_flag_before_ignored_files_are_deleted() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-ignored-dead");
+    commit_file(&path, ".gitignore", "local.db\n");
+    fs::write(path.join("local.db"), "owner data\n").unwrap();
+    fs::write(path.join("note.txt"), "n\n").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(path.join("note.txt"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    env.kill_owner(&id);
+    let out = abandon_dirty(&env, &id, &["--dead-owner"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(
+        text(&out).contains("--discard-ignored-files"),
+        "{}",
+        text(&out)
+    );
+    assert!(path.join("local.db").exists());
+    assert!(missing_ref(&env, &id));
+
+    let out = abandon_dirty(&env, &id, &["--dead-owner", "--discard-ignored-files"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!path.exists());
+}
+
+#[test]
+fn abandon_only_flags_include_discard_ignored_files() {
+    let env = Env::new();
+    let (id, _) = env.create("snap-flag");
+    let out = env.run(&[
+        "remove",
+        "--repo",
+        &env.repo_arg(),
+        "--id",
+        &id,
+        "--discard-ignored-files",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+}

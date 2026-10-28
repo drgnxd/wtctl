@@ -323,7 +323,13 @@ pub fn newest_change_age_secs(entry: &Entry) -> R<Option<u64>> {
 /// Every refusal that `remove --abandon --include-uncommitted` can predict is
 /// raised here, before anything is written or reset, so that a refusal never
 /// follows the point of no return.
-pub fn preflight_snapshot(repo: &Repo, entry: &Entry, annex: bool, dead_owner: bool) -> R<()> {
+pub fn preflight_snapshot(
+    repo: &Repo,
+    entry: &Entry,
+    annex: bool,
+    dead_owner: bool,
+    ignored_ok: bool,
+) -> R<()> {
     let id = entry.id();
     deny_reference_hook(repo)?;
     let head = entry
@@ -395,6 +401,15 @@ pub fn preflight_snapshot(repo: &Repo, entry: &Entry, annex: bool, dead_owner: b
             return refuse(format!("{refname} already preserves {current}, not {head}"));
         }
     }
+    if dead_owner && !ignored_ok {
+        let ignored = ignored_paths(entry)?;
+        if !ignored.is_empty() {
+            return refuse(format!(
+                "{id}: ignored files are not kept and would be deleted with the worktree: {}; pass --discard-ignored-files to accept that for a dead owner's task",
+                ignored.join(", ")
+            ));
+        }
+    }
     if dead_owner {
         if let Some(age) = newest_change_age_secs(entry)? {
             if age < IDLE_SECS {
@@ -402,6 +417,52 @@ pub fn preflight_snapshot(repo: &Repo, entry: &Entry, annex: bool, dead_owner: b
                     "{id}: uncommitted files changed {age}s ago; the owner may have been resumed in another process, so a dead owner's work is taken only after {IDLE_SECS}s of quiet"
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Staged work must appear unchanged in the snapshot, or it would exist only as
+/// a loose object once the index is reset. Read-only: it compares `git
+/// diff-index --cached` entries against the snapshot tree path by path.
+fn ensure_staged_matches(entry: &Entry, tree: &str) -> R<()> {
+    let raw = git::output(
+        &entry.path,
+        [
+            "diff-index",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "HEAD",
+        ],
+    )?;
+    if !raw.status.success() {
+        return refuse(format!(
+            "cannot compare the index: {}",
+            git::stderr_of(&raw)
+        ));
+    }
+    let mut fields = raw.stdout.split(|b| *b == 0).filter(|f| !f.is_empty());
+    while let Some(meta) = fields.next() {
+        let Some(path) = fields.next() else { break };
+        let meta = String::from_utf8_lossy(meta);
+        let parts: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        let (Some(mode), Some(oid)) = (parts.get(1), parts.get(3)) else {
+            continue;
+        };
+        let path = String::from_utf8_lossy(path).into_owned();
+        let in_tree = git::run(&entry.path, ["ls-tree", "-z", tree, "--", &path])?;
+        let entry_line = in_tree.trim_end_matches(' ');
+        let matches = if *mode == "000000" {
+            entry_line.is_empty()
+        } else {
+            entry_line.starts_with(&format!("{mode} ")) && entry_line.contains(&format!(" {oid}	"))
+        };
+        if !matches {
+            return refuse(format!(
+                "{path} is staged differently from the worktree; commit or reset it first"
+            ));
         }
     }
     Ok(())
@@ -457,18 +518,7 @@ pub fn snapshot_uncommitted(entry: &Entry, id: &str) -> R<Option<Snapshot>> {
     if tree == head_tree {
         return Ok(None);
     }
-    // Staged work that the worktree has since diverged from would exist only
-    // as a loose object once the index is reset.
-    let staged = git::output(&entry.path, ["write-tree"])?;
-    if !staged.status.success() {
-        return refuse("the index cannot be written (unmerged paths?)");
-    }
-    let staged = String::from_utf8_lossy(&staged.stdout).trim().to_string();
-    if staged != head_tree && staged != tree {
-        return refuse(
-            "the index holds staged changes that differ from the worktree; commit or reset them first",
-        );
-    }
+    ensure_staged_matches(entry, &tree)?;
     ensure_self_contained(entry, &head, &tree)?;
     let message = format!("wtctl: uncommitted changes of {id}");
     let out = quiet_git(
@@ -503,41 +553,114 @@ pub fn snapshot_uncommitted(entry: &Entry, id: &str) -> R<Option<Snapshot>> {
     }))
 }
 
-/// Resets the worktree to its tip once the snapshot is preserved, so the normal
-/// removal checks see a clean tree. Only files the snapshot holds are deleted;
-/// ignored files are left for the artifact policy. Refuses if the worktree
-/// changed after the snapshot was taken or if anything unexpected remains.
-pub fn discard_snapshotted_changes(entry: &Entry, snapshot: &Snapshot) -> R<()> {
+/// Refusals before the worktree is changed, and failures after it was.
+pub enum ResetError {
+    Before(Fail),
+    After(Fail),
+}
+
+/// Checked before the ref is written: nothing has changed yet.
+pub fn ensure_still_snapshotted(entry: &Entry, snapshot: &Snapshot) -> R<()> {
     ensure_no_cwd_users(entry, "while its uncommitted work is discarded")?;
     if worktree_tree(entry)? != snapshot.tree {
         return refuse("the worktree changed while its snapshot was taken; retry");
     }
+    Ok(())
+}
+
+/// A deletion must never follow a symlink that replaced a directory.
+fn remove_untracked_file(root: &Path, relative: &str) -> R<()> {
+    let mut current = root.to_path_buf();
+    let parent = Path::new(relative).parent().unwrap_or(Path::new(""));
+    for component in parent.components() {
+        current.push(component);
+        let meta = fs::symlink_metadata(&current)
+            .map_err(|e| Fail::new(4, format!("{}: {e}", current.display())))?;
+        if !meta.is_dir() {
+            return refuse(format!(
+                "a parent of {relative} is no longer a plain directory; left in place"
+            ));
+        }
+    }
+    let full = root.join(relative);
+    match fs::symlink_metadata(&full) {
+        Ok(meta) if meta.is_dir() => {
+            return refuse(format!("{relative} is a directory now; left in place"))
+        }
+        Ok(_) => fs::remove_file(&full)
+            .map_err(|e| Fail::new(4, format!("cannot remove {relative}: {e}")))?,
+        Err(_) => {}
+    }
+    let mut dir = full.parent().map(Path::to_path_buf);
+    while let Some(d) = dir {
+        if d == root || fs::remove_dir(&d).is_err() {
+            break;
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    Ok(())
+}
+
+/// Resets the worktree to its tip once the snapshot is preserved, so the normal
+/// removal checks see a clean tree. Only files the snapshot holds are deleted;
+/// ignored files are left for the artifact policy.
+pub fn reset_and_clean(entry: &Entry, snapshot: &Snapshot) -> Result<(), ResetError> {
+    ensure_still_snapshotted(entry, snapshot).map_err(ResetError::Before)?;
     let reset = quiet_git(entry, &["reset", "--hard", "--quiet", "HEAD"])
         .output()
-        .map_err(|e| Fail::new(1, format!("cannot run git: {e}")))?;
+        .map_err(|e| ResetError::Before(Fail::new(1, format!("cannot run git: {e}"))))?;
     if !reset.status.success() {
-        return refuse(format!("git reset failed: {}", git::stderr_of(&reset)));
+        return Err(ResetError::After(Fail::new(
+            4,
+            format!("git reset failed: {}", git::stderr_of(&reset)),
+        )));
     }
     for path in &snapshot.untracked {
         let probe = git::output(
             &entry.path,
             ["cat-file", "-e", &format!("{}:{path}", snapshot.tree)],
-        )?;
+        )
+        .map_err(ResetError::After)?;
         if !probe.status.success() {
-            return refuse(format!("{path} is not in the snapshot; left in place"));
+            return Err(ResetError::After(Fail::new(
+                4,
+                format!("{path} is not in the snapshot; left in place"),
+            )));
         }
-        let full = entry.path.join(path);
-        let _ = fs::remove_file(&full);
-        let mut dir = full.parent().map(Path::to_path_buf);
-        while let Some(d) = dir {
-            if d == entry.path || fs::remove_dir(&d).is_err() {
-                break;
-            }
-            dir = d.parent().map(Path::to_path_buf);
-        }
+        remove_untracked_file(&entry.path, path).map_err(ResetError::After)?;
     }
-    if uncommitted_paths(entry)? != 0 {
-        return refuse("uncommitted changes remain after the snapshot was discarded");
+    if uncommitted_paths(entry).map_err(ResetError::After)? != 0 {
+        return Err(ResetError::After(Fail::new(
+            4,
+            "uncommitted changes remain after the snapshot was discarded",
+        )));
     }
     Ok(())
+}
+
+/// Puts the abandoned ref back as it was before this run wrote it.
+pub fn rollback_ref(repo: &Repo, id: &str, written: &str, previous: Option<&str>) {
+    let refname = ref_name(id);
+    let _ = match previous {
+        Some(old) => git::output(&repo.root, ["update-ref", &refname, old, written]),
+        None => git::output(&repo.root, ["update-ref", "-d", &refname, written]),
+    };
+}
+
+/// Current value of the abandoned ref, if any.
+pub fn current_ref(repo: &Repo, id: &str) -> R<Option<String>> {
+    let out = git::output(
+        &repo.root,
+        [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &ref_name(id),
+        ],
+    )?;
+    Ok(out
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
 }

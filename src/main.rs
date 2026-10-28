@@ -232,6 +232,7 @@ const FLAG_OPTS: &[&str] = &[
     "--abandon",
     "--include-uncommitted",
     "--dead-owner",
+    "--discard-ignored-files",
     "--fetch",
     "--push",
     "--all-repos",
@@ -4747,10 +4748,20 @@ fn cmd_remove(a: &Args) -> R<()> {
             "--abandon needs --id and cannot be combined with --base or --allow-unreferenced-reflog",
         ));
     }
-    if !abandon && (a.flag("--include-uncommitted") || a.flag("--dead-owner")) {
+    if !abandon
+        && (a.flag("--include-uncommitted")
+            || a.flag("--dead-owner")
+            || a.flag("--discard-ignored-files"))
+    {
         return Err(Fail::new(
             2,
-            "--include-uncommitted and --dead-owner are only valid with --abandon",
+            "--include-uncommitted, --dead-owner and --discard-ignored-files are only valid with --abandon",
+        ));
+    }
+    if a.flag("--include-uncommitted") && !cleanup.native_git_cleanup {
+        return Err(Fail::new(
+            2,
+            "--include-uncommitted needs the default cleanup; remove the artifact selectors",
         ));
     }
     let (_, mut main_ref) = base_ref(a, &repo.root)?;
@@ -4848,6 +4859,7 @@ fn cmd_remove(a: &Args) -> R<()> {
         .ok_or_else(|| Fail::new(4, "cannot resolve worktree HEAD"))?;
     let include_uncommitted = abandon && a.flag("--include-uncommitted");
     let dead_owner = abandon && a.flag("--dead-owner");
+    let ignored_ok = a.flag("--discard-ignored-files");
     let uncommitted = if include_uncommitted {
         abandon::uncommitted_paths(&entry)?
     } else {
@@ -4863,7 +4875,7 @@ fn cmd_remove(a: &Args) -> R<()> {
         artifact::check_pending_transaction(&repo.name(), &entry.path)
             .map_err(|why| Fail::new(4, why))?;
         if include_uncommitted {
-            abandon::preflight_snapshot(&repo, &entry, annex, dead_owner)?;
+            abandon::preflight_snapshot(&repo, &entry, annex, dead_owner, ignored_ok)?;
         }
         // Uncommitted paths are about to be preserved, so the strict
         // clean-worktree check is deferred until after the snapshot.
@@ -4975,22 +4987,36 @@ fn cmd_remove(a: &Args) -> R<()> {
         removal_lock_state(&entry, &authority)?;
         ensure_no_cwd_users(&entry, "removal")?;
         if include_uncommitted {
-            abandon::preflight_snapshot(&repo, &entry, annex, dead_owner)?;
+            abandon::preflight_snapshot(&repo, &entry, annex, dead_owner, ignored_ok)?;
         }
         let snapshot = if include_uncommitted {
             abandon::snapshot_uncommitted(&entry, &authority.worktree_id)?
         } else {
             None
         };
+        if let Some(s) = &snapshot {
+            abandon::ensure_still_snapshotted(&entry, s)?;
+        }
+        let previous = abandon::current_ref(&repo, &authority.worktree_id)?;
         let keep = snapshot
             .as_ref()
             .map_or(head.as_str(), |s| s.commit.as_str());
         let refname = abandon::preserve(&repo, &authority.worktree_id, keep)?;
         if let Some(s) = &snapshot {
             snapshot_oid = Some(s.commit.clone());
-            // Past this point the worktree is reset; say so if anything fails.
-            abandon::discard_snapshotted_changes(&entry, s)
-                .map_err(|f| after_reset(f, &s.commit, &refname))?;
+            repo.audit(json!({"at": now(), "event": "abandon-preserved", "worktree_id": authority.worktree_id, "ref": refname, "snapshot": s.commit, "dead_owner": dead_owner}));
+            match abandon::reset_and_clean(&entry, s) {
+                Ok(()) => repo.audit(json!({"at": now(), "event": "abandon-reset", "worktree_id": authority.worktree_id, "snapshot": s.commit})),
+                Err(abandon::ResetError::Before(f)) => {
+                    // Nothing was changed, so the ref written a moment ago is undone.
+                    abandon::rollback_ref(&repo, &authority.worktree_id, &s.commit, previous.as_deref());
+                    return Err(f);
+                }
+                Err(abandon::ResetError::After(f)) => {
+                    repo.audit(json!({"at": now(), "event": "abandon-reset-failed", "worktree_id": authority.worktree_id, "snapshot": s.commit, "error": f.msg}));
+                    return Err(after_reset(f, &s.commit, &refname));
+                }
+            }
         }
         if include_uncommitted {
             // The snapshot is preserved; what remains must pass the same
@@ -5202,7 +5228,8 @@ fn run(argv: &[OsString]) -> R<()> {
     if cmd != "remove"
         && (args.flag("--abandon")
             || args.flag("--include-uncommitted")
-            || args.flag("--dead-owner"))
+            || args.flag("--dead-owner")
+            || args.flag("--discard-ignored-files"))
     {
         return Err(Fail::new(
             2,

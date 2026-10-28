@@ -196,6 +196,14 @@ pub fn cmd_prune(a: &Args) -> R<()> {
                 if age < cutoff {
                     continue;
                 }
+                if let Some(id) = refname.strip_prefix(abandon::PREFIX) {
+                    // A failed abandon can leave the only copy of reset work
+                    // here while its worktree is still registered.
+                    if task::entries(&repo.common).iter().any(|e| e.id() == id) {
+                        actions.push(json!({"kind": "ref", "id": refname, "state": "skipped", "reason": "its task worktree is still registered"}));
+                        continue;
+                    }
+                }
                 if dry_run {
                     actions.push(
                         json!({"kind": "ref", "id": refname, "state": "would-delete", "head": oid}),

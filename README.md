@@ -104,16 +104,24 @@ Nothing is adopted automatically.
   in a private index (the worktree and its real index are not touched), the ref
   points at that snapshot, and only then is the worktree reset so the normal
   removal checks see a clean tree. Repository hooks are disabled for these Git
-  calls. Every refusal that can be predicted is raised before anything is
-  written: submodules and nested repositories, unreviewed filters on tracked or
+  calls. Every refusal that can be predicted is raised before the ref is written
+  or the worktree is changed: submodules and nested repositories, unreviewed filters on tracked or
   untracked paths, a changed `.gitignore` or `.gitattributes`, staged changes
-  that differ from the worktree, content stored in git-annex, a conflicting
+  that differ from the snapshot (checked per path, read-only), content stored in git-annex, a conflicting
   existing ref, and (with `--dead-owner`) files changed within the last ten
-  minutes. After the reset only the untracked files the snapshot holds are
-  deleted, and the command refuses if anything else remains. A refusal after
-  the reset says where the work is kept; a retry accepts that ref.
+  minutes. It cannot be combined with explicit artifact selectors. After the
+  reset only the untracked files the snapshot holds are deleted (never through
+  a symlinked parent), and the command refuses if anything else remains. If a
+  refusal comes before the reset, the ref written a moment earlier is put back. A refusal after
+  the reset says where the work is kept, `prune --refs` leaves that ref alone
+  while its task is still registered, and a retry accepts it. Open file handles
+  are not checked; the working directory check and the ten-minute quiet period
+  are the only guards against a writer.
   Ignored files are not kept; `--dry-run` lists them as `ignored_paths_not_kept`,
   and a normal removal deletes them with the worktree.
+- `--abandon --dead-owner` with ignored files present also needs
+  `--discard-ignored-files`, because a different agent would otherwise delete the
+  previous owner's ignored data without any opt-in.
 - `--abandon --dead-owner` allows the owner to be dead. The owner must be
   verifiably dead; a live or unverifiable owner still refuses. Because the work
   is preserved in full, this does not need `adopt` first. Pass it only when the
