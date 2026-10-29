@@ -4865,7 +4865,7 @@ fn cmd_remove(a: &Args) -> R<()> {
     } else {
         0
     };
-    let ignored_lost = if include_uncommitted {
+    let ignored_lost = if include_uncommitted || dead_owner {
         abandon::ignored_paths(&entry)?
     } else {
         Vec::new()
@@ -4876,6 +4876,8 @@ fn cmd_remove(a: &Args) -> R<()> {
             .map_err(|why| Fail::new(4, why))?;
         if include_uncommitted {
             abandon::preflight_snapshot(&repo, &entry, annex, dead_owner, ignored_ok)?;
+        } else {
+            abandon::dead_owner_guards(&entry, dead_owner, ignored_ok)?;
         }
         // Uncommitted paths are about to be preserved, so the strict
         // clean-worktree check is deferred until after the snapshot.
@@ -4988,6 +4990,8 @@ fn cmd_remove(a: &Args) -> R<()> {
         ensure_no_cwd_users(&entry, "removal")?;
         if include_uncommitted {
             abandon::preflight_snapshot(&repo, &entry, annex, dead_owner, ignored_ok)?;
+        } else {
+            abandon::dead_owner_guards(&entry, dead_owner, ignored_ok)?;
         }
         let snapshot = if include_uncommitted {
             abandon::snapshot_uncommitted(&entry, &authority.worktree_id)?

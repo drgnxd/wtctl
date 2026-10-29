@@ -401,6 +401,14 @@ pub fn preflight_snapshot(
             return refuse(format!("{refname} already preserves {current}, not {head}"));
         }
     }
+    dead_owner_guards(entry, dead_owner, ignored_ok)
+}
+
+/// Checks that apply to a dead owner's task whether or not uncommitted work
+/// is being snapshotted: ignored files are lost on removal, and a resumed
+/// owner may still be writing.
+pub fn dead_owner_guards(entry: &Entry, dead_owner: bool, ignored_ok: bool) -> R<()> {
+    let id = entry.id();
     if dead_owner && !ignored_ok {
         let ignored = ignored_paths(entry)?;
         if !ignored.is_empty() {

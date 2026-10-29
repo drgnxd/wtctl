@@ -6402,6 +6402,44 @@ fn dead_owner_needs_an_explicit_flag_before_ignored_files_are_deleted() {
 }
 
 #[test]
+fn dead_owner_without_include_uncommitted_still_refuses_to_delete_ignored_files() {
+    let env = Env::new();
+    let (id, path) = env.create("snap-ignored-clean");
+    commit_file(&path, ".gitignore", "local.db\n");
+    fs::write(path.join("local.db"), "owner data\n").unwrap();
+    env.kill_owner(&id);
+    let run = |extra: &[&str]| {
+        let repo = env.repo_arg();
+        let mut args = vec![
+            "remove",
+            "--repo",
+            repo.as_str(),
+            "--id",
+            id.as_str(),
+            "--abandon",
+            "--dead-owner",
+            "--external-writers-quiesced",
+        ];
+        args.extend_from_slice(extra);
+        env.run(&args)
+    };
+    let out = run(&["--dry-run"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(
+        text(&out).contains("--discard-ignored-files"),
+        "{}",
+        text(&out)
+    );
+    let out = run(&[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(path.join("local.db").exists());
+
+    let out = run(&["--discard-ignored-files"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!path.exists());
+}
+
+#[test]
 fn abandon_only_flags_include_discard_ignored_files() {
     let env = Env::new();
     let (id, _) = env.create("snap-flag");
