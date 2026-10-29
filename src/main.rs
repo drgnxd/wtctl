@@ -4876,8 +4876,6 @@ fn cmd_remove(a: &Args) -> R<()> {
             .map_err(|why| Fail::new(4, why))?;
         if include_uncommitted {
             abandon::preflight_snapshot(&repo, &entry, annex, dead_owner, ignored_ok)?;
-        } else {
-            abandon::dead_owner_guards(&entry, dead_owner, ignored_ok)?;
         }
         // Uncommitted paths are about to be preserved, so the strict
         // clean-worktree check is deferred until after the snapshot.
@@ -4887,6 +4885,9 @@ fn cmd_remove(a: &Args) -> R<()> {
             artifact::inspect_plan(&entry.path, main_worktree.as_deref(), &cleanup)
                 .map_err(|why| Fail::new(4, why))?
         };
+        if !include_uncommitted {
+            abandon::dead_owner_guards(&entry, dead_owner, ignored_ok)?;
+        }
         let generated_artifact_paths: Vec<String> = plan
             .generated
             .iter()

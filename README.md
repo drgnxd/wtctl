@@ -122,6 +122,9 @@ Nothing is adopted automatically.
 - `--abandon --dead-owner` with ignored files present also needs
   `--discard-ignored-files`, because a different agent would otherwise delete the
   previous owner's ignored data without any opt-in.
+  This holds with or without `--include-uncommitted`.
+  The ten-minute quiet period only measures uncommitted, non-ignored files, so a clean worktree
+  has nothing to measure; for it the working directory check is the only guard against a writer.
 - `--abandon --dead-owner` allows the owner to be dead. The owner must be
   verifiably dead; a live or unverifiable owner still refuses. Because the work
   is preserved in full, this does not need `adopt` first. Pass it only when the

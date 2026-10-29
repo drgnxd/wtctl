@@ -6432,7 +6432,13 @@ fn dead_owner_without_include_uncommitted_still_refuses_to_delete_ignored_files(
     );
     let out = run(&[]);
     assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(
+        text(&out).contains("--discard-ignored-files"),
+        "{}",
+        text(&out)
+    );
     assert!(path.join("local.db").exists());
+    assert!(missing_ref(&env, &id));
 
     let out = run(&["--discard-ignored-files"]);
     assert!(out.status.success(), "{}", text(&out));
